@@ -56,6 +56,77 @@ int  tabLeaderIdx(const EntityState* sq, unsigned int n, unsigned int rank);
 // Fill h[5] (readObjectHand layout) from a captured EntityState's hand fields.
 void handFromEntity(const EntityState& e, unsigned int h[5]);
 
+// ---- Adaptive rank roster (Phase 11 plan 02, TEST-01) -----------------------
+// A monotonic high-water-mark of every rank (= PlayerId, OwnRanks.h) this
+// client has EVER seen connected - itself (observe()'s localId arg) plus
+// whatever ctx.connectedPeers() reports. Ranks are never removed once
+// observed: the locked N=4 gate scenarios (milestone_a_gate, player_state_
+// gate, save_load_gate) rank-gate a single actor for the whole run (e.g. "the
+// client at KO_TARGET_RANK downs its own leader"), and steps 7-8's own
+// DISCONNECT/RECONNECT observation must not swap that actor's identity mid-
+// run just because the harness drops a peer.
+//
+// Call observe() every tick (from onStart's first tick onward, before any
+// rank-gated leg reads highest()/secondHighestJoin()/lowestTwoJoins()) so the
+// roster is maximal by the time a leg's own elapsed-time gate - tens of
+// seconds into the run - actually consults it. At N=4, once every join has
+// connected at least once this converges to exactly {0,1,2,3}: highest()=3,
+// secondHighestJoin(1)=2, lowestTwoJoins()=(1,2) - the frozen constants every
+// N=4 gate already exercises, so those gates re-run against byte-unchanged
+// behavior.
+class RankRoster {
+public:
+    RankRoster() { for (unsigned int i = 0; i < MAX_PLAYERS; ++i) seen_[i] = false; }
+
+    void observe(unsigned int localId, const ScenarioContext& ctx) {
+        mark(localId);
+        if (!ctx.connectedPeers) return;
+        unsigned int ids[MAX_PLAYERS];
+        unsigned int n = ctx.connectedPeers(ids, MAX_PLAYERS);
+        for (unsigned int i = 0; i < n && i < MAX_PLAYERS; ++i) mark(ids[i]);
+    }
+
+    // Highest rank observed so far (0 if observe() has never been called -
+    // callers always observe() their own localId first, so this is never
+    // truly empty once a scenario has ticked at least once).
+    unsigned int highest() const {
+        for (unsigned int r = MAX_PLAYERS; r-- > 0; ) if (seen_[r]) return r;
+        return 0;
+    }
+
+    // The second-highest JOIN rank observed (ranks 1..MAX_PLAYERS-1, host
+    // rank 0 excluded), or 'fallbackRank' when fewer than two joins have ever
+    // been observed (N<3 - only one join exists, so there is no "second").
+    unsigned int secondHighestJoin(unsigned int fallbackRank) const {
+        bool haveTop = false;
+        for (unsigned int r = MAX_PLAYERS; r-- > 1; ) {
+            if (!seen_[r]) continue;
+            if (!haveTop) { haveTop = true; continue; } // skip the highest join
+            return r;
+        }
+        return fallbackRank;
+    }
+
+    // The two LOWEST join ranks observed (*a < *b), for Leg R's rank-vs-rank
+    // contest - the two ESTABLISHED joins, excluding whichever join (if any)
+    // is the highest/late one. Returns false (the leg is N-inapplicable, N<3
+    // - fewer than two joins have ever connected) rather than a degenerate
+    // single contestant.
+    bool lowestTwoJoins(unsigned int* a, unsigned int* b) const {
+        unsigned int found = 0;
+        for (unsigned int r = 1; r < MAX_PLAYERS; ++r) {
+            if (!seen_[r]) continue;
+            if (found == 0) { *a = r; ++found; }
+            else if (found == 1) { *b = r; return true; }
+        }
+        return false;
+    }
+
+private:
+    void mark(unsigned int id) { if (id < MAX_PLAYERS) seen_[id] = true; }
+    bool seen_[MAX_PLAYERS];
+};
+
 // ---- Zone-cell geometry (shared by cell_probe and escape_cohesion) ----------
 // engine::cellAt with the two coords swapped by axis, so one bisection body
 // serves both axes.
@@ -81,6 +152,12 @@ Scenario* makeCharStateScenario(const std::string& name); // ScenarioCharState.c
 Scenario* makeProbeScenario(const std::string& name);     // ScenarioProbes.cpp
 Scenario* makeBuildingScenario(const std::string& name);  // ScenarioBuildings.cpp
 Scenario* makeSessionScenario(const std::string& name);   // ScenarioSession.cpp
+Scenario* makeMilestoneAScenario(const std::string& name); // ScenarioMilestoneA.cpp
+Scenario* makePlayerStateScenario(const std::string& name); // ScenarioPlayerState.cpp (Phase 6 plan 02)
+Scenario* makeItemConservationScenario(const std::string& name); // ScenarioItemConservation.cpp (Phase 7 plan 03)
+Scenario* makeWorldStateScenario(const std::string& name); // ScenarioWorldState.cpp (Phase 8 plan 03)
+Scenario* makeConsensusScenario(const std::string& name); // ScenarioConsensus.cpp (Phase 9 plan 03)
+Scenario* makeSaveLoadScenario(const std::string& name); // ScenarioSaveLoad.cpp (Phase 10 plan 03)
 
 } // namespace coop
 

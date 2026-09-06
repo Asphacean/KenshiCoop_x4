@@ -76,11 +76,17 @@ void Replicator::applyTargets(GameWorld* gw) {
     static EntityState oracleSquad[16]; // main-thread only
     unsigned int oracleSquadN = engine::captureSquad(gw, false, oracleSquad, 16);
     for (std::map<Key, Driven>::iterator it = targets_.begin(); it != targets_.end(); ++it) {
-        // Never drive a body WE own: we control + stream it locally, the peer drives
-        // its copy from our stream. The disjoint partition + no local loopback means
-        // our own hand shouldn't appear in targets_, but guard regardless (a stray
-        // self-owned sample would otherwise fight our own control every frame).
-        if (ownHands_.find(it->first) != ownHands_.end()) continue;
+        // Driven-only veto (Phase 3 OWN-02): never drive a body WE own - we
+        // control + stream it locally, and any other owner's copy drives from
+        // our stream instead. isMineKey() is isMine()'s Key-keyed twin (we
+        // already hold the Key here from targets_, no need to marshal
+        // through the unsigned int[5] hand array only to rebuild it). The
+        // disjoint partition + no local loopback means our own hand
+        // shouldn't appear in targets_, but guard regardless (a stray
+        // self-owned sample would otherwise fight our own control every
+        // frame) - this holds no matter which remote owner (2, 3, ...) last
+        // wrote the stale Driven entry.
+        if (isMineKey(it->first)) continue;
         // Phase 1b (phantom "Squint" fix): also never drive/seed a hand we PIN
         // owned. ownHands_ is rebuilt each publish from the LOCAL captured hand;
         // a control-flip claim pins the OWNER's streamed hand (newK) owned too,
@@ -830,6 +836,22 @@ void Replicator::applyTargets(GameWorld* gw) {
             // AI may have walked the body elsewhere before the down state arrived),
             // so co-locate it with the host's down position when it has drifted.
             // Teleport (not walk) - a limp body has no gait to preserve.
+            //
+            // Phase 11 (11-03) NOTE - measured limitation, reverted experiments:
+            // an ACTIVE ragdoll OWNS the body's position. The engine re-syncs
+            // game pos FROM the physics skeleton every frame, so this
+            // CharMovement write flaps against the ragdoll's settle position
+            // (run 20260905_180631_N3: the observer's capture alternated
+            // between the two), Character::teleport does not relocate a live
+            // ragdoll (run 175944), and a stand-up/teleport/re-knockdown
+            // cycle thrashes the ragdoll lifecycle and diverges WORSE (run
+            // 181349: 13-15u vs the untreated ~6-11u). Three instrumented
+            // live iterations all confirmed: no available lever moves a
+            // ragdolling body. The offset a down body carries is whatever
+            // combat-band divergence existed at its KO edge (bounded by
+            // COMBAT_SNAP_DIST), it is static while the body lies down, and
+            // it heals on revive when the walk drive resumes - the oracles
+            // judge down-body samples at the combat band accordingly.
             if (haveActual && dist3(ax, ay, az, out.x, out.y, out.z) > 2.0f)
                 engine::applyRaw(c, out);
             d.downApplied = true;

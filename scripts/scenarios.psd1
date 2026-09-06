@@ -27,6 +27,12 @@
     #                 judging the scenario at all, where a bound keeps judging it
     #                 at its own number.
     #   WanBounds   - same shape, overlaid on Bounds when the run is under the proxy
+    #   NoSignalFails - oracle ids (N=4 milestone_a_gate schema only) that must
+    #                 contribute a verdict reason if their status is a no-signal
+    #                 result (SKIP), same no-signal-guard treatment PrimaryGate
+    #                 already gets above - a SKIP on one of these ids is an
+    #                 evidentiary gap, not a pass, so it must never silently
+    #                 count as green (04-08-PLAN.md gap 4).
     #
     # Smoke-tier selection principle: ONE scenario per wire pipeline, preferring
     # the bidirectional superset (it strictly covers the unidirectional case):
@@ -2406,6 +2412,282 @@
             Gating   = @()
             Advisory = @()
             Tier = 'none'; WanVariant = $false   # spike: [jail]/[furn]/[census]/[spike] traces
+        }
+
+        # milestone_a_gate: the Phase 4 Milestone A gate (POC-02/POC-03) - the ONE
+        # master 10-step DoD scenario every one of 4 processes runs
+        # (src/plugin/test/ScenarioMilestoneA.cpp, plan 04), judged by the N=4
+        # oracle set (scripts/CoopOraclesN.psm1, plan 05) instead of this
+        # manifest's normal 2-log Gating dispatch. Tier='none': this schema's
+        # Gating/Advisory ids ARE resolvable (Get-OracleRegistryN, extended into
+        # Contract.Tests.ps1's registry check below) but they dispatch through
+        # analyze_run4.ps1 / Invoke-OneOracleN, never through CoopOracles.psm1's
+        # Invoke-OneOracle 2-log switch - regress.ps1's -Tier smoke|full sweep
+        # only ever calls run_test.ps1 (2-instance), which cannot run this
+        # scenario at all (it needs run_test4.ps1's N=4 launcher, plan 02).
+        # Keeping it out of the tier is not a diagnostic downgrade like the
+        # entries above; it is the only way to represent "N=4-only" in a
+        # manifest shaped for exactly two logs.
+        #
+        # Save: unlike every other entry, this scenario does not resume a
+        # fixtures\saves\<name> world - the DoD requires all four ranks SEEDED
+        # (A4 resolution, 04-04-SUMMARY.md), which tools/MultiplayerStartGen's
+        # "Multiplayer (Wanderer x4)" NEW-GAME start provides, not a save capture.
+        # run_test4.ps1 does not consult this field (it reads -Save / rig
+        # config's own "save" key - plan 06's local.rig.json is the actual
+        # source of truth for what each instance loads), so this name is
+        # documentation + Contract.Tests.ps1 schema compliance, not a live
+        # fixtures\saves\wanderer4 folder plan 05 created.
+        #
+        # PrimaryGate = census_convergence: the no-signal guard for the
+        # mechanism POC-03 exists to prove (host-authoritative NPC census
+        # holding at N=4). Gating carries all five DoD-mapped gates - unlike
+        # the rest of the manifest there is no separate "softer" N=4 oracle
+        # yet to demote to Advisory (engine_integrity is folded into clean_exit
+        # rather than duplicated here as its own advisory entry).
+        #
+        # Seconds/KillGraceSec: ScenarioMilestoneA.cpp's own HOST_DURATION_MS is
+        # 150 s (JOIN_DURATION_MS 140 s); this outlives that scripted window by
+        # the house idiom (staggered joins + disconnect/reconnect lifecycle
+        # overhead + the host's shutdown), the same margin town_arrive/run_apart
+        # give their own host windows.
+        milestone_a_gate = @{
+            Save = 'wanderer4'; Setup = ''; Tolerance = 6.0
+            Seconds = 210; KillGraceSec = 180
+            PrimaryGate = 'census_convergence'
+            Gating   = @('census_convergence', 'disconnect_isolation', 'driven_only_movement',
+                         'desync_convergence', 'clean_exit')
+            Advisory = @()
+            # A no-signal (SKIP) result on either movement gate is an
+            # evidentiary gap, not a pass - ROADMAP Success Criteria 1/2
+            # require these DoD behaviors to be positively demonstrated
+            # (04-08-PLAN.md gap 4).
+            NoSignalFails = @('driven_only_movement', 'desync_convergence')
+            Tier = 'none'; WanVariant = $false   # N=4-only: judged by analyze_run4.ps1 (plan 05), never the 2-log tier sweep
+        }
+
+        # player_state_gate (Phase 6 plan 02): the ONE master player-state
+        # scenario proving PLAY-01/02/03 at N=4 - medical/KO/revive + stats/
+        # limbs, cross-owner carry+furniture, stealth/prone, and an EARLY
+        # runtime recruit (so a Plan-03 scheduled disconnect can still land
+        # after a confirmed recruit). Mirrors milestone_a_gate's own schema
+        # shape (N=4-only, judged by analyze_run4.ps1, never the 2-log tier
+        # sweep - Save is documentation only, run_test4.ps1 reads the actual
+        # save from rig config).
+        #
+        # PrimaryGate = player_state_medical: the no-signal guard for the
+        # mechanism this scenario exists to prove (per-owner medical/KO
+        # convergence at N=4, PLAY-01). player_state_recruit (Gate B,
+        # recruitment end-ownership, PLAY-03) is also Gating with
+        # NoSignalFails so a SKIP on either is an evidentiary gap, not a pass.
+        #
+        # Seconds/KillGraceSec: ScenarioPlayerState.cpp's own HOST_DURATION_MS
+        # is 150 s (JOIN_DURATION_MS 140 s), same as milestone_a_gate; the
+        # same margin (staggered joins + disconnect/reconnect lifecycle
+        # overhead + host shutdown) applies here.
+        player_state_gate = @{
+            Save = 'wanderer4'; Setup = ''; Tolerance = 6.0
+            Seconds = 210; KillGraceSec = 180
+            PrimaryGate = 'player_state_medical'
+            Gating   = @('player_state_medical', 'player_state_recruit')
+            Advisory = @()
+            NoSignalFails = @('player_state_medical', 'player_state_recruit')
+            Tier = 'none'; WanVariant = $false   # N=4-only: judged by analyze_run4.ps1, never the 2-log tier sweep
+        }
+
+        # item_conservation_gate (Phase 7 plan 03): the ONE live conservation
+        # scenario proving the host-committed transfer model (Plan 01) and the
+        # claim arbiter (Plan 02) end-to-end - P2->P3/P3->P4/P4->host-container
+        # transfers, a simultaneous disjoint-pair leg, and one 2-claimant ground
+        # contention (loser rollback, coverage gap D4) - judged by
+        # Test-InvConservation's Legs A-D (CoopOraclesN.psm1). Mirrors
+        # player_state_gate's own schema shape (N=4-only, judged by
+        # analyze_run4.ps1, never the 2-log tier sweep - Save is documentation
+        # only, run_test4.ps1 reads the actual save from rig config).
+        #
+        # DiagEnv: KENSHICOOP_INV_SYNC=1 forces invSync on (which cascades
+        # xferSync ON whenever unset, Config.cpp's own "unset = ON whenever
+        # invSync is on" default) and KENSHICOOP_WORLD_SYNC=1 forces worldSync
+        # on - both default OFF for a non-"" scenario name (Config.cpp:146,183),
+        # so without this the transfer/claim planes this gate exists to exercise
+        # would never fire at all.
+        #
+        # PrimaryGate = inv_conservation: the no-signal guard for the ONE
+        # mechanism this scenario exists to prove (zero-dup/zero-loss
+        # conservation across all four ownership domains, INV-01..04).
+        # NoSignalFails on inv_conservation: an evidentiary gap (no CONSERVE
+        # census, no commit/claim-win evidence) is a FAIL, never a silent pass.
+        #
+        # Seconds/KillGraceSec: ScenarioItemConservation.cpp's own
+        # HOST_DURATION_MS is 165s (JOIN_DURATION_MS 140s) - the host outlives
+        # the last-armed join's final checkpoint (the 07-04 arming-skew fix),
+        # so it runs 15s longer than player_state_gate/milestone_a_gate.
+        # Seconds=210 still covers it with the same margin class (staggered
+        # joins + disconnect/reconnect lifecycle overhead + host shutdown).
+        item_conservation_gate = @{
+            DiagEnv = @{ KENSHICOOP_INV_SYNC = '1'; KENSHICOOP_WORLD_SYNC = '1' }
+            Save = 'wanderer4'; Setup = ''; Tolerance = 6.0
+            Seconds = 210; KillGraceSec = 180
+            PrimaryGate = 'inv_conservation'
+            Gating   = @('inv_conservation', 'clean_exit')
+            Advisory = @()
+            NoSignalFails = @('inv_conservation')
+            Tier = 'none'; WanVariant = $false   # N=4-only: judged by analyze_run4.ps1, never the 2-log tier sweep
+        }
+
+        # world_state_gate (Phase 8 plan 03; contested leg redesigned 08-06):
+        # the ONE live scenario proving WORLD-01/02/03 end to end - every
+        # locked world channel (build/door/prod on rank0, faction on rank1,
+        # deed on rank2, research on rank3) via one-call engine levers, plus
+        # the D1/D2/D3 contested-claim leg asserting the deterministic
+        # continuity -> host-if-party -> lowest-playerId tie-break the
+        # CellMap.h reduce (Plan 02) is built to enforce. 08-06: ONLY JOINS
+        # MOVE (no lever reliably relocates the host's own selected leader) -
+        # D1 home cell owner=0, D2 away cell owner=2 (rank2+3 relocate, host
+        # not a party), D3 away cell STAYS 2 when rank1 (the lowest playerId)
+        # arrives (continuity beats fresh contest) - sequence 0 -> 2 -> 2.
+        # Judged by Test-WorldState's Legs A-D (CoopOraclesN.psm1). Mirrors
+        # item_conservation_gate's own schema shape (N=4-only, judged by
+        # analyze_run4.ps1, never the 2-log tier sweep).
+        #
+        # DiagEnv: KENSHICOOP_CELL_AUTH=1 is REQUIRED for the contested leg -
+        # the harness (Set-CoopDiagEnv, CoopHarness.psm1) pins it to 0 for any
+        # scenario that does not ask (Config.cpp:379-382), and with authority
+        # off authorityFor always fail-opens to the host, so D2/D3 could never
+        # fire. KENSHICOOP_CELL_COLLAPSE=0 keeps exactly one authority path
+        # live (Plan 02 made the per-cell reduce structural, so collapse is a
+        # no-op either way - the gate still pins it to make that explicit).
+        # The world channels themselves (fac/door/build/prod/research/deed)
+        # default ON even for scenarios (Config.cpp:226-238) - no DiagEnv
+        # needed for them.
+        #
+        # PrimaryGate = world_state: the no-signal guard for the ONE
+        # mechanism this scenario exists to prove. NoSignalFails on
+        # world_state: an evidentiary gap (no SCENARIO WORLD evidence, or a
+        # missing claimphase marker that leaves a D1/D2/D3 window
+        # unjudgeable) is a FAIL, never a silent pass.
+        #
+        # Seconds/KillGraceSec: ScenarioWorldState.cpp's own HOST_DURATION_MS
+        # is 250s (JOIN_DURATION_MS 240s; 08-06 - D3's judged window closes
+        # at marker+55s = 235s host-clock) - Seconds=290 covers it with the
+        # same margin class item_conservation_gate uses (~40s: staggered
+        # joins + host shutdown overhead).
+        world_state_gate = @{
+            DiagEnv = @{ KENSHICOOP_CELL_AUTH = '1'; KENSHICOOP_CELL_COLLAPSE = '0' }
+            Save = 'wanderer4'; Setup = ''; Tolerance = 6.0
+            Seconds = 290; KillGraceSec = 260
+            PrimaryGate = 'world_state'
+            Gating   = @('world_state', 'clean_exit')
+            Advisory = @()
+            NoSignalFails = @('world_state')
+            Tier = 'none'; WanVariant = $false   # N=4-only: judged by analyze_run4.ps1, never the 2-log tier sweep
+        }
+
+        # consensus_gate (Phase 9 plan 03, CONS-01/02/03): the ONE live
+        # scenario proving all three global-consensus planes (shared money
+        # pool, speed min-vote, time convergence) end to end on real UDP -
+        # Leg A money conservation + a deliberate overdraft contest with an
+        # identical reject verdict + refund on all four instances, Leg B
+        # speed min-vote + combat cap + a mid-session disconnect of the rank
+        # holding a constraining vote (the CONS-02 instant-vote-drop proof),
+        # Leg C passive time-convergence sampling. Judged by Test-Consensus
+        # (CoopOraclesN.psm1). Mirrors world_state_gate/item_conservation_gate's
+        # own schema shape (N=4-only, judged by analyze_run4.ps1, never the
+        # 2-log tier sweep - Save is documentation only, run_test4.ps1 reads
+        # the actual save from rig config).
+        #
+        # No DiagEnv: money/speed/time sync all default ON (Config.cpp:196-228)
+        # even for a named scenario - unlike the cell-authority/inv-sync
+        # planes, nothing needs to be force-enabled here.
+        #
+        # TIMING CONTRACT (see ScenarioConsensus.cpp's file header): Plan 04's
+        # live run MUST set join3's disconnectAtSec so the force-kill lands
+        # strictly inside the scenario's own "SCENARIO CONSENSUS legmark
+        # leg=B phase=1" (t=150s own-clock) / "phase=2" (t=220s own-clock)
+        # bracket - a kill outside that window either never observes the held
+        # constraining vote or leaves too little run time for the survivors'
+        # raise to register. disconnectAtSec is measured from the HOST's
+        # clock (run_test4.ps1's own doc comment); the scenario's phase
+        # markers are host-clock-anchored too (host-only marker emission,
+        # the ScenarioWorldState.cpp claimphase idiom), so the two line up
+        # directly with no additional skew conversion.
+        #
+        # PrimaryGate = consensus: the no-signal guard for the ONE mechanism
+        # this scenario exists to prove. NoSignalFails on consensus: an
+        # evidentiary gap (no SCENARIO CONSENSUS evidence, or a missing
+        # reject/vote-drop/clock window) is a FAIL, never a silent pass.
+        #
+        # Seconds/KillGraceSec: ScenarioConsensus.cpp's own HOST_DURATION_MS
+        # is 250s (JOIN_DURATION_MS 235s) - Seconds=290 covers it with the
+        # same margin class world_state_gate/item_conservation_gate use.
+        consensus_gate = @{
+            Save = 'wanderer4'; Setup = ''; Tolerance = 6.0
+            Seconds = 290; KillGraceSec = 260
+            PrimaryGate = 'consensus'
+            Gating   = @('consensus', 'clean_exit')
+            Advisory = @()
+            NoSignalFails = @('consensus')
+            Tier = 'none'; WanVariant = $false   # N=4-only: judged by analyze_run4.ps1, never the 2-log tier sweep
+        }
+
+        # save_load_gate (Phase 10 plan 03, SAVE-01..04): the ONE live 4-
+        # instance scenario proving the per-client save/load coordinator
+        # (Plan 01) and the joiner-unicast late-join bootstrap (Plan 02) end
+        # to end on real UDP - four legs on one fixed host-clock timeline,
+        # ordered L(late-join)->S(4-client save)->R(concurrent reject)->
+        # H(host-load-while-3-connected), a deliberate divergence from the
+        # research's sketched order: Legs S and H require the 4th instance
+        # (join3) to already be connected (cardinality), so the late-join
+        # leg must run first. Judged by Test-SaveLoad (CoopOraclesN.psm1).
+        # Mirrors consensus_gate/world_state_gate's own schema shape (N=4-
+        # only, judged by analyze_run4.ps1, never the 2-log tier sweep -
+        # Save is documentation only, run_test4.ps1 reads the actual save
+        # from rig config; the rig RESTORES the fixture per run, mandatory
+        # here since the connect-push bake rewrites the host's save folder
+        # by design).
+        #
+        # No DiagEnv: save/load coordination sync defaults ON (Config.cpp)
+        # even for a named scenario - nothing needs to be force-enabled.
+        #
+        # TIMING CONTRACT (reconnectAtSec, see ScenarioSaveLoad.cpp's file
+        # header + HOST_DURATION_MS/JOIN_DURATION_MS): join3's rig entry
+        # (Plan 04's local.rig.json, gitignored) sets reconnectAtSec to a
+        # host-relative offset strictly inside Leg L's window
+        # [0, LEGL_END_MS=120000ms] - a deferred FIRST launch (the rig's
+        # existing lever, run_test4.ps1:329-343/372-404), never a new
+        # harness surface. run_meta.json's scheduledReconnect (keyed by
+        # join3's ACTUAL logName) exempts join3 from clean_exit's full-
+        # duration/health assumptions for the pre-connect window; Test-
+        # SaveLoad reads it as a bonus cross-check (not a hard requirement -
+        # the primary join-window boundary is derived from this scenario's
+        # OWN "SCENARIO SAVELOAD ..." / the production "[boot] GO->join
+        # dest=.." evidence, which is more precise than a config marker).
+        #
+        # PrimaryGate = save_load: the no-signal guard for the ONE
+        # mechanism this scenario exists to prove. NoSignalFails on
+        # save_load: an evidentiary gap (no SCENARIO SAVELOAD evidence, or a
+        # missing leg=<L|S|R|H> marker that leaves a window unjudgeable) is
+        # a FAIL, never a silent pass.
+        #
+        # Seconds/KillGraceSec: ScenarioSaveLoad.cpp's own HOST_DURATION_MS
+        # is 320s (JOIN_DURATION_MS 305s; Leg H's judged window closes at
+        # LEGH_END_MS=305s host-clock) - Seconds=350 covers it with the same
+        # margin class world_state_gate/consensus_gate use (~30-40s:
+        # staggered joins + host shutdown overhead). HostSelfExitSec (new
+        # manifest key, run_test4.ps1's reconnectAtSec deferred-launch cap)
+        # is set to HOST_DURATION_MS/1000=320 - the invariant this key
+        # locks: HostSelfExitSec MUST equal the scenario's own host self-
+        # exit duration, or a mismatch silently self-exits the host before
+        # join3's deferred launch completes Leg L (research Pitfall 9).
+        save_load_gate = @{
+            Save = 'wanderer4'; Setup = ''; Tolerance = 6.0
+            Seconds = 350; KillGraceSec = 320
+            HostSelfExitSec = 320
+            PrimaryGate = 'save_load'
+            Gating   = @('save_load', 'clean_exit')
+            Advisory = @()
+            NoSignalFails = @('save_load')
+            Tier = 'none'; WanVariant = $false   # N=4-only: judged by analyze_run4.ps1, never the 2-log tier sweep
         }
     }
 }

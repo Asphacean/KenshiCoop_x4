@@ -90,11 +90,28 @@ foreach ($f in @("tests\CrawlMove.Fixture.ps1")) {
 Write-Host ("ORACLE FIXTURES: " + $(if ($oracleOk) { "PASS" } else { "FAIL" }))
 if (-not $oracleOk) { $overall = $false }
 
+# ---- 4. Routing matrix completeness (zero game) ---------------------------------
+Write-Host ""
+Write-Host "############################################################"
+Write-Host "# verify: routing matrix completeness"
+Write-Host "############################################################"
+$routing = Join-Path $scriptDir "tests\RoutingMatrix.Tests.ps1"
+if (Test-Path $routing) {
+    & powershell -NoProfile -ExecutionPolicy Bypass -File $routing
+    $routingOk = ($LASTEXITCODE -eq 0)
+    Write-Host ("ROUTING MATRIX: " + $(if ($routingOk) { "PASS" } else { "FAIL (exit $LASTEXITCODE)" }))
+    if (-not $routingOk) { $overall = $false }
+} else {
+    Write-Host "ROUTING MATRIX: FAIL - scripts\tests\RoutingMatrix.Tests.ps1 not found"
+    $overall = $false
+}
+
 # ---- summary -------------------------------------------------------------------
 Write-Host ""
 Write-Host "================= VERIFY SUMMARY ================="
 Write-Host ("  unit layer (prototest):   " + $(if ($unitOk) { "PASS" } else { "FAIL" }))
 Write-Host ("  contract fixtures:        " + $(if ($fixOk)  { "PASS" } else { "FAIL" }))
 Write-Host ("  oracle fixtures:          " + $(if ($oracleOk) { "PASS" } else { "FAIL" }))
+Write-Host ("  routing matrix:           " + $(if ($routingOk) { "PASS" } else { "FAIL" }))
 Write-Host ("OVERALL: " + $(if ($overall) { "PASS" } else { "FAIL" }))
 if ($overall) { exit 0 } else { exit 1 }

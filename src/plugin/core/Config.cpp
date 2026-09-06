@@ -239,6 +239,19 @@ void loadConfig(Config& c) {
     c.storeSync   = envOr("KENSHICOOP_STORE_SYNC", "1") != "0";
     c.squadSync   = envOr("KENSHICOOP_SQUAD_SYNC", "1") != "0";
     c.latejoinSync = envOr("KENSHICOOP_LATEJOIN_SYNC", "1") != "0";
+
+    // Phase 10 Plan 01 (SAVE-01): per-client save/load coordinator retry/
+    // timeout knobs. "0" or absent uses the documented default.
+    {
+        int v = std::atoi(envOr("KENSHICOOP_SAVE_RETRIES", "0").c_str());
+        c.saveRetries = (v > 0) ? (unsigned int)v : 2u;
+        long t = std::atol(envOr("KENSHICOOP_SAVE_ACK_TIMEOUT_MS", "0").c_str());
+        c.saveAckTimeoutMs = (t > 0) ? (unsigned long)t : 30000ul;
+        // Phase 10 review CR-03: the load plane's own, larger deadline floor
+        // (a coordinated load spans reloads + a possible fallback transfer).
+        long lt = std::atol(envOr("KENSHICOOP_LOAD_ACK_TIMEOUT_MS", "0").c_str());
+        c.loadAckTimeoutMs = (lt > 0) ? (unsigned long)lt : 120000ul;
+    }
     // NOTE: every channel above DEFAULTS ON for real sessions; the diagnostic
     // "*_probe" scenarios (and time_probe/speed_sync) that need a channel OFF to
     // measure the unsynced baseline force it via their manifest DiagEnv (e.g.

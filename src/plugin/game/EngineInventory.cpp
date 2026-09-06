@@ -1203,6 +1203,36 @@ int removeTestItemsFromContainer(GameWorld* gw, const unsigned int cHand[5], int
     return removeByKey(inv, curItems, cur, ncur, sid, typeCat, qty, /*wantEquipped=*/0);
 }
 
+// SEH-guarded CONSERVATION primitive (Phase 7 review CR-02) - see the Engine.h
+// declaration comment. removeByKey is the unit-scoped worker: per matching
+// Item entry it takes min(shortfall, stack quantity) units via
+// removeItemAutoDestroy, which splits a stack in place - so removing 5 claimed
+// units from a merged 8-stack leaves the loser's own 3, and a pre-owned
+// same-sid single is only consumed if the shortfall still calls for it.
+// Loose entries first; the equipped pass re-snapshots because the first
+// removeByKey mutated _allItems (a cached Item* could dangle - the same
+// re-snapshot rule dropItemFromInventory documents).
+int removeItemUnitsFromContainer(GameWorld* gw, const unsigned int cHand[5],
+                                 const char* sid, unsigned int typeCat, int qty) {
+    if (!gw || !sid || !sid[0] || qty <= 0) return 0;
+    RootObject* ro = resolveObjectByHand(cHand);
+    if (!ro) return 0;
+    Inventory* inv = invOf(ro);
+    if (!inv) return 0;
+    const unsigned int MAXC = 64;
+    InvItemEntry cur[64];
+    Item* curItems[64];
+    unsigned int ncur = readInvItems(inv, cur, curItems, MAXC);
+    int removed = removeByKey(inv, curItems, cur, ncur, sid, typeCat, qty,
+                              /*wantEquipped=*/0);
+    if (removed < qty) {
+        ncur = readInvItems(inv, cur, curItems, MAXC);
+        removed += removeByKey(inv, curItems, cur, ncur, sid, typeCat,
+                               qty - removed, /*wantEquipped=*/1);
+    }
+    return removed;
+}
+
 int commonTestItemSid(GameWorld* gw, char* outSid, unsigned int outLen,
                       unsigned int* outType) {
     if (outSid && outLen) outSid[0] = '\0';
@@ -1901,6 +1931,37 @@ int groundItemLiveness(const unsigned int itemHand[5], float out[3]) {
     RootObject* ro = resolveObjectByHand(itemHand);
     if (!ro) return 0; // destroyed / no longer resolvable
     return groundObjectLiveness(ro, out, 0);
+}
+
+// SEH-guarded (Phase 7 Plan 02, INV-03): read a LIVE object's item identity
+// (template stringID/itemType/quantity) directly off the pointer, without any
+// spatial re-query. Used at W1 claim-detection time (a proxy just consumed
+// into a bag is still a live, readable object - isInInventory true, not
+// destroyed) to capture the identity a LOSING claim's rollback needs later,
+// mirroring the drop-hook's own GameData/quantity read (dropItem_hook,
+// EngineInternal.cpp). Returns 1 on success (outSid/outType/outQty filled),
+// 0 on a null pointer or a fault (outSid left empty, outType/outQty
+// untouched).
+int readItemIdentity(RootObject* obj, char* outSid, unsigned int sidLen,
+                     unsigned int* outType, unsigned short* outQty) {
+    if (outSid && sidLen) outSid[0] = '\0';
+    if (!obj || !outSid || sidLen == 0) return 0;
+    int ok = 0;
+    __try {
+        GameData* gd = obj->getGameData();
+        if (!gd) return 0;
+        const char* s = gd->stringID.c_str();
+        strncpy(outSid, s ? s : "", sidLen - 1);
+        outSid[sidLen - 1] = '\0';
+        if (outType) *outType = (unsigned int)gd->type;
+        if (outQty) {
+            int qty = reinterpret_cast<Item*>(obj)->quantity;
+            if (qty < 1) qty = 1;
+            *outQty = (unsigned short)(qty > 0xFFFF ? 0xFFFF : qty);
+        }
+        ok = 1;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { ok = 0; }
+    return ok;
 }
 
 // SEH-guarded (Phase W3): world position of a tracked Item* (as void*). The drop detector

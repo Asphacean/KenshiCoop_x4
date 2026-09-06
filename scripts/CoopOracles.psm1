@@ -459,7 +459,7 @@ Export-ModuleMember -Function @(
     "Reset-GateResults", "Add-GateResult", "Get-GateResults", "Merge-Status",
     "Get-PreRunGates",
     "Get-LogClockOffsetMs", "Get-ClockSyncStats", "Convert-StampToMs",
-    "Get-ScenarioLines", "Get-ScenarioSeries", "Get-MarkerTimeMs",
+    "Get-ScenarioLines", "Get-ScenarioSeries", "Get-MarkerTimeMs", "Get-LogLastActivityMs", "Get-HandAliases",
     "Test-LogHealth", "Test-EngineIntegrity", "Test-NoCheckFail", "Test-ScenarioResultPass", "Test-ClockSync",
     "Test-Crosscheck", "Measure-NpcSync", "Test-NpcTrack", "Test-CoopPresence",
     "Test-NpcPose", "Test-NpcPoseState", "Test-NpcBodyState", "Test-BedPose", "Test-BedWake", "Test-BedLay",

@@ -139,12 +139,25 @@ void removeTree(const std::string& folder, int depth) {
 
 // A rejected path must never escape the staging folder: reject absolute
 // paths, drive letters and any ".." component.
+// Phase 10 review IN-01: only a FULL ".." path component escapes - two
+// adjacent dots INSIDE a filename (e.g. a platoon file derived from a squad
+// named "a..b") are harmless, and the sender's collectFiles ships such names
+// unfiltered, so rejecting them here just guaranteed a CRC-fail loop for
+// that save. Reject exactly the components "\..\" / leading "..\" /
+// trailing "\.." / the lone "..".
 bool relPathSafe(const char* p, unsigned int len) {
     if (len == 0 || len > SAVE_PATH_MAX) return false;
     if (p[0] == '\\' || p[0] == '/') return false;
-    for (unsigned int i = 0; i < len; ++i) {
-        if (p[i] == ':') return false;
-        if (p[i] == '.' && i + 1 < len && p[i + 1] == '.') return false;
+    unsigned int compStart = 0;
+    for (unsigned int i = 0; i <= len; ++i) {
+        if (i == len || p[i] == '\\' || p[i] == '/') {
+            if (i - compStart == 2 &&
+                p[compStart] == '.' && p[compStart + 1] == '.')
+                return false; // a full ".." component escapes staging
+            compStart = i + 1;
+        } else if (p[i] == ':') {
+            return false;
+        }
     }
     return true;
 }
@@ -166,6 +179,11 @@ unsigned __int64      g_sendTotalBytes = 0;
 unsigned __int64      g_sendSentBytes  = 0;
 unsigned long         g_sendStartTick  = 0;
 unsigned long         g_sendLastBurst  = 0;
+// Phase 10 Plan 01 (SAVE-01/SAVE-04): the destination this transfer streams
+// to - OWNER_ID_ALL (the historical behavior) or one specific PlayerId for a
+// per-client retry / targeted late-join push. Set once by beginSend and
+// carried through every tickSend chunk of the SAME transfer.
+u32                   g_sendDestId  = OWNER_ID_ALL;
 
 void sendCloseFile() {
     if (g_sendHandle != INVALID_HANDLE_VALUE) {
@@ -174,11 +192,22 @@ void sendCloseFile() {
     }
 }
 
+// Phase 11 (11-03): the sender's private snapshot folder for the CURRENT
+// transfer ("" = none). See beginSend's snapshot block for why it exists.
+std::string g_sendSnapshot;
+
+void sendDropSnapshot() {
+    if (g_sendSnapshot.empty()) return;
+    removeTree(g_sendSnapshot, 0);
+    g_sendSnapshot.clear();
+}
+
 void sendAbort(const char* why) {
     char b[192];
     _snprintf(b, sizeof(b) - 1, "[save] XFER-ABORT id=%u %s", g_sendXferId, why);
     b[sizeof(b) - 1] = '\0'; coop::logErrLine(b);
     sendCloseFile();
+    sendDropSnapshot();
     g_sendActive = false;
     g_sendFiles.clear();
     g_sendCrcs.clear();
@@ -277,8 +306,12 @@ bool folderInventory(const std::string& folder, unsigned int* outFiles,
     return true;
 }
 
-u32 folderFingerprint(const std::string& name) {
-    std::string folder = saveFolderFor(name);
+// Path-based fingerprint core (phase 10 review WR-06): folderFingerprint's
+// body, taking a FULL folder path instead of a logical save name, so
+// onSaveDone can fingerprint the staging dir (a PID-tagged path, not a
+// resolvable save name) against a commit-race occupant. 0 = missing/
+// unreadable/oversized, same sentinel semantics as folderFingerprint.
+static u32 fingerprintFolderPath(const std::string& folder) {
     std::vector<XferFile> files;
     collectFiles(folder, "", 0, &files);
     if (files.empty() || files.size() > 4096) return 0;
@@ -300,6 +333,88 @@ u32 folderFingerprint(const std::string& name) {
         crcs[i] = crc;
     }
     return folderFingerprintOf(&paths[0], &crcs[0], (unsigned int)files.size());
+}
+
+u32 folderFingerprint(const std::string& name) {
+    return fingerprintFolderPath(saveFolderFor(name));
+}
+
+// Phase 11 review WR-01: generalized dead-PID sibling sweep. Phase 10's WR-07
+// sweep covered only the receiver's "__incoming_<pid>" staging orphans, but
+// Phase 11 added two MORE PID-tagged folder classes to the save root - the
+// sender's "__xfersrc_<pid>" snapshot (beginSend) and the commit's
+// "__old_<pid>" move-aside (onSaveDone) - with the identical failure mode:
+// a crash/hard-kill strands the folder FOREVER (PIDs change every launch, so
+// no later run's own-path cleanup ever matches it), and it sits inside the
+// save root where Kenshi's load menu lists it as a corrupt/phantom save.
+// Sweep any sibling save/<name>__{incoming|xfersrc|old}_<pid> whose tagged
+// PID is no longer a live process; a PID that resolves to SOME live process
+// (even an unrelated reuse) is conservatively skipped, exactly like WR-07.
+//
+// "__old_<pid>" gets special handling: it holds the user's PREVIOUS save,
+// moved aside between onSaveDone's move-aside and move-in. A crash in that
+// window leaves save/<name> MISSING with the only surviving copy stranded
+// under the orphan - so when the logical folder is absent, RESTORE the
+// orphan over it instead of deleting the user's data; delete only when
+// save/<name> exists (the commit completed, the orphan is a stale backup).
+// Called from onSaveBegin (receiver) and beginSend (sender), so either
+// role's next transfer of the same save self-heals the root.
+static void sweepDeadPidSiblings(const std::string& name) {
+    static const char* const kTags[] = { "__incoming_", "__xfersrc_", "__old_" };
+    for (int ti = 0; ti < 3; ++ti) {
+        const bool isOldTag = (ti == 2);
+        std::string prefix = name + kTags[ti];
+        WIN32_FIND_DATAA fd;
+        HANDLE fh = FindFirstFileA(saveFolderFor(prefix + "*").c_str(), &fd);
+        if (fh == INVALID_HANDLE_VALUE) continue;
+        do {
+            if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) continue;
+            if (_strnicmp(fd.cFileName, prefix.c_str(), prefix.size()) != 0) continue;
+            unsigned long pid = strtoul(fd.cFileName + prefix.size(), 0, 10);
+            if (pid == 0 || pid == GetCurrentProcessId()) continue; // own paths handled by their owners
+            bool alive = false;
+            HANDLE ph = OpenProcess(PROCESS_QUERY_INFORMATION, FALSE, (DWORD)pid);
+            if (ph) {
+                DWORD ec = 0;
+                alive = (GetExitCodeProcess(ph, &ec) != 0) && ec == STILL_ACTIVE;
+                CloseHandle(ph);
+            } else if (GetLastError() == ERROR_ACCESS_DENIED) {
+                alive = true; // exists but not openable (e.g. elevated) - leave it
+            }
+            if (alive) continue;
+            std::string orphan = saveFolderFor(fd.cFileName);
+            if (isOldTag &&
+                GetFileAttributesA(saveFolderFor(name).c_str()) == INVALID_FILE_ATTRIBUTES) {
+                // The crash landed between move-aside and move-in: the orphan
+                // IS the user's previous save and save/<name> is gone. Put it
+                // back rather than deleting the only copy.
+                char rb[704];
+                if (MoveFileExA(orphan.c_str(), saveFolderFor(name).c_str(),
+                                MOVEFILE_WRITE_THROUGH)) {
+                    _snprintf(rb, sizeof(rb) - 1,
+                              "[save] XFER restored stranded previous save '%s' "
+                              "from dead move-aside orphan '%s' (pid %lu gone)",
+                              name.c_str(), orphan.c_str(), pid);
+                    rb[sizeof(rb) - 1] = '\0'; coop::logLine(rb);
+                } else {
+                    _snprintf(rb, sizeof(rb) - 1,
+                              "[save] XFER could NOT restore stranded previous save "
+                              "from '%s' (pid %lu gone) - left in place",
+                              orphan.c_str(), pid);
+                    rb[sizeof(rb) - 1] = '\0'; coop::logErrLine(rb);
+                }
+                continue; // never fall through to delete for the __old_ restore case
+            }
+            char ob[704];
+            _snprintf(ob, sizeof(ob) - 1,
+                      "[save] XFER sweeping dead %s orphan '%s' (pid %lu gone)",
+                      isOldTag ? "move-aside" : (ti == 1 ? "snapshot" : "staging"),
+                      orphan.c_str(), pid);
+            ob[sizeof(ob) - 1] = '\0'; coop::logLine(ob);
+            removeTree(orphan, 0);
+        } while (FindNextFileA(fh, &fd));
+        FindClose(fh);
+    }
 }
 
 void armWatch(const std::string& name) {
@@ -393,11 +508,22 @@ int tickWatch(unsigned int* outFiles, unsigned __int64* outBytes,
 // ---- Sender (host) -------------------------------------------------------------
 #ifndef KENSHICOOP_PROTOTEST
 
-bool beginSend(NetLink& net, u32 localId, const std::string& name) {
+bool beginSend(NetLink& net, u32 localId, const std::string& name, u32 destId) {
     sendCloseFile();
     g_sendFiles.clear();
     g_sendCrcs.clear();
     g_sendActive = false;
+    g_sendDestId = destId;
+
+    // Phase 10 review CR-04: saveFolderFor("") resolves to the save ROOT
+    // itself (pathJoin(root, "") = root + "\\"), which EXISTS as a directory
+    // - an empty name would snapshot and stream the user's entire save
+    // library. The save root must never be a transfer source.
+    if (name.empty()) {
+        coop::logErrLine("[save] XFER-BEGIN refused: empty save name "
+                         "(would resolve to the save ROOT)");
+        return false;
+    }
 
     std::string folder = saveFolderFor(name);
     DWORD attrs = GetFileAttributesA(folder.c_str());
@@ -408,11 +534,70 @@ bool beginSend(NetLink& net, u32 localId, const std::string& name) {
         b[sizeof(b) - 1] = '\0'; coop::logErrLine(b);
         return false;
     }
+    // Phase 11 review WR-01: the sender-side half of the dead-PID sweep -
+    // a crashed sibling's __xfersrc_/__incoming_/__old_ orphans for this
+    // name self-heal on the next SEND too, not only on the next receive.
+    sweepDeadPidSiblings(name);
+
     collectFiles(folder, "", 0, &g_sendFiles);
     if (g_sendFiles.empty() || g_sendFiles.size() > 0xFFFF) {
         coop::logErrLine("[save] XFER-BEGIN refused: empty/oversized file list");
         g_sendFiles.clear();
         return false;
+    }
+
+    // Phase 11 (11-03 live matrix, runs 20260905_130015/130752_N4): SNAPSHOT
+    // the source folder before sending. On a same-machine rig (and the
+    // documented two-installs-one-PC setup) every instance shares ONE
+    // physical %LOCALAPPDATA%\kenshi\save root, so while this sender streams
+    // files from save/<name>/ over multiple seconds, a RECEIVING sibling
+    // process that already finished commits its verified copy ONTO that same
+    // logical folder (move-aside + move-in, onSaveDone) - the sender's
+    // still-open reads then hold handles that fail the sibling's move-aside
+    // ("genuinely still occupied" -> XFER-FAILED badCrc=0), or the folder
+    // swap lands between this sender's CRC accumulation and its later file
+    // reads so the bytes it ships no longer match the manifest it computed
+    // (receiver-side badCrc=1) - both observed live, both self-healed only
+    // by burning a coordinator retry. Copying the just-collected file list
+    // into a private, PID-tagged sibling folder (save/<name>__xfersrc_<pid>)
+    // and streaming from THAT makes the send immune to any concurrent
+    // activity on the logical folder, and the sender never holds handles
+    // inside the folder receivers commit to. The snapshot is a few MB
+    // (quiesced save), deleted at XFER-SENT/abort/next beginSend. On a
+    // copy failure the send falls back to the live folder - the pre-existing
+    // behavior, no new failure mode.
+    sendDropSnapshot();
+    {
+        char snapSuffix[48];
+        _snprintf(snapSuffix, sizeof(snapSuffix) - 1, "__xfersrc_%lu",
+                  (unsigned long)GetCurrentProcessId());
+        snapSuffix[sizeof(snapSuffix) - 1] = '\0';
+        std::string snap = folder + snapSuffix;
+        removeTree(snap, 0);
+        bool snapOk = true;
+        for (size_t i = 0; i < g_sendFiles.size(); ++i) {
+            std::string s = pathJoin(folder, g_sendFiles[i].rel);
+            std::string d = pathJoin(snap, g_sendFiles[i].rel);
+            ensureParentDirs(d);
+            if (!CopyFileA(s.c_str(), d.c_str(), FALSE)) { snapOk = false; break; }
+        }
+        if (snapOk) {
+            // Re-collect from the snapshot so sizes/offsets describe exactly
+            // the frozen bytes that will be read and CRC'd.
+            std::vector<XferFile> snapFiles;
+            collectFiles(snap, "", 0, &snapFiles);
+            if (!snapFiles.empty() && snapFiles.size() == g_sendFiles.size()) {
+                g_sendFiles.swap(snapFiles);
+                g_sendSnapshot = snap;
+                folder = snap;
+            } else {
+                snapOk = false;
+            }
+        }
+        if (!snapOk) {
+            removeTree(snap, 0);
+            coop::logLine("[save] XFER-BEGIN snapshot copy failed - sending from the live folder");
+        }
     }
     g_sendTotalBytes = 0;
     for (size_t i = 0; i < g_sendFiles.size(); ++i)
@@ -438,13 +623,13 @@ bool beginSend(NetLink& net, u32 localId, const std::string& name) {
     strncpy(bp.name, name.c_str(), sizeof(bp.name) - 1);
     bp.fileCount  = (u16)g_sendFiles.size();
     bp.totalBytes = g_sendTotalBytes;
-    net.queueSaveBegin(bp);
+    net.queueSaveBegin(bp, g_sendDestId);
 
-    char b[192];
+    char b[224];
     _snprintf(b, sizeof(b) - 1,
-              "[save] XFER-BEGIN id=%u name='%s' files=%u bytes=%I64u",
+              "[save] XFER-BEGIN id=%u name='%s' files=%u bytes=%I64u dest=%u",
               g_sendXferId, name.c_str(), (unsigned)g_sendFiles.size(),
-              g_sendTotalBytes);
+              g_sendTotalBytes, (unsigned)g_sendDestId);
     b[sizeof(b) - 1] = '\0'; coop::logLine(b);
     return true;
 }
@@ -492,7 +677,7 @@ bool tickSend(NetLink& net, u32 localId) {
         fh.pathLen = (u16)xf.rel.size();
         fh.offset  = (u32)g_sendOffset;
         fh.dataLen = (u16)got;
-        net.queueSaveFile(fh, xf.rel.c_str(), buf, (unsigned int)got);
+        net.queueSaveFile(fh, xf.rel.c_str(), buf, (unsigned int)got, g_sendDestId);
 
         g_sendOffset    += got;
         g_sendSentBytes += got;
@@ -510,7 +695,7 @@ bool tickSend(NetLink& net, u32 localId) {
         dh.xferId    = g_sendXferId;
         dh.fileCount = (u16)g_sendFiles.size();
         net.queueSaveDone(dh, g_sendCrcs.empty() ? 0 : &g_sendCrcs[0],
-                          (unsigned int)g_sendCrcs.size());
+                          (unsigned int)g_sendCrcs.size(), g_sendDestId);
         char b[176];
         _snprintf(b, sizeof(b) - 1,
                   "[save] XFER-SENT id=%u files=%u bytes=%I64u ms=%lu",
@@ -520,6 +705,7 @@ bool tickSend(NetLink& net, u32 localId) {
         g_lastSentXferId = g_sendXferId;
         g_sendActive = false;
         g_sendFiles.clear();
+        sendDropSnapshot(); // Phase 11: the frozen source has served its purpose
         return true;
     }
     return false;
@@ -528,6 +714,13 @@ bool tickSend(NetLink& net, u32 localId) {
 #endif // !KENSHICOOP_PROTOTEST (sender)
 
 u32 lastSentXferId()  { return g_lastSentXferId; }
+#ifndef KENSHICOOP_PROTOTEST
+u32 sendXferId()      { return g_sendXferId; }
+unsigned __int64 sendTotalBytes() { return g_sendTotalBytes; }
+#else
+u32 sendXferId()      { return 0; } // sender state is compiled out under KENSHICOOP_PROTOTEST
+unsigned __int64 sendTotalBytes() { return 0; }
+#endif
 int lastCommitResult() { return g_lastCommitResult; }
 u32 commitSeq()        { return g_commitSeq; }
 std::string lastCommitName() { return g_recvName; }
@@ -562,15 +755,59 @@ void onSaveBegin(const SaveBeginPacket& b) {
     memcpy(name, b.name, sizeof(b.name));
     name[sizeof(b.name)] = '\0';
 
+    // Phase 10 review CR-04 (receiver half): an empty name would stage as
+    // "__incoming_<pid>" and COMMIT over saveFolderFor("") - the save ROOT
+    // itself (onSaveDone's MoveFileExA would transiently rename the user's
+    // ENTIRE save library to "save__old"). Refuse outright; the ACK ok=0
+    // path (onSaveDone's !g_recvActive early-out) reports the failure.
+    if (!name[0]) {
+        coop::logErrLine("[save] XFER-RECV refused: empty save name "
+                         "(the save ROOT is never a transfer target)");
+        g_recvActive = false;
+        g_recvXferId = b.xferId; // stale-chunk guard still keys off the id
+        return;
+    }
+
     g_recvName       = name;
     g_recvXferId     = b.xferId;
     g_recvFileCount  = b.fileCount;
     g_recvTotalBytes = b.totalBytes;
     g_recvBytes      = 0;
     g_recvStartTick  = GetTickCount();
-    g_recvStaging    = saveFolderFor(g_recvName + "__incoming");
+    // Staging folder is PID-tagged (not just name-derived): a coordinated
+    // save (Phase 10 Plan 01, SAVE-01) can push the SAME name to MULTIPLE
+    // already-connected clients concurrently. On separate real machines
+    // each has its own filesystem and this would never collide, but the
+    // N=4 dev rig runs every clone as a separate process under the SAME
+    // Windows user, so run_test4.ps1's own restore step already proved
+    // Kenshi/RE_Kenshi reads/writes the ONE shared %LOCALAPPDATA%\kenshi\
+    // save regardless of installDir (the "User save location=1" A3 finding
+    // does not hold in practice). Without a per-process staging path, two
+    // or three receivers opening CreateFileA(..., dwShareMode=0) against
+    // the IDENTICAL staging file at the same instant hand every loser an
+    // INVALID_HANDLE_VALUE ("[save] XFER chunk write-open FAILED") for the
+    // life of the transfer - a real, reproducible blocking failure (10-04
+    // live gate run 1), not a false-negative oracle/timing artifact. The
+    // FINAL commit directory (finalDir below, saveFolderFor(g_recvName))
+    // is deliberately left untouched - onSaveDone's MoveFileExA and the
+    // MATCH-path engine::loadSave(name) callers both still resolve the
+    // plain logical name, so nothing downstream needs to know about this
+    // tag; only the transient staging area needs to be collision-safe.
+    char pidTag[24];
+    _snprintf(pidTag, sizeof(pidTag) - 1, "__incoming_%lu",
+              (unsigned long)GetCurrentProcessId());
+    pidTag[sizeof(pidTag) - 1] = '\0';
+    g_recvStaging    = saveFolderFor(g_recvName + pidTag);
     g_recvCrcs.assign(b.fileCount, fnv1aInit());
     g_recvSeen.assign(b.fileCount, 0);
+
+    // Phase 10 review WR-07 / Phase 11 review WR-01: sweep DEAD siblings'
+    // PID-tagged orphans for this save name - staging (__incoming_<pid>),
+    // sender snapshot (__xfersrc_<pid>) and commit move-aside (__old_<pid>)
+    // alike; a stranded __old_<pid> whose logical folder is missing is
+    // RESTORED, not deleted. See sweepDeadPidSiblings above for the full
+    // rationale (the old inline sweep matched only __incoming_).
+    sweepDeadPidSiblings(g_recvName);
 
     // A fresh staging folder: stale partials from an aborted transfer would
     // otherwise pollute the CRC verify.
@@ -636,6 +873,10 @@ int onSaveDone(const SaveDoneHeader& d, const u32* crcs,
     g_recvActive = false;
 
     bool ok = (d.fileCount == g_recvFileCount);
+    // Phase 10 review CR-04 (belt/braces): never commit toward the save ROOT
+    // - onSaveBegin already refuses an empty name, but a commit with
+    // g_recvName empty would MoveFileExA the whole save library aside.
+    if (g_recvName.empty()) ok = false;
     unsigned int bad = 0;
     if (ok) {
         for (u16 i = 0; i < d.fileCount; ++i) {
@@ -646,20 +887,98 @@ int onSaveDone(const SaveDoneHeader& d, const u32* crcs,
     if (ok) {
         // Commit: swap the staged folder over save/<name>/ - the previous
         // save is only removed AFTER the new one is in place.
+        //
+        // finalDir/oldDir are the LOGICAL (unchanged, non-PID-tagged) names
+        // by design - engine::loadSave(name)'s MATCH-arm callers (Plugin.cpp)
+        // resolve a save by this exact literal name, so only the transient
+        // staging folder above could be made process-unique. On the N=4 dev
+        // rig this means finalDir/oldDir are the ONE shared physical target
+        // several receiving processes commit into concurrently for the SAME
+        // xferId (all receiving byte-identical host-authored data) - a
+        // directory rename race that never happens on separate real
+        // machines. MoveFileExA has no MOVEFILE_REPLACE_EXISTING equivalent
+        // for directories, so losing that race surfaces as a plain move
+        // failure. Rather than treating "someone else already finished this
+        // exact commit a moment earlier" as a false DROP (10-04 live gate
+        // run 2), verify by EXISTENCE after a failed move: if finalDir is
+        // there regardless of who put it there, our own CRC-verified data
+        // is redundant, not wrong.
         std::string finalDir = saveFolderFor(g_recvName);
-        std::string oldDir   = finalDir + "__old";
+        // Phase 11 (11-03, run 20260905_133536_N4): PID-unique oldDir - the
+        // shared "__old" name was itself a rendezvous point for sibling
+        // receivers committing the same broadcast transfer on a same-machine
+        // rig (one sibling's removeTree racing another's move-aside).
+        char oldSuffix[40];
+        _snprintf(oldSuffix, sizeof(oldSuffix) - 1, "__old_%lu",
+                  (unsigned long)GetCurrentProcessId());
+        oldSuffix[sizeof(oldSuffix) - 1] = '\0';
+        std::string oldDir = finalDir + oldSuffix;
         removeTree(oldDir, 0);
         bool hadOld = false;
+        bool adoptedOccupant = false;
         if (GetFileAttributesA(finalDir.c_str()) != INVALID_FILE_ATTRIBUTES) {
             hadOld = (MoveFileExA(finalDir.c_str(), oldDir.c_str(),
                                   MOVEFILE_WRITE_THROUGH) != 0);
-            if (!hadOld) ok = false;
+            if (!hadOld && GetFileAttributesA(finalDir.c_str()) != INVALID_FILE_ATTRIBUTES) {
+                // Phase 11 (11-03): same WR-06 occupant-fingerprint resolution
+                // as the move-in branch below, applied to the move-ASIDE
+                // failure - on a same-machine rig the occupant blocking our
+                // aside is usually a SIBLING receiver's just-committed copy of
+                // the SAME CRC-verified broadcast data (or the sibling is
+                // still holding handles from its own commit). If the
+                // occupant's content fingerprint equals our staged data's,
+                // our copy is redundant, not wrong - adopt the occupant
+                // instead of failing the transfer (run 20260905_133536_N4:
+                // full bytes received, badCrc=0, commit lost this exact
+                // race and burned a coordinator retry).
+                u32 stagedFp   = fingerprintFolderPath(g_recvStaging);
+                u32 occupantFp = fingerprintFolderPath(finalDir);
+                if (stagedFp != 0 && stagedFp == occupantFp) {
+                    adoptedOccupant = true;
+                    removeTree(g_recvStaging, 0);
+                    coop::logLine("[save] XFER commit-race occupant IDENTICAL "
+                                  "(move-aside blocked) - adopted the sibling's commit");
+                } else {
+                    ok = false; // genuinely still occupied by DIFFERENT data - not resolvable
+                }
+            }
         }
+        if (adoptedOccupant) {
+            // Nothing left to move; fall through to the success bookkeeping.
+        } else
         if (ok && !MoveFileExA(g_recvStaging.c_str(), finalDir.c_str(),
                                MOVEFILE_WRITE_THROUGH)) {
-            ok = false;
-            if (hadOld) MoveFileExA(oldDir.c_str(), finalDir.c_str(),
-                                    MOVEFILE_WRITE_THROUGH); // restore
+            if (GetFileAttributesA(finalDir.c_str()) != INVALID_FILE_ATTRIBUTES) {
+                // Phase 10 review WR-06: "finalDir exists" alone is NOT
+                // proof a sibling receiver committed our identical data - in
+                // production, anything can recreate save/<name> between the
+                // two moves (the join's own engine writing that name with
+                // suppression just lifted, an autosave, ...). Declaring the
+                // race benign then records SC_COMMITTED for a copy that was
+                // never CRC-verified - masked divergence, the exact class
+                // the CRC table exists to prevent. Verify the OCCUPANT: the
+                // race is only benign when its content fingerprint equals
+                // our staged (already CRC-verified) data's.
+                u32 stagedFp   = fingerprintFolderPath(g_recvStaging);
+                u32 occupantFp = fingerprintFolderPath(finalDir);
+                if (stagedFp != 0 && stagedFp == occupantFp) {
+                    removeTree(g_recvStaging, 0); // identical concurrent commit won the race
+                } else {
+                    char fb[192];
+                    _snprintf(fb, sizeof(fb) - 1,
+                              "[save] XFER commit-race occupant DIVERGED "
+                              "(stagedFp=%08x occupantFp=%08x) - not committed",
+                              stagedFp, occupantFp);
+                    fb[sizeof(fb) - 1] = '\0'; coop::logErrLine(fb);
+                    ok = false;
+                    if (hadOld) MoveFileExA(oldDir.c_str(), finalDir.c_str(),
+                                            MOVEFILE_WRITE_THROUGH); // best-effort restore
+                }
+            } else {
+                ok = false;
+                if (hadOld) MoveFileExA(oldDir.c_str(), finalDir.c_str(),
+                                        MOVEFILE_WRITE_THROUGH); // restore
+            }
         }
         if (ok && hadOld) removeTree(oldDir, 0);
     }

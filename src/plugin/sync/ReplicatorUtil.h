@@ -32,6 +32,7 @@
 #include "../core/WorkPose.h" // poseClearElapsed (debounced task-clear predicate)
 #include "../core/DeathLatch.h" // rekeyCarryLatch (down/death latch carry on re-key)
 #include "ChangeGate.h" // Phase 6: shared change-gated send/accept policy
+#include "FoldDedup.h" // Phase 5: shared per-owner fold/dedup helpers (ID-01)
 #include "SyncContext.h" // Phase 6: per-tick channel call environment
 #include "../CoopLog.h"
 

@@ -573,6 +573,28 @@ struct Config {
     // "0" is the A/B escape hatch.
     bool          latejoinSync;
 
+    // Phase 10 Plan 01 (SAVE-01): bounded retry + drop policy for the
+    // per-client coordinated-save/load coordinator (SaveCoord.h/LoadCoord.h).
+    // KENSHICOOP_SAVE_RETRIES (default 2): retries a failed/silent client's
+    // transfer/load this many times before kickPeer drops it. Everyone else
+    // completes normally regardless of one client's outcome.
+    unsigned int  saveRetries;
+    // KENSHICOOP_SAVE_ACK_TIMEOUT_MS (default 30000): the floor of the per-
+    // client deadline before a silent client counts as failed; driveSaveSync
+    // scales this up for large transfers (size / 2.5 MBps * 3) so a genuinely
+    // slow-but-healthy transfer is never mistaken for a dead client.
+    unsigned long saveAckTimeoutMs;
+    // KENSHICOOP_LOAD_ACK_TIMEOUT_MS (default 120000): the load-plane
+    // deadline floor (phase 10 review CR-03). A coordinated load's ACK
+    // covers strictly more than a save ACK: GO delivery + the join's
+    // fingerprint + (NACK path) the host's OWN reload (tens of seconds) +
+    // the fallback SaveXfer + the join's reload to gameplay-live - so it
+    // gets its own, larger floor instead of reusing saveAckTimeoutMs.
+    // driveLoadSync additionally re-arms the deadline at each observed
+    // progress edge (NACK, transfer start - size-scaled) so only genuine
+    // silence ever expires a client.
+    unsigned long loadAckTimeoutMs;
+
     // Transport selection (KENSHICOOP_TRANSPORT): "udp" (default) or "steam".
     // "steam" tunnels the unchanged ENet protocol over Steam P2P (legacy
     // ISteamNetworking in the game's own steam_api64.dll): connections are

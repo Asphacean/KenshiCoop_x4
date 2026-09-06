@@ -22,6 +22,11 @@ tools/manual-sessions/
 third_party/enet/enet/
 third_party/KenshiLib_deps/
 
+# Downloaded RE_Kenshi release zip + extraction cache (scripts/clone_instance.ps1
+# downloads/caches it here). Per-machine cache of a fixed external GitHub-release
+# binary, not repo source - same rationale as the third_party/ entries above.
+scripts/vendor/
+
 # Test-run artifacts (logs, screenshots, verdicts, history)
 tools/test-runs/
 tools/*.log
@@ -69,6 +74,14 @@ tools/*.exe
 # Machine-specific config (committed template: scripts/lan.config.example.json)
 scripts/lan.config.json
 
+# Machine-specific N-instance rig config (committed templates:
+# scripts/local.rig.example.json, .n2.example.json, .n3.example.json). Covers
+# the base 2-client config plus the N=2/N=3 live rig variants (11-03) - all
+# carry machine-local install paths, same as local.rig.json.
+scripts/local.rig.json
+scripts/local.rig.n2.json
+scripts/local.rig.n3.json
+
 # Local assets / working notes (design docs, spikes, recordings, frames) - kept
 # locally, not tracked in the repo.
 resources/
@@ -78,3 +91,9 @@ nul
 
 # Local-only maintainer notes (release process, etc.) - not for the public repo
 *.local.md
+
+# Spec-driven development / agent working artifacts - kept locally, never published
+.planning/
+.claude/
+.cursor/
+MAIN_GOAL.MD

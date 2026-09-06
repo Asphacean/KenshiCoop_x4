@@ -83,6 +83,7 @@ NetLink::NetLink()
       outOwner_(0), outStampMs_(0), haveOut_(false),
       thread_(0), running_(0), stopFlag_(0), myId_(0),
       sendEpoch_(0),
+      debugResendHello_(0),
       steamPeer_(0),
       simDelayMs_(0), simJitterMs_(0), simLossPct_(0) {
     InitializeCriticalSection(&outCs_);
@@ -148,6 +149,8 @@ void NetLink::setOwnedEntities(u32 ownerId, const EntityState* arr, unsigned int
 
 void NetLink::queueEvent(const EventPacket& ev) { pushLocked(outCs_, outEvents_, ev); }
 
+void NetLink::debugResendHelloForTest() { InterlockedExchange(&debugResendHello_, 1); }
+
 void NetLink::queueInvSnapshot(u32 ownerId, u8 keyKind, const u32 cKey[5],
                                const InvItemEntry* items, unsigned int count, u8 flags) {
     OutInv oi;
@@ -179,13 +182,15 @@ void NetLink::queueWorldRemove(u32 ownerId, const u32* netIds, unsigned int coun
 }
 
 void NetLink::queueWorldClaim(u32 ownerId, u32 authorId, const u32* netIds,
-                              unsigned int count) {
+                              unsigned int count, u32 authorClaimMs) {
     OutWorldClaim ow;
-    ow.ownerId = ownerId; ow.authorId = authorId;
+    ow.ownerId = ownerId; ow.authorId = authorId; ow.authorClaimMs = authorClaimMs;
     if (count > 255) count = 255; // u8 count on the wire
     if (netIds && count > 0) ow.netIds.assign(netIds, netIds + count);
     pushLocked(outCs_, outWorldClaim_, ow);
 }
+
+void NetLink::queueClaimVerdict(const ClaimVerdictPacket& pkt) { pushLocked(outCs_, outClaimVerdict_, pkt); }
 
 void NetLink::queueNpcCensus(u32 ownerId, const u32* hands, const float* pos,
                              unsigned int count) {
@@ -211,6 +216,7 @@ void NetLink::queueStats(const StatsPacket& pkt) { pushLocked(outCs_, outStats_,
 
 void NetLink::queueMoney(const MoneyPacket& pkt) { pushLocked(outCs_, outMoney_, pkt); }
 void NetLink::queueMoneyDelta(const MoneyDeltaPacket& pkt) { pushLocked(outCs_, outMoneyDelta_, pkt); }
+void NetLink::queueMoneyReject(const MoneyRejectPacket& pkt) { pushLocked(outCs_, outMoneyReject_, pkt); }
 
 void NetLink::queueFaction(const FactionPacket& pkt) { pushLocked(outCs_, outFaction_, pkt); }
 
@@ -239,6 +245,7 @@ void NetLink::queueStealth(const StealthPacket& pkt) { pushLocked(outCs_, outSte
 void NetLink::queueCamHint(const CamHintPacket& pkt) { pushLocked(outCs_, outCamHint_, pkt); }
 
 void NetLink::queueCellClaim(const CellClaimPacket& pkt) { pushLocked(outCs_, outCellClaim_, pkt); }
+void NetLink::queueCellMap(const CellMapPacket& pkt) { pushLocked(outCs_, outCellMap_, pkt); }
 
 void NetLink::queueSpawnReq(const SpawnReqPacket& pkt) { pushLocked(outCs_, outSpawnReq_, pkt); }
 
@@ -250,35 +257,334 @@ void NetLink::queueInvXfer(const InvXferPacket& pkt) { pushLocked(outCs_, outInv
 
 void NetLink::queueInvXferAck(const InvXferAckPacket& pkt) { pushLocked(outCs_, outInvXferAcks_, pkt); }
 
+void NetLink::queueXferCommit(const XferCommitPacket& pkt) { pushLocked(outCs_, outXferCommit_, pkt); }
+
+void NetLink::queueXferCommitAck(const XferCommitAckPacket& pkt) { pushLocked(outCs_, outXferCommitAck_, pkt); }
+
 void NetLink::queueSaveReq(const SaveReqPacket& pkt) { pushLocked(outCs_, outSaveReq_, pkt); }
 
-void NetLink::queueSaveBegin(const SaveBeginPacket& pkt) { pushLocked(outCs_, outSaveBegin_, pkt); }
+void NetLink::queueSaveBegin(const SaveBeginPacket& pkt, u32 destId) {
+    OutSaveBegin ob; ob.pkt = pkt; ob.destId = destId;
+    pushLocked(outCs_, outSaveBegin_, ob);
+}
 
 void NetLink::queueSaveFile(const SaveFileHeader& hdr, const char* relPath,
-                            const unsigned char* data, unsigned int dataLen) {
+                            const unsigned char* data, unsigned int dataLen,
+                            u32 destId) {
     OutSaveFile of;
     of.hdr = hdr;
     of.tail.reserve(hdr.pathLen + dataLen);
     of.tail.assign(relPath, relPath + hdr.pathLen);
     if (data && dataLen > 0) of.tail.insert(of.tail.end(), data, data + dataLen);
+    of.destId = destId;
     pushLocked(outCs_, outSaveFile_, of);
 }
 
 void NetLink::queueSaveDone(const SaveDoneHeader& hdr, const u32* crcs,
-                            unsigned int count) {
+                            unsigned int count, u32 destId) {
     OutSaveDone od;
     od.hdr = hdr;
     if (crcs && count > 0) od.crcs.assign(crcs, crcs + count);
+    od.destId = destId;
     pushLocked(outCs_, outSaveDone_, od);
 }
 
 void NetLink::queueSaveAck(const SaveAckPacket& pkt) { pushLocked(outCs_, outSaveAck_, pkt); }
 
-void NetLink::queueLoadGo(const LoadGoPacket& pkt) { pushLocked(outCs_, outLoadGo_, pkt); }
+void NetLink::queueLoadGo(const LoadGoPacket& pkt, u32 destId) {
+    OutLoadGo og; og.pkt = pkt; og.destId = destId;
+    pushLocked(outCs_, outLoadGo_, og);
+}
 
 void NetLink::queueLoadReq(const LoadReqPacket& pkt) { pushLocked(outCs_, outLoadReq_, pkt); }
 
 void NetLink::queueLoadNack(const LoadNackPacket& pkt) { pushLocked(outCs_, outLoadNack_, pkt); }
+
+void NetLink::queueLoadAck(const LoadAckPacket& pkt) { pushLocked(outCs_, outLoadAck_, pkt); }
+
+void NetLink::queueCoordReject(const CoordRejectPacket& pkt) { pushLocked(outCs_, outCoordReject_, pkt); }
+
+void NetLink::kickPeer(u32 playerId) { pushLocked(outCs_, outKick_, playerId); }
+
+void NetLink::broadcastOwnRanks(const OwnRanksPacket& pkt) { pushLocked(outCs_, outOwnRanks_, pkt); }
+
+// Host-side send primitives (Phase 2). NET-thread-only, built directly on the
+// registry above and the same enet_peer_send/enet_host_broadcast calls every
+// outbound drain already uses - see the two-branch shape repeated ~40 times
+// below in threadLoop(). Not migrated into any existing drain this plan
+// (Phase 3 scope); this is the primitive layer only.
+void NetLink::sendTo(u32 playerId, ENetPacket* pkt, int channel) {
+    std::map<u32, PeerState>::iterator it = registry_.find(playerId);
+    if (it != registry_.end() && it->second.peer &&
+        it->second.peer->state == ENET_PEER_STATE_CONNECTED) {
+        enet_peer_send(it->second.peer, (enet_uint8)channel, pkt);
+    } else {
+        enet_packet_destroy(pkt);
+    }
+}
+
+void NetLink::broadcast(ENetPacket* pkt, int channel) {
+    if (isHost_) {
+        enet_host_broadcast(enetHost_, (enet_uint8)channel, pkt);
+    } else {
+        // Host-only concept; a client calling this would misroute the packet
+        // to the single server peer under a name that promises "everyone".
+        enet_packet_destroy(pkt);
+    }
+}
+
+void NetLink::broadcastExcept(u32 playerId, ENetPacket* pkt, int channel) {
+    unsigned sentCount = 0;
+    for (std::map<u32, PeerState>::iterator it = registry_.begin();
+         it != registry_.end(); ++it) {
+        if (it->first == playerId) continue;
+        if (it->second.peer && it->second.peer->state == ENET_PEER_STATE_CONNECTED) {
+            // Same ENetPacket* reused across sends - ENet refcounts it
+            // internally, so this is the documented-safe fan-out pattern
+            // (never enet_host_broadcast-then-"unsend"; ENet has no such
+            // retraction).
+            enet_peer_send(it->second.peer, (enet_uint8)channel, pkt);
+            ++sentCount;
+        }
+    }
+    if (sentCount == 0) enet_packet_destroy(pkt);
+}
+
+// NET thread (Phase 3): routing-class lookup, keyed by docs/ROUTING_MATRIX.md's
+// Class column. Pure and game-free - a switch over PacketType, no I/O, safe to
+// call from any thread (nettest's Task 3 drift oracle calls it directly with no
+// NetLink instance). Every case below cites the matrix row(s) it implements by
+// packet NAME - the matrix's row NUMBERS are its own thematic ordering, not the
+// PacketType enum's numeric value, so names (not numbers) are the source of truth.
+RelayClass NetLink::routingClassOf(u8 packetType) {
+    switch (packetType) {
+    // Class A (broadcast-authoritative): join-authored state must reach every
+    // OTHER connected client, ownerId unchanged, never echoed to the author.
+    case PKT_ENTITY_BATCH:
+    case PKT_EVENT:
+    case PKT_INV_SNAPSHOT:
+    case PKT_WORLD_ITEM:
+    case PKT_WORLD_ITEM_REMOVE:
+    case PKT_WORLD_DROP:
+    case PKT_WORLD_PICKUP:
+    case PKT_MEDICAL:
+    case PKT_STATS:
+    case PKT_DOOR:
+    case PKT_BUILD_PLACE:
+    case PKT_BUILD_STATE:
+    case PKT_BUILD_DOOR:
+    case PKT_BUILD_REMOVE:
+    case PKT_CAM_HINT:
+    case PKT_FIXTURE:
+    // Phase 8 Plan 02 Task 3 (WORLD-03): PKT_NPC_CENSUS moved HERE (Class A,
+    // RELAY_BROADCAST_EXCEPT) out of Class B (host-only) - the per-owner
+    // census intake (map<ownerId,CensusSet>) means a join's own census is
+    // now safe to relay to OTHER joins: no wire change (NpcCensusHeader
+    // already carries ownerId), and rejectIfForgedOwner on the receive
+    // branch guards a forged census owner exactly like every other Class A
+    // row. The host's own census still reaches everyone the same way it
+    // always did (broadcastExcept with the host as sourcePlayerId reaches
+    // every OTHER connected client, which for the host IS everyone).
+    case PKT_NPC_CENSUS:
+    // Phase 6 (GAP-1/GAP-2): PKT_TREATMENT and PKT_STEALTH were FAILSAFE
+    // because neither wire struct carries a destination PlayerId (Phase 3
+    // rationale below). Both are now proven Class A instead: broadcast-except
+    // fan-out reaches every non-author receiver, and correctness holds
+    // because every receiver applies ONLY to bodies it authors - the
+    // treatment authority guard (ReplicatorChannels.cpp applyTreatments,
+    // "own hand" skip) and the stealth ownHands_ apply guard
+    // (ReplicatorChannels.cpp applyStealthFeedback) both already ignore a
+    // relayed packet whose target hand isn't theirs. A non-authority
+    // receiver's ignore is a no-op, not a correctness risk - the same
+    // pattern PKT_MEDICAL/PKT_STATS already rely on above. No wire change;
+    // rejectIfForgedOwner() already authenticates ownerId == sourcePlayerId
+    // for every Class A relay.
+    case PKT_TREATMENT:
+    case PKT_STEALTH:
+        return RELAY_BROADCAST_EXCEPT;
+
+    // Class D already carrying a routable destination PlayerId field on the
+    // wire (InvXferAckPacket::xferOwnerId) - no game-thread hand-ownership
+    // lookup needed; a same-day sendTo() swap. (PKT_WORLD_ITEM_CLAIM moved OUT
+    // of this group in Phase 7 Plan 02 - see below.)
+    case PKT_INV_XFER_ACK:
+        return RELAY_UNICAST;
+
+    // Class D/E whose destination cannot be resolved on the net thread this
+    // phase - either it needs a game-thread hand->owner lookup, or the wire
+    // struct carries no destination-player field at all (PKT_SPAWN_INFO, the
+    // PKT_SAVE_BEGIN/FILE/DONE save-transfer group - RESEARCH.md Pitfall 4).
+    // Never blind-broadcast a targeted/host-only packet to route around the
+    // missing unicast (Security note: a leaked Class D/E is information
+    // disclosure) - log and drop instead. (PKT_STEALTH/PKT_TREATMENT moved to
+    // Class A above, Phase 6 GAP-1/GAP-2; PKT_INV_XFER moved OUT of this
+    // group in Phase 7 Plan 01 - see below.)
+    case PKT_SPAWN_INFO:
+    case PKT_SAVE_BEGIN:
+    case PKT_SAVE_FILE:
+    case PKT_SAVE_DONE:
+        return RELAY_FAILSAFE_LOG;
+
+    // Everything else never relays through the host's dispatch: Class B
+    // (host-broadcast, e.g. PKT_MONEY/PKT_PROD/PKT_LOAD_GO/PKT_PLAYER_JOINED/
+    // PKT_PLAYER_LEFT/PKT_OWN_RANKS - already correct via enet_host_broadcast
+    // or the dedicated sendTo/broadcastExcept roster call sites), Class C
+    // (client-request, e.g. PKT_TIME_PING/PKT_SPEED_REQ/PKT_SAVE_REQ/
+    // PKT_COMBAT_HIT - terminates at the host by definition), PKT_TIME (the
+    // B/C role-split channel - neither branch relays), Class F handshake
+    // (PKT_HELLO/PKT_WELCOME - already targeted inline against ev.peer at
+    // connect time), PKT_TIME_PONG (Class D, but ALREADY correctly unicast
+    // inline via enet_peer_send(ev.peer,...) - ROUTING_MATRIX.md row 12's
+    // stale "needs sendTo()" claim is corrected by this phase's doc update,
+    // not by a code change here - RESEARCH.md Pitfall 5), and PKT_LEAVE (the
+    // N/A sentinel, never actually sent on the wire).
+    //
+    // Phase 7 Plan 01 (protocol 58): PKT_INV_XFER moved HERE (RELAY_NONE) out
+    // of the RELAY_FAILSAFE_LOG group above - it now carries srcOwnerId/
+    // dstOwnerId (resolved on the AUTHOR's game thread), which closes the
+    // exact gap that used to force FAILSAFE: the intent is a host-terminated
+    // CLIENT-REQUEST (Class C shape, like PKT_SPEED_REQ), so it falls through
+    // to this default branch - the host consumes it (after
+    // rejectIfForgedOwner on the receive branch) and never relays the raw
+    // intent to any other client. PKT_XFER_COMMIT (host's single broadcast
+    // verdict, Class B - authored via queueXferCommit's isHost_ branch, same
+    // shape as broadcastOwnRanks, never received-and-relayed through this
+    // switch) and PKT_XFER_COMMIT_ACK (participant -> host bookkeeping,
+    // Class C shape) also land here by omission, matching every other
+    // Class B/C packet's "no explicit case needed" convention above.
+    //
+    // Phase 7 Plan 02 (protocol 58): PKT_WORLD_ITEM_CLAIM moved HERE
+    // (RELAY_NONE) out of the RELAY_UNICAST group above - it is now the claim
+    // INTENT (claimant -> host, Class C shape, same host-terminated
+    // reasoning as PKT_INV_XFER just above), carrying authorClaimMs so the
+    // host's ClaimArbiter.h contention window can map it. The receive branch
+    // calls rejectIfForgedOwner then pushes to the host's own arbiter -
+    // never relayed to the item's author or any other client anymore.
+    // PKT_CLAIM_VERDICT (host's single broadcast winner, Class B - authored
+    // via queueClaimVerdict's isHost_ branch, same shape as
+    // broadcastOwnRanks/queueXferCommit) also lands here by omission.
+    //
+    // Phase 8 (WORLD-01/WORLD-02, protocol 58 - NO wire change): PKT_FACTION
+    // and PKT_DEED moved HERE (RELAY_NONE) out of the Class A block above.
+    // They are LOCKED global world facts (faction diplomacy, property
+    // ownership), not per-hand symmetric state like doors - the "joins never
+    // mutate global facts directly" decision means a join's row is now an
+    // INTENT (host-terminated CLIENT-REQUEST, the exact PKT_INV_XFER/
+    // PKT_WORLD_ITEM_CLAIM precedent from Phase 7), never relayed to any
+    // other client. The wire struct is unchanged (no new field, no PROTOCOL_
+    // VERSION bump) - only the routing class and the host's apply-side echo
+    // guard change (ReplicatorChannels.cpp applyFactions/applyDeeds): the
+    // HOST applies the write but does NOT update its own publish baseline
+    // for a received row, so its own publishFactions/publishDeeds detects the
+    // change and RE-EMITS the committed fact under the host's own ownerId/
+    // seq - every join converges to the host's value. This also kills the
+    // cross-sender seq collision on these two channels as a side effect
+    // (after conversion only the host ever authors the rows a join applies).
+    // The receive branches gain rejectIfForgedOwner (the check relayDispatch
+    // used to perform for a Class A relay, now bypassed for RELAY_NONE).
+    //
+    // Phase 8 Plan 02 (protocol 59, WORLD-03): PKT_CELL_CLAIM moved HERE
+    // (RELAY_NONE) out of the Class A block above - it is now a
+    // host-terminated INTENT (every instance still PUBLISHES its own claims,
+    // but only the host folds them into claimSlots_ and runs the reduce),
+    // the exact PKT_INV_XFER/PKT_WORLD_ITEM_CLAIM precedent. The receive
+    // branch calls rejectIfForgedOwner then pushes to the host's own intake
+    // - never relayed to any other client anymore (a join no longer needs
+    // to see another join's raw claim; it only ever adopts the host's
+    // reduced map). PKT_CELL_MAP (the host's single broadcast verdict,
+    // Class B - authored via queueCellMap's isHost_ branch, same shape as
+    // queueClaimVerdict/queueXferCommit) also lands here by omission.
+    //
+    // Phase 9 Plan 01 (protocol 60, CONS-01): PKT_MONEY_REJECT (the host's
+    // single insufficient-funds verdict broadcast, Class B - authored via
+    // queueMoneyReject's isHost_ branch, same shape as
+    // queueClaimVerdict/queueCellMap/queueXferCommit) also lands here by
+    // omission - never received-and-relayed through this switch.
+    //
+    // Phase 10 Plan 01 (protocol 61, SAVE-02/SAVE-03): PKT_LOAD_ACK (join ->
+    // host, Class C client-request shape like PKT_SAVE_ACK - terminates at
+    // the host) and PKT_COORD_REJECT (host -> the rejected requester ONLY,
+    // Class D unicast authored via queueCoordReject's isHost_ branch -
+    // sendTo, never enet_host_broadcast) both land here by omission - neither
+    // is ever received-and-relayed through this switch.
+    default:
+        return RELAY_NONE;
+    }
+}
+
+// NET thread, host-only (Phase 3 CR-01 fix): see the declaration doc comment
+// in NetLink.h for the full contract. Factored out of relayDispatch()'s
+// RELAY_BROADCAST_EXCEPT/RELAY_UNICAST reject branches (below) so every
+// Class A/E receive branch can run the SAME ownerId-vs-domain check BEFORE
+// its own local-apply push, not just before the relay. relayDispatch() keeps
+// its own copy of this check as defense in depth - a forged packet that
+// somehow slipped past this pre-check would still be rejected there rather
+// than relayed to a third client.
+bool NetLink::rejectIfForgedOwner(u32 sourcePlayerId, u32 claimedOwnerId) {
+    if (!isHost_) return false; // a client only ever applies host-authored payloads
+    if (claimedOwnerId == sourcePlayerId) return false; // legitimate: author owns its own domain
+    char b[96];
+    _snprintf(b, sizeof(b) - 1, "relay REJECT player=%u claimed owner=%u",
+              (unsigned)sourcePlayerId, (unsigned)claimedOwnerId);
+    b[sizeof(b) - 1] = '\0';
+    netErr(b);
+    return true;
+}
+
+// NET thread, host-only (Phase 3): see the declaration doc comment in
+// NetLink.h for the full contract. Extracted from this plan's Task 1 tracer
+// (the RELAY_BROADCAST_EXCEPT branch below is byte-for-byte what Task 1 proved
+// end-to-end for PKT_ENTITY_BATCH) and generalized to every routing class.
+void NetLink::relayDispatch(u8 packetType, u32 sourcePlayerId, u32 claimedOwnerId,
+                             u32 destId, const ENetEvent& ev) {
+    if (!isHost_) return;
+    const unsigned len = (unsigned)ev.packet->dataLength;
+    switch (routingClassOf(packetType)) {
+    case RELAY_BROADCAST_EXCEPT:
+        if (claimedOwnerId == sourcePlayerId) {
+            // Fresh copy, never ev.packet itself: the single unconditional
+            // enet_packet_destroy(ev.packet) at the end of the receive case
+            // runs for every branch, and broadcastExcept relinquishes
+            // ownership of whatever it's handed - passing ev.packet itself
+            // would double-free it (STRIDE T-03-02).
+            ENetPacket* copy = enet_packet_create(ev.packet->data, len, ev.packet->flags);
+            broadcastExcept(sourcePlayerId, copy, (int)ev.channelID);
+        } else {
+            char b[96];
+            _snprintf(b, sizeof(b) - 1, "relay REJECT player=%u claimed owner=%u",
+                      (unsigned)sourcePlayerId, (unsigned)claimedOwnerId);
+            b[sizeof(b) - 1] = '\0';
+            netErr(b);
+        }
+        break;
+    case RELAY_UNICAST:
+        // Same ownerId-vs-sourcePlayerId validation as Class A (Security
+        // note): a client must not be able to publish another player's
+        // ownership domain through a targeted channel either.
+        if (claimedOwnerId == sourcePlayerId) {
+            ENetPacket* copy = enet_packet_create(ev.packet->data, len, ev.packet->flags);
+            sendTo(destId, copy, (int)ev.channelID);
+        } else {
+            char b[96];
+            _snprintf(b, sizeof(b) - 1, "relay REJECT player=%u claimed owner=%u",
+                      (unsigned)sourcePlayerId, (unsigned)claimedOwnerId);
+            b[sizeof(b) - 1] = '\0';
+            netErr(b);
+        }
+        break;
+    case RELAY_FAILSAFE_LOG: {
+        char b[80];
+        _snprintf(b, sizeof(b) - 1, "relay FAILSAFE no-relay type=%u player=%u",
+                  (unsigned)packetType, (unsigned)sourcePlayerId);
+        b[sizeof(b) - 1] = '\0';
+        netErr(b);
+        break;
+    }
+    case RELAY_NONE:
+    default:
+        break; // no-op: this class never relays through the host's dispatch.
+    }
+}
 
 void NetLink::setNetSim(unsigned int delayMs, unsigned int jitterMs, unsigned int lossPct) {
     simDelayMs_  = delayMs;
@@ -399,7 +705,6 @@ void NetLink::threadLoop() {
         if (serverPeer_) serverPeer_->mtu = 1200;
     }
 
-    u32   nextId = 1;
     DWORD lastConnectAttempt = GetTickCount();
 
     // Wall-clock time-sync state (client only). The join pings every ~2 s; each
@@ -444,16 +749,31 @@ void NetLink::threadLoop() {
         while (enet_host_service(enetHost_, &ev, TICK_MS) > 0) {
             switch (ev.type) {
                 case ENET_EVENT_TYPE_CONNECT: {
-                    // A fresh connection restarts the peer's epoch sequence (a
-                    // reconnecting peer may resume at a lower epoch than the one
-                    // we last saw); forget prior per-owner epochs so the new
-                    // session's first batch is never mistaken for stale (v44).
-                    epochSeen_.clear();
                     if (isHost_) {
+                        // Do NOT blanket-clear epochSeen_ here (Phase 2 Plan 03):
+                        // this event fires for EVERY connecting peer, including a
+                        // 3rd/4th client joining an already-populated host, and a
+                        // blanket .clear() here used to wipe players 1/2's
+                        // already-accepted epoch state the instant a 3rd peer's
+                        // ENet handshake completed - before that peer's own id is
+                        // even known (TWO_PLAYER_ASSUMPTIONS finding 8's global-
+                        // wipe bug class, RESEARCH.md Pitfall 2). The per-player
+                        // reset for THIS connecting peer happens once its id is
+                        // assigned below (epochSeen_.erase(id) in the HELLO
+                        // success branch), touching only its own stale epoch
+                        // entry - never another connected player's.
+                        //
                         // Wait for the client's HELLO before assigning an id, so
                         // a version mismatch is rejected before we admit it.
                         netLog("peer connecting (awaiting HELLO)");
                     } else {
+                        // Client: a fresh connection to the host restarts our own
+                        // epoch bookkeeping. A client's registry is exactly the
+                        // one link to the host, so a blanket reset here is
+                        // correct - not the finding-8 global-wipe bug class,
+                        // which is specific to the HOST fanning one connect event
+                        // out across many already-connected players.
+                        epochSeen_.clear();
                         // Introduce ourselves with our protocol version.
                         HelloPacket h;
                         h.type = (u8)PKT_HELLO; h.version = PROTOCOL_VERSION; h.nameLen = 0;
@@ -465,10 +785,50 @@ void NetLink::threadLoop() {
                 }
                 case ENET_EVENT_TYPE_RECEIVE: {
                     const u8 type = packetType(ev.packet->data, (unsigned)ev.packet->dataLength);
+                    // Sender-identity resolution (Phase 2, NET-04): the host's only
+                    // AUTHORITATIVE knowledge of who sent this packet is the connection
+                    // itself - ev.peer->data, assigned by the host at HELLO/WELCOME time
+                    // (see the connect-handler registry insert below) - never the
+                    // packet's own self-reported ownerId field, which every receive
+                    // branch below still reads from the payload unchanged this phase.
+                    // Resolved once here, before the per-type dispatch, so it is
+                    // available to every branch; not yet used to reject/rewrite a
+                    // mismatched payload ownerId (that is Phase 3's relay-boundary
+                    // work per docs/ROUTING_MATRIX.md's Security note) - this phase's
+                    // job is only to make the true sender EXIST and be OBSERVABLE on
+                    // every receive, closing the "only known at disconnect" gap.
+                    // Excluded from the HELLO branch: ev.peer->data is not assigned
+                    // yet for a still-connecting peer, so it would only ever read 0.
+                    u32 sourcePlayerId = (u32)(size_t)ev.peer->data;
+                    if (isHost_ && type != PKT_HELLO) {
+                        char sb[64];
+                        _snprintf(sb, sizeof(sb) - 1, "recv player=%u type=%u",
+                                  (unsigned)sourcePlayerId, (unsigned)type);
+                        sb[sizeof(sb) - 1] = '\0';
+                        netLog(sb);
+                    }
                     if (isHost_ && type == PKT_HELLO) {
                         HelloPacket h;
                         if (readPacket(ev.packet->data, (unsigned)ev.packet->dataLength, &h)) {
-                            if (h.version != PROTOCOL_VERSION) {
+                            if (ev.peer->data != 0) {
+                                // Duplicate HELLO on an already-registered connection
+                                // (CR-02): ev.peer->data is only ever non-zero once the
+                                // free-slot scan below has assigned this peer a real id
+                                // (ids start at 1; a still-connecting peer reads its
+                                // zero-initialized default). Re-running the scan here
+                                // would mint a SECOND id for the same ENetPeer* and
+                                // orphan the slot it already holds - permanently, since
+                                // the disconnect handler only ever erases
+                                // registry_.find(ev.peer->data), which by then reads the
+                                // new id, not the old one. Treat the resend as a no-op:
+                                // do not re-scan, re-insert, or re-broadcast anything.
+                                char b[96];
+                                _snprintf(b, sizeof(b) - 1,
+                                          "duplicate HELLO from already-registered id=%u; ignored",
+                                          (unsigned)(size_t)ev.peer->data);
+                                b[sizeof(b) - 1] = '\0';
+                                netLog(b);
+                            } else if (h.version != PROTOCOL_VERSION) {
                                 char b[128];
                                 _snprintf(b, sizeof(b) - 1,
                                           "protocol mismatch: peer v%u, ours v%u; rejecting",
@@ -477,30 +837,99 @@ void NetLink::threadLoop() {
                                 netErr(b);
                                 enet_peer_disconnect(ev.peer, 0);
                             } else {
-                                u32 id = nextId++;
-                                // TWO-PLAYER ASSUMPTION (step-6 guard): the sync model
-                                // is host + ONE join. Join-authored events/inventory/
-                                // conservation intents reach only the host and are NOT
-                                // relayed to other joins, and OWNER_ID_ALL sweeps assume
-                                // a single peer. A third player connects at the wire
-                                // level but will silently desync - fail loudly instead.
-                                if (id >= 2) {
-                                    netErr("3+ players unsupported: join-authored state is "
-                                           "not relayed peer-to-peer; expect desync");
+                                // Registry-backed lowest-free-slot assignment (Phase 2):
+                                // PlayerId 0 is reserved for the host; scan [1, MAX_PLAYERS)
+                                // for the first id not currently held in registry_. Replaces
+                                // the old nextId++ counter + "admit anyway, warn" guard
+                                // (TWO_PLAYER_ASSUMPTIONS finding 6) with a real
+                                // access-control boundary: a connect beyond the cap is
+                                // cleanly rejected instead of silently desyncing.
+                                u32  id    = 0;
+                                bool found = false;
+                                for (u32 cand = 1; cand < MAX_PLAYERS; ++cand) {
+                                    if (registry_.find(cand) == registry_.end()) {
+                                        id = cand;
+                                        found = true;
+                                        break;
+                                    }
                                 }
-                                ev.peer->data = (void*)(size_t)id;
-                                WelcomePacket w;
-                                w.type = (u8)PKT_WELCOME; w.version = PROTOCOL_VERSION; w.playerId = id;
-                                ENetPacket* out =
-                                    enet_packet_create(&w, sizeof(w), ENET_PACKET_FLAG_RELIABLE);
-                                enet_peer_send(ev.peer, CH_RELIABLE, out);
-                                char b[96];
-                                _snprintf(b, sizeof(b) - 1,
-                                          "peer connected id=%u (proto v%u)",
-                                          (unsigned)id, (unsigned)PROTOCOL_VERSION);
-                                b[sizeof(b) - 1] = '\0';
-                                netLog(b);
-                                if (inbound_) inbound_->pushConnect(id);
+                                if (!found) {
+                                    char b[128];
+                                    _snprintf(b, sizeof(b) - 1,
+                                              "peer rejected: MAX_PLAYERS=%u slots full",
+                                              (unsigned)MAX_PLAYERS);
+                                    b[sizeof(b) - 1] = '\0';
+                                    netErr(b);
+                                    enet_peer_disconnect(ev.peer, 0);
+                                } else {
+                                    // Roster (Phase 2 Plan 03, NET-05): snapshot
+                                    // every ALREADY-connected peer's id BEFORE the
+                                    // newcomer is inserted below, so this list
+                                    // never includes the newcomer itself.
+                                    std::vector<u32> alreadyConnected;
+                                    for (std::map<u32, PeerState>::const_iterator it =
+                                             registry_.begin();
+                                         it != registry_.end(); ++it) {
+                                        alreadyConnected.push_back(it->first);
+                                    }
+
+                                    PeerState ps;
+                                    ps.peer = ev.peer;
+                                    registry_[id] = ps;
+                                    ev.peer->data = (void*)(size_t)id;
+                                    // Per-player epoch reset for the (possibly
+                                    // reused) slot only - never a blanket clear,
+                                    // so other connected players' accepted-epoch
+                                    // state is untouched at N>=3 (finding 8 /
+                                    // RESEARCH.md Pitfall 2).
+                                    epochSeen_.erase(id);
+
+                                    // Tell the NEWCOMER about every peer that was
+                                    // ALREADY connected. sendTo() looks the target
+                                    // up in registry_, so this MUST run after the
+                                    // newcomer's own insert above - calling it
+                                    // before the insert would find no destination
+                                    // and silently drop every catch-up packet.
+                                    for (size_t ai = 0; ai < alreadyConnected.size(); ++ai) {
+                                        RosterPacket existing;
+                                        existing.type = (u8)PKT_PLAYER_JOINED;
+                                        existing.playerId = alreadyConnected[ai];
+                                        sendTo(id,
+                                               enet_packet_create(
+                                                   &existing, sizeof(existing),
+                                                   ENET_PACKET_FLAG_RELIABLE),
+                                               CH_RELIABLE);
+                                    }
+                                    WelcomePacket w;
+                                    w.type = (u8)PKT_WELCOME; w.version = PROTOCOL_VERSION; w.playerId = id;
+                                    ENetPacket* out =
+                                        enet_packet_create(&w, sizeof(w), ENET_PACKET_FLAG_RELIABLE);
+                                    enet_peer_send(ev.peer, CH_RELIABLE, out);
+                                    char b[112];
+                                    _snprintf(b, sizeof(b) - 1,
+                                              "peer connected id=%u player=%u (proto v%u)",
+                                              (unsigned)id, (unsigned)id, (unsigned)PROTOCOL_VERSION);
+                                    b[sizeof(b) - 1] = '\0';
+                                    netLog(b);
+                                    if (inbound_) inbound_->pushConnect(id);
+
+                                    // Announce the newcomer to every ALREADY-
+                                    // connected client, excluding the newcomer
+                                    // itself (WR-01 fix): it already learned its
+                                    // own id via WELCOME above, and a self-
+                                    // targeted PKT_PLAYER_JOINED would be a new,
+                                    // untested pushConnect(id == localId())
+                                    // event with no documented downstream
+                                    // meaning. broadcastExcept matches the
+                                    // routing matrix's no-echo-to-author rule.
+                                    RosterPacket joined;
+                                    joined.type = (u8)PKT_PLAYER_JOINED;
+                                    joined.playerId = id;
+                                    broadcastExcept(id,
+                                                     enet_packet_create(&joined, sizeof(joined),
+                                                                         ENET_PACKET_FLAG_RELIABLE),
+                                                     CH_RELIABLE);
+                                }
                             }
                         }
                     } else if (!isHost_ && type == PKT_WELCOME) {
@@ -524,6 +953,47 @@ void NetLink::threadLoop() {
                                 if (inbound_) inbound_->pushConnect(0); // host id = 0
                             }
                         }
+                    } else if (!isHost_ && type == PKT_PLAYER_JOINED) {
+                        // Roster (protocol 56): learn of a connected peer - either
+                        // the newcomer just announced, or one of the already-
+                        // connected peers this client is catching up on. Mirrors
+                        // pushConnect exactly (Inbound::pushConnect).
+                        RosterPacket rp;
+                        if (readPacket(ev.packet->data, (unsigned)ev.packet->dataLength, &rp)
+                            && inbound_) {
+                            inbound_->pushConnect(rp.playerId);
+                        }
+                    } else if (!isHost_ && type == PKT_PLAYER_LEFT) {
+                        // Roster (protocol 56): a peer left. Mirrors pushLeave
+                        // exactly (Inbound::pushLeave). OWNER_ID_ALL ("the host
+                        // itself disconnected") is handled separately in the
+                        // DISCONNECT case below, never sent as a roster id here.
+                        RosterPacket rp;
+                        if (readPacket(ev.packet->data, (unsigned)ev.packet->dataLength, &rp)
+                            && inbound_) {
+                            inbound_->pushLeave(rp.playerId);
+                        }
+                    } else if (!isHost_ && type == PKT_OWN_RANKS) {
+                        // Ownership-rank announcement (protocol 57): the host's
+                        // authoritative map<PlayerId,set<rank>>. Applied by the
+                        // game thread via Replicator::setAllOwnRanks() (Plugin.cpp
+                        // drains this queue in processNetEvents) - T-03-06: a
+                        // client only ever APPLIES this host-authored map, never
+                        // authors its own.
+                        OwnRanksPacket rp;
+                        if (readPacket(ev.packet->data, (unsigned)ev.packet->dataLength, &rp)
+                            && inbound_) {
+                            inbound_->pushOwnRanks(rp);
+                        }
+                    } else if (isHost_ && type == PKT_OWN_RANKS) {
+                        // IN-01: a client must never author PKT_OWN_RANKS (T-03-06,
+                        // host-authoritative only) - correctly discarded below via
+                        // the fallthrough enet_packet_destroy(ev.packet), but unlike
+                        // every other rejected/forged packet in this phase there was
+                        // no log line, leaving an attempted peer-authored ownership
+                        // claim with no audit trail. Matches the "relay REJECT ..."/
+                        // "relay FAILSAFE ..." logging discipline used elsewhere.
+                        netErr("PKT_OWN_RANKS from a client rejected (host-authoritative only)");
                     } else if (type == PKT_ENTITY_BATCH) {
                         const unsigned len = (unsigned)ev.packet->dataLength;
                         if (len >= sizeof(EntityBatchHeader) && inbound_) {
@@ -531,15 +1001,28 @@ void NetLink::threadLoop() {
                             std::memcpy(&hdr, ev.packet->data, sizeof(hdr));
                             unsigned need =
                                 sizeof(EntityBatchHeader) + (unsigned)hdr.count * sizeof(EntityState);
-                            // Drop batches from a superseded session (protocol 44)
-                            // before they reach the WAN-sim queue / interp buffers.
-                            if (len >= need && acceptEpoch(hdr.ownerId, hdr.epoch)) {
+                            // WR-03: reject a forged ownerId BEFORE acceptEpoch() ever
+                            // touches epochSeen_ - acceptEpoch() unconditionally inserts
+                            // epochSeen_[hdr.ownerId] on a first sighting, and hdr.ownerId
+                            // is exactly the client-controlled, not-yet-validated field
+                            // CR-01 exists to guard. Validating first also avoids
+                            // polluting a real owner's epoch tracking in the case a
+                            // forged id happens to collide with a currently-connected
+                            // real player's id.
+                            if (len >= need && !rejectIfForgedOwner(sourcePlayerId, hdr.ownerId) &&
+                                acceptEpoch(hdr.ownerId, hdr.epoch)) {
                                 const enet_uint8* p = ev.packet->data + sizeof(EntityBatchHeader);
                                 for (unsigned i = 0; i < hdr.count; ++i) {
                                     EntityState e;
                                     std::memcpy(&e, p + i * sizeof(EntityState), sizeof(e));
                                     deliverEntity(hdr.ownerId, hdr.sendMs, e);
                                 }
+                                // Class A relay (host only, Phase 3 ROUTE-02/03/04): the
+                                // author's PKT_ENTITY_BATCH must reach every OTHER
+                                // connected client exactly once, ownerId unchanged, never
+                                // echoed back to the author (docs/ROUTING_MATRIX.md
+                                // Security note; STRIDE T-03-01/T-03-02).
+                                relayDispatch(type, sourcePlayerId, hdr.ownerId, 0, ev);
                             }
                         }
                     } else if (type == PKT_EVENT) {
@@ -550,7 +1033,12 @@ void NetLink::threadLoop() {
                         EventPacket evp;
                         if (readPacket(ev.packet->data, (unsigned)ev.packet->dataLength, &evp)
                             && inbound_) {
-                            inbound_->pushEvent(evp.ownerId, evp);
+                            // CR-01: reject a forged ownerId before local-apply, not
+                            // just before the relay.
+                            if (!rejectIfForgedOwner(sourcePlayerId, evp.ownerId)) {
+                                inbound_->pushEvent(evp.ownerId, evp);
+                                relayDispatch(type, sourcePlayerId, evp.ownerId, 0, ev);
+                            }
                         }
                     } else if (type == PKT_INV_SNAPSHOT) {
                         // Reliable container-contents snapshot (Phase 4a). Like
@@ -569,8 +1057,12 @@ void NetLink::threadLoop() {
                                                 hdr.cContainerSerial, hdr.cIndex, hdr.cSerial };
                                 const InvItemEntry* items =
                                     (hdr.count > 0) ? reinterpret_cast<const InvItemEntry*>(p) : 0;
-                                inbound_->pushInv(hdr.ownerId, hdr.keyKind, cKey,
-                                                  items, hdr.count, hdr.flags);
+                                // CR-01: reject a forged ownerId before local-apply.
+                                if (!rejectIfForgedOwner(sourcePlayerId, hdr.ownerId)) {
+                                    inbound_->pushInv(hdr.ownerId, hdr.keyKind, cKey,
+                                                      items, hdr.count, hdr.flags);
+                                    relayDispatch(type, sourcePlayerId, hdr.ownerId, 0, ev);
+                                }
                             }
                         }
                     } else if (type == PKT_WORLD_ITEM) {
@@ -588,7 +1080,11 @@ void NetLink::threadLoop() {
                                 const enet_uint8* p = ev.packet->data + sizeof(WorldItemSnapshotHeader);
                                 const WorldItemEntry* items =
                                     (hdr.count > 0) ? reinterpret_cast<const WorldItemEntry*>(p) : 0;
-                                inbound_->pushWorldItems(hdr.ownerId, items, hdr.count);
+                                // CR-01: reject a forged ownerId before local-apply.
+                                if (!rejectIfForgedOwner(sourcePlayerId, hdr.ownerId)) {
+                                    inbound_->pushWorldItems(hdr.ownerId, items, hdr.count);
+                                    relayDispatch(type, sourcePlayerId, hdr.ownerId, 0, ev);
+                                }
                             }
                         }
                     } else if (type == PKT_WORLD_ITEM_REMOVE) {
@@ -602,13 +1098,22 @@ void NetLink::threadLoop() {
                                 const enet_uint8* p = ev.packet->data + sizeof(WorldItemRemoveHeader);
                                 const u32* netIds =
                                     (hdr.count > 0) ? reinterpret_cast<const u32*>(p) : 0;
-                                inbound_->pushWorldRemove(hdr.ownerId, netIds, hdr.count);
+                                // CR-01: reject a forged ownerId before local-apply.
+                                if (!rejectIfForgedOwner(sourcePlayerId, hdr.ownerId)) {
+                                    inbound_->pushWorldRemove(hdr.ownerId, netIds, hdr.count);
+                                    relayDispatch(type, sourcePlayerId, hdr.ownerId, 0, ev);
+                                }
                             }
                         }
                     } else if (type == PKT_WORLD_ITEM_CLAIM) {
-                        // A peer consumed the proxies it held for these netIds
-                        // (protocol 47), so the AUTHOR must destroy its real
-                        // ground objects - the pickup mirror W1 lacked.
+                        // A peer consumed the proxies it held for these netIds -
+                        // protocol 58: this is now the claim INTENT (claimant ->
+                        // host, host-terminated CLIENT-REQUEST), not a notice the
+                        // author acts on unconditionally. The host arbitrates via
+                        // ClaimArbiter.h's bounded contention window and
+                        // broadcasts the single PKT_CLAIM_VERDICT; the raw intent
+                        // is never relayed to the item's author or any other
+                        // client anymore.
                         const unsigned len = (unsigned)ev.packet->dataLength;
                         if (len >= sizeof(WorldItemClaimHeader) && inbound_) {
                             WorldItemClaimHeader hdr;
@@ -619,13 +1124,46 @@ void NetLink::threadLoop() {
                                 const enet_uint8* p = ev.packet->data + sizeof(WorldItemClaimHeader);
                                 const u32* netIds =
                                     (hdr.count > 0) ? reinterpret_cast<const u32*>(p) : 0;
-                                inbound_->pushWorldClaim(hdr.ownerId, hdr.authorId,
-                                                         netIds, hdr.count);
+                                // CR-01: reject a forged ownerId before local-apply
+                                // (this branch lacked the check before Phase 7 -
+                                // the WorldItemClaimHeader::ownerId field IS the
+                                // claimant's own domain, so the same guard every
+                                // other owner-tagged reliable packet uses applies).
+                                if (!rejectIfForgedOwner(sourcePlayerId, hdr.ownerId)) {
+                                    inbound_->pushWorldClaim(hdr.ownerId, hdr.authorId,
+                                                             hdr.authorClaimMs,
+                                                             netIds, hdr.count);
+                                }
                             }
                         }
+                    } else if (!isHost_ && type == PKT_CLAIM_VERDICT) {
+                        // Reliable host-committed claim-contention verdict
+                        // (protocol 58). Host-authored broadcast (Class B, like
+                        // PKT_XFER_COMMIT/PKT_OWN_RANKS) - never received-and-
+                        // relayed here; a client just pushes it to Inbound. The
+                        // wire topology itself is the host-source guard (the
+                        // PKT_OWN_RANKS T-03-06 precedent): a client's ENet
+                        // connection has exactly one peer (the host), so anything
+                        // a client receives here genuinely came from the host.
+                        ClaimVerdictPacket cvp;
+                        if (readPacket(ev.packet->data, (unsigned)ev.packet->dataLength, &cvp)
+                            && inbound_) {
+                            inbound_->pushClaimVerdict(cvp);
+                        }
+                    } else if (isHost_ && type == PKT_CLAIM_VERDICT) {
+                        // A client must never author PKT_CLAIM_VERDICT (host-
+                        // authoritative only, protocol 58) - reject with an audit
+                        // line rather than silently accepting a peer-authored
+                        // verdict into the host's own Inbound (mirrors the
+                        // PKT_XFER_COMMIT/PKT_OWN_RANKS reject branches).
+                        netErr("PKT_CLAIM_VERDICT from a client rejected (host-authoritative only)");
                     } else if (type == PKT_NPC_CENSUS) {
                         // Reliable wide-radius NPC existence census (protocol
-                        // 36; v38 rows carry positions too). Latest-wins on
+                        // 36; v38 rows carry positions too; protocol 59 Task 3
+                        // WORLD-03: Class A relay, was Class B host-only - a
+                        // join's own census now reaches every OTHER connected
+                        // client too, so the per-owner intake, not just the
+                        // host's, is usable at N). Latest-wins per owner on
                         // the game thread; delivered whole.
                         const unsigned len = (unsigned)ev.packet->dataLength;
                         if (len >= sizeof(NpcCensusHeader) && inbound_) {
@@ -635,14 +1173,22 @@ void NetLink::threadLoop() {
                                           + (unsigned)hdr.count * 5 * sizeof(u32)
                                           + (unsigned)hdr.count * 3 * sizeof(float);
                             if (len >= need && hdr.count <= NPC_CENSUS_MAX) {
-                                const enet_uint8* p = ev.packet->data + sizeof(NpcCensusHeader);
-                                const u32* hands =
-                                    (hdr.count > 0) ? reinterpret_cast<const u32*>(p) : 0;
-                                const float* pos = (hdr.count > 0)
-                                    ? reinterpret_cast<const float*>(
-                                          p + (unsigned)hdr.count * 5 * sizeof(u32))
-                                    : 0;
-                                inbound_->pushNpcCensus(hdr.ownerId, hands, pos, hdr.count);
+                                // CR-01: reject a forged ownerId before
+                                // local-apply/relay (this branch lacked the
+                                // check pre-Task-3 - harmless while it was
+                                // host-only Class B, load-bearing now that a
+                                // join's census relays to other joins).
+                                if (!rejectIfForgedOwner(sourcePlayerId, hdr.ownerId)) {
+                                    const enet_uint8* p = ev.packet->data + sizeof(NpcCensusHeader);
+                                    const u32* hands =
+                                        (hdr.count > 0) ? reinterpret_cast<const u32*>(p) : 0;
+                                    const float* pos = (hdr.count > 0)
+                                        ? reinterpret_cast<const float*>(
+                                              p + (unsigned)hdr.count * 5 * sizeof(u32))
+                                        : 0;
+                                    inbound_->pushNpcCensus(hdr.ownerId, hands, pos, hdr.count);
+                                    relayDispatch(type, sourcePlayerId, hdr.ownerId, 0, ev);
+                                }
                             }
                         }
                     } else if (type == PKT_WORLD_DROP) {
@@ -651,21 +1197,75 @@ void NetLink::threadLoop() {
                         WorldDropPacket wdp;
                         if (readPacket(ev.packet->data, (unsigned)ev.packet->dataLength, &wdp)
                             && inbound_) {
-                            inbound_->pushWorldDrop(wdp.ownerId, wdp);
+                            // CR-01: reject a forged ownerId before local-apply.
+                            if (!rejectIfForgedOwner(sourcePlayerId, wdp.ownerId)) {
+                                inbound_->pushWorldDrop(wdp.ownerId, wdp);
+                                relayDispatch(type, sourcePlayerId, wdp.ownerId, 0, ev);
+                            }
                         }
                     } else if (type == PKT_WORLD_PICKUP) {
                         // Reliable conservation pickup intent (Phase W3), mirror of the drop.
                         WorldPickupPacket wpp;
                         if (readPacket(ev.packet->data, (unsigned)ev.packet->dataLength, &wpp)
                             && inbound_) {
-                            inbound_->pushWorldPickup(wpp.ownerId, wpp);
+                            // CR-01: reject a forged ownerId before local-apply.
+                            if (!rejectIfForgedOwner(sourcePlayerId, wpp.ownerId)) {
+                                inbound_->pushWorldPickup(wpp.ownerId, wpp);
+                                relayDispatch(type, sourcePlayerId, wpp.ownerId, 0, ev);
+                            }
                         }
                     } else if (type == PKT_INV_XFER) {
-                        // Reliable cross-owner transfer intent (protocol 37).
+                        // Reliable cross-owner transfer intent (protocol 37;
+                        // protocol 58: host-terminated CLIENT-REQUEST carrying
+                        // srcOwnerId/dstOwnerId - the host arbitrates via
+                        // XferCommit.h and broadcasts PKT_XFER_COMMIT; the raw
+                        // intent is never relayed to any other client).
                         InvXferPacket ixp;
                         if (readPacket(ev.packet->data, (unsigned)ev.packet->dataLength, &ixp)
                             && inbound_) {
-                            inbound_->pushInvXfer(ixp.ownerId, ixp);
+                            // CR-01: reject a forged ownerId before local-apply
+                            // (this branch lacked the check before Phase 7 -
+                            // the one owner-tagged reliable packet that did).
+                            if (!rejectIfForgedOwner(sourcePlayerId, ixp.ownerId)) {
+                                inbound_->pushInvXfer(ixp.ownerId, ixp);
+                            }
+                        }
+                    } else if (!isHost_ && type == PKT_XFER_COMMIT) {
+                        // Reliable host-committed transfer verdict (protocol
+                        // 58). Host-authored broadcast (Class B, like
+                        // PKT_OWN_RANKS) - never received-and-relayed here; a
+                        // client just pushes it to Inbound. The wire topology
+                        // itself is the host-source guard: a client's ENet
+                        // connection has exactly one peer (the host), so
+                        // anything a client receives here genuinely came from
+                        // the host - the T-03-06/PKT_OWN_RANKS precedent
+                        // (host-authoritative packet, !isHost_ receive branch
+                        // + a matching isHost_ REJECT branch below for a
+                        // client that tries to author one).
+                        XferCommitPacket xcp;
+                        if (readPacket(ev.packet->data, (unsigned)ev.packet->dataLength, &xcp)
+                            && inbound_) {
+                            inbound_->pushXferCommit(xcp);
+                        }
+                    } else if (isHost_ && type == PKT_XFER_COMMIT) {
+                        // A client must never author PKT_XFER_COMMIT (host-
+                        // authoritative only, protocol 58) - reject with an
+                        // audit line rather than silently accepting a peer-
+                        // authored verdict into the host's own Inbound
+                        // (mirrors the PKT_OWN_RANKS T-03-06 reject branch
+                        // immediately above it).
+                        netErr("PKT_XFER_COMMIT from a client rejected (host-authoritative only)");
+                    } else if (type == PKT_XFER_COMMIT_ACK) {
+                        // Reliable transfer-commit bookkeeping ack (protocol
+                        // 58, host side only). Audit/correlation - never
+                        // settles anything.
+                        XferCommitAckPacket xap;
+                        if (readPacket(ev.packet->data, (unsigned)ev.packet->dataLength, &xap)
+                            && inbound_) {
+                            // CR-01: reject a forged ownerId before local-apply.
+                            if (!rejectIfForgedOwner(sourcePlayerId, xap.ownerId)) {
+                                inbound_->pushXferCommitAck(xap.ownerId, xap);
+                            }
                         }
                     } else if (type == PKT_INV_XFER_ACK) {
                         // Reliable transfer verdict (protocol 50). Must be as
@@ -674,7 +1274,15 @@ void NetLink::threadLoop() {
                         InvXferAckPacket iap;
                         if (readPacket(ev.packet->data, (unsigned)ev.packet->dataLength, &iap)
                             && inbound_) {
-                            inbound_->pushInvXferAck(iap.ownerId, iap);
+                            // CR-01: reject a forged ownerId before local-apply.
+                            if (!rejectIfForgedOwner(sourcePlayerId, iap.ownerId)) {
+                                inbound_->pushInvXferAck(iap.ownerId, iap);
+                                // Class D, already-addressable (matrix row 46): xferOwnerId
+                                // is the routable destination - unicast the verdict back to
+                                // the client that authored the original intent.
+                                relayDispatch(type, sourcePlayerId, iap.ownerId,
+                                              iap.xferOwnerId, ev);
+                            }
                         }
                     } else if (type == PKT_MEDICAL) {
                         // Reliable owner-authoritative vitals snapshot (phase 2).
@@ -682,15 +1290,29 @@ void NetLink::threadLoop() {
                         MedicalPacket mp;
                         if (readPacket(ev.packet->data, (unsigned)ev.packet->dataLength, &mp)
                             && inbound_) {
-                            inbound_->pushMedical(mp.ownerId, mp);
+                            // CR-01: reject a forged ownerId before local-apply.
+                            if (!rejectIfForgedOwner(sourcePlayerId, mp.ownerId)) {
+                                inbound_->pushMedical(mp.ownerId, mp);
+                                relayDispatch(type, sourcePlayerId, mp.ownerId, 0, ev);
+                            }
                         }
                     } else if (type == PKT_TREATMENT) {
                         // Reliable treatment delta (first aid on a driven copy,
-                        // forwarded to the owner).
+                        // forwarded to the owner). Phase 6 (GAP-1): now Class A
+                        // broadcast-except - a join healing ANOTHER join's driven
+                        // body must reach that body's authority, not just the
+                        // host. relayDispatch() only fans out on the host
+                        // (isHost_ guard); a client still pushes to its own
+                        // Inbound so it observes host-forwarded treatments from
+                        // other joins.
                         TreatmentPacket tp;
                         if (readPacket(ev.packet->data, (unsigned)ev.packet->dataLength, &tp)
                             && inbound_) {
-                            inbound_->pushTreatment(tp.ownerId, tp);
+                            // CR-01: reject a forged ownerId before local-apply.
+                            if (!rejectIfForgedOwner(sourcePlayerId, tp.ownerId)) {
+                                inbound_->pushTreatment(tp.ownerId, tp);
+                                relayDispatch(type, sourcePlayerId, tp.ownerId, 0, ev);
+                            }
                         }
                     } else if (type == PKT_COMBAT_HIT) {
                         // Reliable join-dealt damage report (join -> host): the
@@ -703,10 +1325,24 @@ void NetLink::threadLoop() {
                     } else if (type == PKT_SPEED_REQ || type == PKT_SPEED_SET) {
                         // Reliable game-speed request/set (consensus speed sync).
                         // Delivered immediately like the other reliable packets.
+                        // Protocol 60 (Phase 9 Plan 02, CONS-02): PKT_SPEED_REQ
+                        // is a join-authored intent (host-terminated, like
+                        // PKT_MONEY_DELTA) and gains rejectIfForgedOwner before
+                        // it can land in speedVotes_ - it lacked the check
+                        // pre-Phase-9 (research Wire Impact row 7). PKT_SPEED_SET
+                        // is host-authored only; the host's own syncSpeed drain
+                        // ignores any PKT_SPEED_SET it receives (the isHost
+                        // guard on apply), so a client-forged SET already has
+                        // nowhere to land - no check needed for it here.
                         SpeedPacket sp;
                         if (readPacket(ev.packet->data, (unsigned)ev.packet->dataLength, &sp)
                             && inbound_) {
-                            inbound_->pushSpeed(sp.ownerId, sp);
+                            if (type == PKT_SPEED_REQ) {
+                                if (!rejectIfForgedOwner(sourcePlayerId, sp.ownerId))
+                                    inbound_->pushSpeed(sp.ownerId, sp);
+                            } else {
+                                inbound_->pushSpeed(sp.ownerId, sp);
+                            }
                         }
                     } else if (type == PKT_STATS) {
                         // Reliable owner-authoritative character-stats snapshot
@@ -714,7 +1350,11 @@ void NetLink::threadLoop() {
                         StatsPacket stp;
                         if (readPacket(ev.packet->data, (unsigned)ev.packet->dataLength, &stp)
                             && inbound_) {
-                            inbound_->pushStats(stp.ownerId, stp);
+                            // CR-01: reject a forged ownerId before local-apply.
+                            if (!rejectIfForgedOwner(sourcePlayerId, stp.ownerId)) {
+                                inbound_->pushStats(stp.ownerId, stp);
+                                relayDispatch(type, sourcePlayerId, stp.ownerId, 0, ev);
+                            }
                         }
                     } else if (type == PKT_MONEY) {
                         // Reliable host-authoritative money-pool total
@@ -727,26 +1367,68 @@ void NetLink::threadLoop() {
                     } else if (type == PKT_MONEY_DELTA) {
                         // Reliable money-pool delta (protocol 52, join -> host).
                         // Ordered delivery is what makes the fold exactly-once.
+                        // Protocol 60 (CONS-01): reject a forged ownerId before
+                        // local-apply - this branch lacked the check pre-Phase-9
+                        // (research Wire Impact row 7 / Pitfall 7), the one
+                        // owner-tagged reliable packet that did.
                         MoneyDeltaPacket md;
                         if (readPacket(ev.packet->data, (unsigned)ev.packet->dataLength, &md)
                             && inbound_) {
-                            inbound_->pushMoneyDelta(md.ownerId, md);
+                            if (!rejectIfForgedOwner(sourcePlayerId, md.ownerId)) {
+                                inbound_->pushMoneyDelta(md.ownerId, md);
+                            }
                         }
+                    } else if (!isHost_ && type == PKT_MONEY_REJECT) {
+                        // Reliable host-committed insufficient-funds verdict
+                        // (protocol 60, CONS-01). Host-authored broadcast
+                        // (Class B, like PKT_CLAIM_VERDICT/PKT_CELL_MAP) -
+                        // never received-and-relayed here; a client just
+                        // pushes it to Inbound. The wire topology itself is
+                        // the host-source guard: a client's ENet connection
+                        // has exactly one peer (the host), so anything a
+                        // client receives here genuinely came from the host.
+                        MoneyRejectPacket mr;
+                        if (readPacket(ev.packet->data, (unsigned)ev.packet->dataLength, &mr)
+                            && inbound_) {
+                            inbound_->pushMoneyReject(mr);
+                        }
+                    } else if (isHost_ && type == PKT_MONEY_REJECT) {
+                        // A client must never author PKT_MONEY_REJECT (host-
+                        // authoritative only, protocol 60) - reject with an
+                        // audit line rather than silently accepting a peer-
+                        // authored verdict into the host's own Inbound
+                        // (mirrors the PKT_CLAIM_VERDICT/PKT_CELL_MAP reject
+                        // branches).
+                        netErr("PKT_MONEY_REJECT from a client rejected (host-authoritative only)");
                     } else if (type == PKT_FACTION) {
                         // Reliable player-faction relation row (protocol 24):
                         // host stream or join intent, disambiguated on apply.
                         FactionPacket fa;
                         if (readPacket(ev.packet->data, (unsigned)ev.packet->dataLength, &fa)
                             && inbound_) {
-                            inbound_->pushFaction(fa.ownerId, fa);
+                            // CR-01: reject a forged ownerId before local-apply.
+                            if (!rejectIfForgedOwner(sourcePlayerId, fa.ownerId)) {
+                                inbound_->pushFaction(fa.ownerId, fa);
+                                relayDispatch(type, sourcePlayerId, fa.ownerId, 0, ev);
+                            }
                         }
                     } else if (type == PKT_TIME) {
-                        // Reliable host-authoritative game-clock sample
-                        // (protocol 25). Delivered immediately like the others.
+                        // Bidirectional game-clock channel (protocol 25): host
+                        // broadcasts its sample, a join reports its own back.
+                        // Delivered immediately like the others. Protocol 60
+                        // (Phase 9 Plan 02, CONS-03): a join's report is a
+                        // host-terminated client request just like
+                        // PKT_SPEED_REQ/PKT_MONEY_DELTA, and the host's
+                        // per-owner timeReports_ map must never be poisoned by
+                        // a misattributed owner slot - rejectIfForgedOwner
+                        // returns false immediately on a client (isHost_
+                        // guard), so the host's own broadcast to joins is
+                        // unaffected.
                         TimePacket ti;
                         if (readPacket(ev.packet->data, (unsigned)ev.packet->dataLength, &ti)
                             && inbound_) {
-                            inbound_->pushTime(ti.ownerId, ti);
+                            if (!rejectIfForgedOwner(sourcePlayerId, ti.ownerId))
+                                inbound_->pushTime(ti.ownerId, ti);
                         }
                     } else if (type == PKT_DOOR) {
                         // Reliable baked-door state row (protocol 26):
@@ -754,7 +1436,11 @@ void NetLink::threadLoop() {
                         DoorPacket dp;
                         if (readPacket(ev.packet->data, (unsigned)ev.packet->dataLength, &dp)
                             && inbound_) {
-                            inbound_->pushDoor(dp.ownerId, dp);
+                            // CR-01: reject a forged ownerId before local-apply.
+                            if (!rejectIfForgedOwner(sourcePlayerId, dp.ownerId)) {
+                                inbound_->pushDoor(dp.ownerId, dp);
+                                relayDispatch(type, sourcePlayerId, dp.ownerId, 0, ev);
+                            }
                         }
                     } else if (type == PKT_PROD) {
                         // Reliable host-authoritative machine state row
@@ -765,12 +1451,22 @@ void NetLink::threadLoop() {
                             inbound_->pushProd(pp.ownerId, pp);
                         }
                     } else if (type == PKT_RESEARCH) {
-                        // Reliable host-authoritative known-research row
-                        // (protocol 38), applied via Research::startResearch.
+                        // Reliable known-research row (protocol 38): a host
+                        // stream (unchanged) OR, since Phase 8 (08-01,
+                        // WORLD-02), a join's post-baseline-unlock INTENT -
+                        // disambiguated on apply exactly like PKT_FACTION/
+                        // PKT_DOOR above. Already RELAY_NONE pre-Phase-8 (no
+                        // routing change needed), but a join publishing one
+                        // now means the host-side receive genuinely needs the
+                        // forge check it never needed before (a client could
+                        // not previously author this packet type at all).
                         ResearchPacket rp;
                         if (readPacket(ev.packet->data, (unsigned)ev.packet->dataLength, &rp)
                             && inbound_) {
-                            inbound_->pushResearch(rp.ownerId, rp);
+                            // CR-01: reject a forged ownerId before local-apply.
+                            if (!rejectIfForgedOwner(sourcePlayerId, rp.ownerId)) {
+                                inbound_->pushResearch(rp.ownerId, rp);
+                            }
                         }
                     } else if (type == PKT_DEED) {
                         // Reliable property-deed ownership row (protocol 54):
@@ -778,7 +1474,11 @@ void NetLink::threadLoop() {
                         DeedPacket dep;
                         if (readPacket(ev.packet->data, (unsigned)ev.packet->dataLength, &dep)
                             && inbound_) {
-                            inbound_->pushDeed(dep.ownerId, dep);
+                            // CR-01: reject a forged ownerId before local-apply.
+                            if (!rejectIfForgedOwner(sourcePlayerId, dep.ownerId)) {
+                                inbound_->pushDeed(dep.ownerId, dep);
+                                relayDispatch(type, sourcePlayerId, dep.ownerId, 0, ev);
+                            }
                         }
                     } else if (type == PKT_FIXTURE) {
                         // Reliable runtime-fixture identity row (protocol 55):
@@ -786,7 +1486,11 @@ void NetLink::threadLoop() {
                         FixturePacket fxp;
                         if (readPacket(ev.packet->data, (unsigned)ev.packet->dataLength, &fxp)
                             && inbound_) {
-                            inbound_->pushFixture(fxp.ownerId, fxp);
+                            // CR-01: reject a forged ownerId before local-apply.
+                            if (!rejectIfForgedOwner(sourcePlayerId, fxp.ownerId)) {
+                                inbound_->pushFixture(fxp.ownerId, fxp);
+                                relayDispatch(type, sourcePlayerId, fxp.ownerId, 0, ev);
+                            }
                         }
                     } else if (type == PKT_BUILD_PLACE) {
                         // Reliable placed-building announcement (protocol 27):
@@ -794,7 +1498,11 @@ void NetLink::threadLoop() {
                         BuildPlacePacket bp;
                         if (readPacket(ev.packet->data, (unsigned)ev.packet->dataLength, &bp)
                             && inbound_) {
-                            inbound_->pushBuildPlace(bp.ownerId, bp);
+                            // CR-01: reject a forged ownerId before local-apply.
+                            if (!rejectIfForgedOwner(sourcePlayerId, bp.ownerId)) {
+                                inbound_->pushBuildPlace(bp.ownerId, bp);
+                                relayDispatch(type, sourcePlayerId, bp.ownerId, 0, ev);
+                            }
                         }
                     } else if (type == PKT_BUILD_STATE) {
                         // Reliable construction-progress row (protocol 27),
@@ -802,7 +1510,11 @@ void NetLink::threadLoop() {
                         BuildStatePacket bs;
                         if (readPacket(ev.packet->data, (unsigned)ev.packet->dataLength, &bs)
                             && inbound_) {
-                            inbound_->pushBuildState(bs.ownerId, bs);
+                            // CR-01: reject a forged ownerId before local-apply.
+                            if (!rejectIfForgedOwner(sourcePlayerId, bs.ownerId)) {
+                                inbound_->pushBuildState(bs.ownerId, bs);
+                                relayDispatch(type, sourcePlayerId, bs.ownerId, 0, ev);
+                            }
                         }
                     } else if (type == PKT_BUILD_DOOR) {
                         // Reliable placed-building door row (protocol 28),
@@ -810,7 +1522,11 @@ void NetLink::threadLoop() {
                         BuildDoorPacket bd;
                         if (readPacket(ev.packet->data, (unsigned)ev.packet->dataLength, &bd)
                             && inbound_) {
-                            inbound_->pushBuildDoor(bd.ownerId, bd);
+                            // CR-01: reject a forged ownerId before local-apply.
+                            if (!rejectIfForgedOwner(sourcePlayerId, bd.ownerId)) {
+                                inbound_->pushBuildDoor(bd.ownerId, bd);
+                                relayDispatch(type, sourcePlayerId, bd.ownerId, 0, ev);
+                            }
                         }
                     } else if (type == PKT_BUILD_REMOVE) {
                         // Reliable placer-authoritative building removal
@@ -818,16 +1534,30 @@ void NetLink::threadLoop() {
                         BuildRemovePacket br;
                         if (readPacket(ev.packet->data, (unsigned)ev.packet->dataLength, &br)
                             && inbound_) {
-                            inbound_->pushBuildRemove(br.ownerId, br);
+                            // CR-01: reject a forged ownerId before local-apply.
+                            if (!rejectIfForgedOwner(sourcePlayerId, br.ownerId)) {
+                                inbound_->pushBuildRemove(br.ownerId, br);
+                                relayDispatch(type, sourcePlayerId, br.ownerId, 0, ev);
+                            }
                         }
                     } else if (type == PKT_STEALTH) {
                         // Unreliable stealth detection-map snapshot (protocol 20).
                         // Delivered immediately; the game thread keeps latest-wins
-                        // per subject.
+                        // per subject. Phase 6 (GAP-2): now Class A broadcast-
+                        // except - one join's detection feedback about ANOTHER
+                        // join's sneaker must reach that join, not just the
+                        // host. relayDispatch() only fans out on the host
+                        // (isHost_ guard); a client still pushes to its own
+                        // Inbound so it observes host-forwarded feedback from
+                        // other joins.
                         StealthPacket slp;
                         if (readPacket(ev.packet->data, (unsigned)ev.packet->dataLength, &slp)
                             && inbound_) {
-                            inbound_->pushStealth(slp.ownerId, slp);
+                            // CR-01: reject a forged ownerId before local-apply.
+                            if (!rejectIfForgedOwner(sourcePlayerId, slp.ownerId)) {
+                                inbound_->pushStealth(slp.ownerId, slp);
+                                relayDispatch(type, sourcePlayerId, slp.ownerId, 0, ev);
+                            }
                         }
                     } else if (type == PKT_SPAWN_REQ) {
                         // Reliable runtime-spawn query (protocol 21, join -> host).
@@ -848,7 +1578,13 @@ void NetLink::threadLoop() {
                         SaveReqPacket sq;
                         if (readPacket(ev.packet->data, (unsigned)ev.packet->dataLength, &sq)
                             && inbound_) {
-                            inbound_->pushSaveReq(sq.ownerId, sq);
+                            // Phase 10 Plan 01 (SAVE-01, Spoofing): reject a
+                            // forged ownerId before the coordinator ever
+                            // keys arbiter/SaveCoord state on it - a forged
+                            // requester could otherwise name another
+                            // client's reqId in the arbitration record.
+                            if (!rejectIfForgedOwner(sourcePlayerId, sq.ownerId))
+                                inbound_->pushSaveReq(sq.ownerId, sq);
                         }
                     } else if (type == PKT_SAVE_BEGIN) {
                         // Reliable save-transfer announce (protocol 31, host -> join).
@@ -896,7 +1632,14 @@ void NetLink::threadLoop() {
                         SaveAckPacket sa;
                         if (readPacket(ev.packet->data, (unsigned)ev.packet->dataLength, &sa)
                             && inbound_) {
-                            inbound_->pushSaveAck(sa.ownerId, sa);
+                            // Phase 10 Plan 01 (SAVE-01, Spoofing, T-10-01):
+                            // the exact gap the last-of-N-ACKs-wins collapse
+                            // fix depends on closing - a forged ownerId here
+                            // could mark ANOTHER client's SaveClient
+                            // COMMITTED (or fail it out) once saveNoteAck
+                            // keys per-owner state on it.
+                            if (!rejectIfForgedOwner(sourcePlayerId, sa.ownerId))
+                                inbound_->pushSaveAck(sa.ownerId, sa);
                         }
                     } else if (type == PKT_LOAD_GO) {
                         // Reliable coordinated-load order (protocol 32, host -> join).
@@ -910,15 +1653,62 @@ void NetLink::threadLoop() {
                         LoadReqPacket lr;
                         if (readPacket(ev.packet->data, (unsigned)ev.packet->dataLength, &lr)
                             && inbound_) {
-                            inbound_->pushLoadReq(lr.ownerId, lr);
+                            // Phase 10 Plan 01 (SAVE-03, Spoofing): reject a
+                            // forged ownerId before it can key the arbiter's
+                            // record (a forged requester naming another
+                            // client's reqId).
+                            if (!rejectIfForgedOwner(sourcePlayerId, lr.ownerId))
+                                inbound_->pushLoadReq(lr.ownerId, lr);
                         }
                     } else if (type == PKT_LOAD_NACK) {
                         // Reliable copy-missing/diverged answer (protocol 32, join -> host).
                         LoadNackPacket ln;
                         if (readPacket(ev.packet->data, (unsigned)ev.packet->dataLength, &ln)
                             && inbound_) {
-                            inbound_->pushLoadNack(ln.ownerId, ln);
+                            // Phase 10 Plan 01 (SAVE-02, Spoofing): a forged
+                            // ownerId here could mark ANOTHER client's
+                            // LoadClient NACKED once loadNoteNack keys
+                            // per-owner state on it.
+                            if (!rejectIfForgedOwner(sourcePlayerId, ln.ownerId))
+                                inbound_->pushLoadNack(ln.ownerId, ln);
                         }
+                    } else if (type == PKT_LOAD_ACK) {
+                        // Reliable positive coordinated-load completion (protocol
+                        // 61, join -> host, SAVE-02). Host-terminated CLIENT
+                        // input, the PKT_SAVE_ACK shape.
+                        LoadAckPacket la;
+                        if (readPacket(ev.packet->data, (unsigned)ev.packet->dataLength, &la)
+                            && inbound_) {
+                            // Phase 10 Plan 01 (SAVE-02, Spoofing, T-10-01):
+                            // a forged ownerId here could mark ANOTHER
+                            // client's LoadClient LOADED (or FAILED) once
+                            // loadNoteAck keys per-owner state on it - the
+                            // exact SaveAck-forgery gap, mirrored onto the
+                            // new positive load ACK.
+                            if (!rejectIfForgedOwner(sourcePlayerId, la.ownerId))
+                                inbound_->pushLoadAck(la.ownerId, la);
+                        }
+                    } else if (!isHost_ && type == PKT_COORD_REJECT) {
+                        // Reliable first-wins arbitration reject (protocol 61,
+                        // SAVE-03). Host-authored Class D unicast to the
+                        // rejected requester - never received-and-relayed here;
+                        // a client just pushes it to Inbound. The wire topology
+                        // itself is the host-source guard (the PKT_CLAIM_VERDICT/
+                        // PKT_OWN_RANKS T-03-06 precedent): a client's ENet
+                        // connection has exactly one peer (the host).
+                        CoordRejectPacket cr;
+                        if (readPacket(ev.packet->data, (unsigned)ev.packet->dataLength, &cr)
+                            && inbound_) {
+                            inbound_->pushCoordReject(cr);
+                        }
+                    } else if (isHost_ && type == PKT_COORD_REJECT) {
+                        // A client must never author PKT_COORD_REJECT (host-
+                        // authoritative only, protocol 61, SAVE-03) - reject
+                        // with an audit line rather than silently accepting a
+                        // peer-authored rejection into the host's own Inbound
+                        // (mirrors the PKT_CLAIM_VERDICT/PKT_MONEY_REJECT
+                        // reject branches).
+                        netErr("PKT_COORD_REJECT from a client rejected (host-authoritative only)");
                     } else if (type == PKT_CAM_HINT) {
                         // Camera hint (protocol 43): latest-wins interest
                         // anchor. Accepted in BOTH directions - the attention
@@ -927,17 +1717,51 @@ void NetLink::threadLoop() {
                         CamHintPacket chp;
                         if (readPacket(ev.packet->data, (unsigned)ev.packet->dataLength, &chp)
                             && inbound_) {
-                            inbound_->pushCamHint(chp.ownerId, chp);
+                            // CR-01: reject a forged ownerId before local-apply.
+                            if (!rejectIfForgedOwner(sourcePlayerId, chp.ownerId)) {
+                                inbound_->pushCamHint(chp.ownerId, chp);
+                                relayDispatch(type, sourcePlayerId, chp.ownerId, 0, ev);
+                            }
                         }
                     } else if (type == PKT_CELL_CLAIM) {
-                        // Cell claim (protocol 49): presence-based authorship.
-                        // Both directions - each side claims the cells its own
-                        // tabs are standing in.
+                        // Cell claim (protocol 49; protocol 59 WORLD-03:
+                        // host-terminated INTENT, not a Class A relay -
+                        // every instance still PUBLISHES its own claims, but
+                        // only the host folds them into claimSlots_ and runs
+                        // the reduce). The raw claim is never relayed to any
+                        // other client anymore.
                         CellClaimPacket ccp;
                         if (readPacket(ev.packet->data, (unsigned)ev.packet->dataLength, &ccp)
                             && inbound_) {
-                            inbound_->pushCellClaim(ccp.ownerId, ccp);
+                            // CR-01: reject a forged ownerId before local-apply.
+                            if (!rejectIfForgedOwner(sourcePlayerId, ccp.ownerId)) {
+                                inbound_->pushCellClaim(ccp.ownerId, ccp);
+                            }
                         }
+                    } else if (!isHost_ && type == PKT_CELL_MAP) {
+                        // Reliable host-committed cell-claim map (protocol
+                        // 59, WORLD-03). Host-authored broadcast (Class B,
+                        // like PKT_CLAIM_VERDICT/PKT_XFER_COMMIT/
+                        // PKT_OWN_RANKS) - never received-and-relayed here; a
+                        // client just pushes it to Inbound. The wire topology
+                        // itself is the host-source guard (the
+                        // PKT_OWN_RANKS T-03-06 precedent): a client's ENet
+                        // connection has exactly one peer (the host), so
+                        // anything a client receives here genuinely came
+                        // from the host.
+                        CellMapPacket cmp;
+                        if (readPacket(ev.packet->data, (unsigned)ev.packet->dataLength, &cmp)
+                            && inbound_) {
+                            inbound_->pushCellMap(cmp);
+                        }
+                    } else if (isHost_ && type == PKT_CELL_MAP) {
+                        // A client must never author PKT_CELL_MAP (host-
+                        // authoritative only, protocol 59) - reject with an
+                        // audit line rather than silently accepting a
+                        // peer-authored map into the host's own Inbound
+                        // (mirrors the PKT_CLAIM_VERDICT/PKT_XFER_COMMIT/
+                        // PKT_OWN_RANKS reject branches).
+                        netErr("PKT_CELL_MAP from a client rejected (host-authoritative only)");
                     } else if (type == PKT_TIME_PING) {
                         // Wall-clock sync probe: echo immediately (host side). Answered
                         // inside the service loop so the response delay stays minimal
@@ -974,16 +1798,72 @@ void NetLink::threadLoop() {
                     break;
                 }
                 case ENET_EVENT_TYPE_DISCONNECT: {
-                    epochSeen_.clear(); // peer gone; its epoch sequence ends (v44)
                     if (isHost_) {
                         u32 id = (u32)(size_t)ev.peer->data;
                         ev.peer->data = 0;
-                        if (inbound_) inbound_->pushLeave(id);
-                        char b[64];
-                        _snprintf(b, sizeof(b) - 1, "peer disconnected id=%u", (unsigned)id);
-                        b[sizeof(b) - 1] = '\0';
-                        netLog(b);
+                        // Per-player teardown (Phase 2 Plan 03, CR-01 fix): clear
+                        // THIS departing player's registry + epoch bookkeeping
+                        // WITHOUT touching any other connected player's state -
+                        // the blanket epochSeen_.clear() this replaced used to
+                        // wipe every OTHER connected player's accepted-epoch
+                        // state too at N>=3 (TWO_PLAYER_ASSUMPTIONS finding 8 /
+                        // RESEARCH.md Pitfall 2). Registry erase happens BEFORE
+                        // the roster-leave broadcast and before this slot can be
+                        // reassigned to a new connection (threat T-02-04:
+                        // teardown-before-reuse). Never dereference peer after
+                        // this edge (never retain ENetPeer* across disconnect).
+                        //
+                        // CR-01: ev.peer->data is ONLY ever set to a real
+                        // PlayerId in the HELLO-success branch above. A peer
+                        // rejected before that point (protocol-version
+                        // mismatch, or MAX_PLAYERS slots full - both call
+                        // enet_peer_disconnect() before ev.peer->data is
+                        // assigned) still raises this DISCONNECT event, and
+                        // ev.peer->data reads its zero-initialized default
+                        // (enet_host_create() memsets the whole peer array) -
+                        // the SAME value as PlayerId 0, the host itself. The
+                        // entire teardown (epoch erase, leave-queue push, log,
+                        // and PKT_PLAYER_LEFT broadcast) must therefore run
+                        // ONLY when this peer was actually found in registry_ -
+                        // never unconditionally on bare `id`.
+                        std::map<u32, PeerState>::iterator regIt = registry_.find(id);
+                        if (regIt != registry_.end()) {
+                            registry_.erase(regIt);
+                            epochSeen_.erase(id);
+                            if (inbound_) inbound_->pushLeave(id);
+                            char b[80];
+                            _snprintf(b, sizeof(b) - 1,
+                                      "peer disconnected id=%u player=%u",
+                                      (unsigned)id, (unsigned)id);
+                            b[sizeof(b) - 1] = '\0';
+                            netLog(b);
+                            // Roster (NET-05): tell every REMAINING connected
+                            // client the slot is free. broadcast() only
+                            // reaches currently-connected peers, so the
+                            // departing id (already erased from registry_
+                            // above) is never itself a destination.
+                            RosterPacket left;
+                            left.type = (u8)PKT_PLAYER_LEFT;
+                            left.playerId = id;
+                            broadcast(enet_packet_create(&left, sizeof(left),
+                                                          ENET_PACKET_FLAG_RELIABLE),
+                                      CH_RELIABLE);
+                        } else {
+                            // Never completed HELLO (protocol-version
+                            // mismatch, MAX_PLAYERS full, or dropped
+                            // mid-handshake) - no registry entry, no roster
+                            // fact to announce, and bare id=0 must never be
+                            // mistaken for the host's own PlayerId.
+                            netLog("peer disconnected before completing "
+                                   "handshake (no id assigned)");
+                        }
                     } else {
+                        // Client: the sole connection (to the host) just ended -
+                        // all local epoch bookkeeping for this session is moot
+                        // (unlike the host, a client only ever tracks ownerIds
+                        // relative to this one link, so a blanket clear here is
+                        // correct - not the finding-8 global-wipe bug class).
+                        epochSeen_.clear();
                         serverPeer_ = 0;
                         if (inbound_) inbound_->pushLeave(OWNER_ID_ALL);
                         netLog("disconnected from host");
@@ -1040,6 +1920,21 @@ void NetLink::threadLoop() {
                 enet_peer_send(serverPeer_, CH_RELIABLE, out);
             } else {
                 enet_packet_destroy(out);
+            }
+        }
+
+        // TEST HOOK (Phase 2, CR-02 regression): resend a fresh HELLO on this
+        // already-established connection when debugResendHelloForTest() was
+        // called. CLIENT only - mirrors the exact HelloPacket construction in
+        // the CONNECT handler above, byte for byte, so the host receives an
+        // indistinguishable "second successful HELLO" on the same ENetPeer.
+        if (!isHost_ && InterlockedExchange(&debugResendHello_, 0)) {
+            if (serverPeer_ && serverPeer_->state == ENET_PEER_STATE_CONNECTED) {
+                HelloPacket h;
+                h.type = (u8)PKT_HELLO; h.version = PROTOCOL_VERSION; h.nameLen = 0;
+                ENetPacket* out = enet_packet_create(&h, sizeof(h), ENET_PACKET_FLAG_RELIABLE);
+                enet_peer_send(serverPeer_, CH_RELIABLE, out);
+                netLog("debug: resent duplicate HELLO on established connection");
             }
         }
 
@@ -1175,22 +2070,81 @@ void NetLink::threadLoop() {
                 enet_packet_destroy(out);
             }
         }
-        // Drain + send any queued world-item CLAIMS on CH_RELIABLE (protocol 47). A claim
-        // travels the opposite way to a cull: the peer that consumed a proxy tells the
-        // AUTHOR to destroy its real ground copy.
+        // Drain + send any queued world-item claim INTENTS on CH_RELIABLE (protocol
+        // 58). Now a host-terminated CLIENT-REQUEST (Class C shape, like
+        // PKT_INV_XFER) - only the HOST's own applyClaimIntents ever drains
+        // InboundWorldClaim. When the HOST itself is the claimant (a host player
+        // can pick up an item exactly like any other claimant - INV-01 2-player
+        // parity requires this), the generic isHost_ ? broadcast branch below
+        // would otherwise fan the raw intent out to every connected client, none
+        // of which drain it as an intent anymore (the PKT_INV_XFER self-loop fix
+        // precedent, Phase 7 Plan 01 Task 2). Loop it directly into the host's OWN
+        // Inbound so the SAME applyClaimIntents drain path picks it up next tick,
+        // exactly as if it had arrived over the network from itself.
         for (size_t i = 0; i < wcs.size(); ++i) {
             unsigned count = (unsigned)wcs[i].netIds.size();
             if (count > 255) count = 255;
+            if (isHost_) {
+                if (inbound_)
+                    inbound_->pushWorldClaim(wcs[i].ownerId, wcs[i].authorId,
+                                             wcs[i].authorClaimMs,
+                                             count > 0 ? &wcs[i].netIds[0] : 0, count);
+                continue;
+            }
             unsigned bytes = sizeof(WorldItemClaimHeader) + count * sizeof(u32);
             ENetPacket* out = enet_packet_create(0, bytes, ENET_PACKET_FLAG_RELIABLE);
             WorldItemClaimHeader hdr;
-            hdr.type     = (u8)PKT_WORLD_ITEM_CLAIM;
-            hdr.ownerId  = wcs[i].ownerId;
-            hdr.authorId = wcs[i].authorId;
-            hdr.count    = (u8)count;
+            hdr.type          = (u8)PKT_WORLD_ITEM_CLAIM;
+            hdr.ownerId       = wcs[i].ownerId;
+            hdr.authorId      = wcs[i].authorId;
+            hdr.authorClaimMs = wcs[i].authorClaimMs;
+            hdr.count         = (u8)count;
             std::memcpy(out->data, &hdr, sizeof(hdr));
             if (count > 0)
                 std::memcpy(out->data + sizeof(hdr), &wcs[i].netIds[0], count * sizeof(u32));
+            if (serverPeer_ && serverPeer_->state == ENET_PEER_STATE_CONNECTED) {
+                enet_peer_send(serverPeer_, CH_RELIABLE, out);
+            } else {
+                enet_packet_destroy(out);
+            }
+        }
+
+        // Drain + send any queued host-committed claim-contention verdicts on
+        // CH_RELIABLE (protocol 58). HOST ONLY in practice (queueClaimVerdict's
+        // doc comment) - isHost_ true broadcasts to every connected client (the
+        // single authoritative winner); a mis-called join falls into the
+        // else-branch and sends toward the host, which has no PKT_CLAIM_VERDICT
+        // receive branch (same inert-mis-call shape as PKT_XFER_COMMIT/
+        // PKT_OWN_RANKS).
+        std::vector<ClaimVerdictPacket> claimVerdicts;
+        EnterCriticalSection(&outCs_);
+        claimVerdicts.swap(outClaimVerdict_);
+        LeaveCriticalSection(&outCs_);
+        for (size_t i = 0; i < claimVerdicts.size(); ++i) {
+            ENetPacket* out = enet_packet_create(&claimVerdicts[i], sizeof(ClaimVerdictPacket),
+                                                 ENET_PACKET_FLAG_RELIABLE);
+            if (isHost_) {
+                enet_host_broadcast(enetHost_, CH_RELIABLE, out);
+            } else if (serverPeer_ && serverPeer_->state == ENET_PEER_STATE_CONNECTED) {
+                enet_peer_send(serverPeer_, CH_RELIABLE, out);
+            } else {
+                enet_packet_destroy(out);
+            }
+        }
+
+        // Drain + send any queued host-committed cell-claim maps on
+        // CH_RELIABLE (protocol 59, WORLD-03). HOST ONLY in practice
+        // (queueCellMap's doc comment) - isHost_ true broadcasts to every
+        // connected client (the single authoritative verdict); a mis-called
+        // join falls into the else-branch and sends toward the host, which
+        // rejects it (isHost_ && type == PKT_CELL_MAP receive branch above).
+        std::vector<CellMapPacket> cellMaps;
+        EnterCriticalSection(&outCs_);
+        cellMaps.swap(outCellMap_);
+        LeaveCriticalSection(&outCs_);
+        for (size_t i = 0; i < cellMaps.size(); ++i) {
+            ENetPacket* out = enet_packet_create(&cellMaps[i], sizeof(CellMapPacket),
+                                                 ENET_PACKET_FLAG_RELIABLE);
             if (isHost_) {
                 enet_host_broadcast(enetHost_, CH_RELIABLE, out);
             } else if (serverPeer_ && serverPeer_->state == ENET_PEER_STATE_CONNECTED) {
@@ -1238,13 +2192,47 @@ void NetLink::threadLoop() {
         }
 
         // Drain + send any queued cross-owner TRANSFER intents on CH_RELIABLE
-        // (protocol 37). Fixed-size PODs like the drop/pickup intents.
+        // (protocol 37/58). Fixed-size PODs like the drop/pickup intents.
+        //
+        // Phase 7 Plan 01 Task 2: PKT_INV_XFER is now a host-terminated
+        // CLIENT-REQUEST (routingClassOf == RELAY_NONE) - only the HOST's own
+        // processXferIntents ever drains InboundInvXfer. When the HOST itself
+        // is the author (a host player can drag an item into/out of a join's
+        // container exactly like any other cross-owner trade - INV-01
+        // 2-player parity requires this), the generic isHost_ ? broadcast
+        // branch below would otherwise fan the raw intent out to every
+        // connected client, none of which ever drain it anymore (dead
+        // traffic, and an unbounded InboundInvXfer growth on every join's
+        // Inbound - Class E's own "never blind-broadcast a targeted packet"
+        // rule). A host-authored intent never needs the wire at all: loop it
+        // directly into the host's OWN Inbound so the SAME
+        // processXferIntents drain path picks it up next tick, exactly as if
+        // it had arrived over the network from itself.
         std::vector<InvXferPacket> xfers;
         EnterCriticalSection(&outCs_);
         xfers.swap(outInvXfers_);
         LeaveCriticalSection(&outCs_);
         for (size_t i = 0; i < xfers.size(); ++i) {
+            if (isHost_) {
+                if (inbound_) inbound_->pushInvXfer(xfers[i].ownerId, xfers[i]);
+                continue;
+            }
             ENetPacket* out = enet_packet_create(&xfers[i], sizeof(InvXferPacket),
+                                                 ENET_PACKET_FLAG_RELIABLE);
+            if (serverPeer_ && serverPeer_->state == ENET_PEER_STATE_CONNECTED) {
+                enet_peer_send(serverPeer_, CH_RELIABLE, out);
+            } else {
+                enet_packet_destroy(out);
+            }
+        }
+
+        // Transfer VERDICTS (protocol 50, superseded), same channel as the intents.
+        std::vector<InvXferAckPacket> xferAcks;
+        EnterCriticalSection(&outCs_);
+        xferAcks.swap(outInvXferAcks_);
+        LeaveCriticalSection(&outCs_);
+        for (size_t i = 0; i < xferAcks.size(); ++i) {
+            ENetPacket* out = enet_packet_create(&xferAcks[i], sizeof(InvXferAckPacket),
                                                  ENET_PACKET_FLAG_RELIABLE);
             if (isHost_) {
                 enet_host_broadcast(enetHost_, CH_RELIABLE, out);
@@ -1255,13 +2243,37 @@ void NetLink::threadLoop() {
             }
         }
 
-        // Transfer VERDICTS (protocol 50), same channel as the intents.
-        std::vector<InvXferAckPacket> xferAcks;
+        // Drain + send any queued host-committed transfer verdicts on
+        // CH_RELIABLE (protocol 58). HOST ONLY in practice (queueXferCommit's
+        // doc comment) - isHost_ true broadcasts to every connected client
+        // (the single authoritative verdict); a mis-called join falls into
+        // the else-branch and sends toward the host, which has no
+        // PKT_XFER_COMMIT receive branch (same inert-mis-call shape as
+        // PKT_OWN_RANKS).
+        std::vector<XferCommitPacket> xferCommits;
         EnterCriticalSection(&outCs_);
-        xferAcks.swap(outInvXferAcks_);
+        xferCommits.swap(outXferCommit_);
         LeaveCriticalSection(&outCs_);
-        for (size_t i = 0; i < xferAcks.size(); ++i) {
-            ENetPacket* out = enet_packet_create(&xferAcks[i], sizeof(InvXferAckPacket),
+        for (size_t i = 0; i < xferCommits.size(); ++i) {
+            ENetPacket* out = enet_packet_create(&xferCommits[i], sizeof(XferCommitPacket),
+                                                 ENET_PACKET_FLAG_RELIABLE);
+            if (isHost_) {
+                enet_host_broadcast(enetHost_, CH_RELIABLE, out);
+            } else if (serverPeer_ && serverPeer_->state == ENET_PEER_STATE_CONNECTED) {
+                enet_peer_send(serverPeer_, CH_RELIABLE, out);
+            } else {
+                enet_packet_destroy(out);
+            }
+        }
+
+        // Drain + send any queued transfer-commit bookkeeping acks on
+        // CH_RELIABLE (protocol 58). Participant -> host; audit only.
+        std::vector<XferCommitAckPacket> xferCommitAcks;
+        EnterCriticalSection(&outCs_);
+        xferCommitAcks.swap(outXferCommitAck_);
+        LeaveCriticalSection(&outCs_);
+        for (size_t i = 0; i < xferCommitAcks.size(); ++i) {
+            ENetPacket* out = enet_packet_create(&xferCommitAcks[i], sizeof(XferCommitAckPacket),
                                                  ENET_PACKET_FLAG_RELIABLE);
             if (isHost_) {
                 enet_host_broadcast(enetHost_, CH_RELIABLE, out);
@@ -1395,6 +2407,29 @@ void NetLink::threadLoop() {
             }
         }
 
+        // Drain + send any queued insufficient-funds verdicts on CH_RELIABLE
+        // (protocol 60, CONS-01). HOST ONLY in practice (queueMoneyReject's
+        // doc comment) - isHost_ true broadcasts to every connected client
+        // (the single authoritative reject); a mis-called join falls into
+        // the else-branch and sends toward the host, which rejects it
+        // (isHost_ && type == PKT_MONEY_REJECT receive branch below), the
+        // same inert-mis-call shape as PKT_CLAIM_VERDICT/PKT_CELL_MAP.
+        std::vector<MoneyRejectPacket> moneyRejectPkts;
+        EnterCriticalSection(&outCs_);
+        moneyRejectPkts.swap(outMoneyReject_);
+        LeaveCriticalSection(&outCs_);
+        for (size_t i = 0; i < moneyRejectPkts.size(); ++i) {
+            ENetPacket* out = enet_packet_create(&moneyRejectPkts[i], sizeof(MoneyRejectPacket),
+                                                 ENET_PACKET_FLAG_RELIABLE);
+            if (isHost_) {
+                enet_host_broadcast(enetHost_, CH_RELIABLE, out);
+            } else if (serverPeer_ && serverPeer_->state == ENET_PEER_STATE_CONNECTED) {
+                enet_peer_send(serverPeer_, CH_RELIABLE, out);
+            } else {
+                enet_packet_destroy(out);
+            }
+        }
+
         // Drain + send any queued faction-relation rows on CH_RELIABLE
         // (protocol 24). Change-gated by the Replicator; a settled diplomacy
         // is silent. A lost row would diverge hostility until the safety
@@ -1484,6 +2519,29 @@ void NetLink::threadLoop() {
         LeaveCriticalSection(&outCs_);
         for (size_t i = 0; i < researchPkts.size(); ++i) {
             ENetPacket* out = enet_packet_create(&researchPkts[i], sizeof(ResearchPacket),
+                                                 ENET_PACKET_FLAG_RELIABLE);
+            if (isHost_) {
+                enet_host_broadcast(enetHost_, CH_RELIABLE, out);
+            } else if (serverPeer_ && serverPeer_->state == ENET_PEER_STATE_CONNECTED) {
+                enet_peer_send(serverPeer_, CH_RELIABLE, out);
+            } else {
+                enet_packet_destroy(out);
+            }
+        }
+
+        // Drain + send any queued ownership-rank announcements on CH_RELIABLE
+        // (protocol 57). HOST ONLY (Replicator::announceOwnRanks no-ops on a
+        // join) - a join calling this by mistake falls into the else-branch
+        // below and sends toward the HOST, which has no PKT_OWN_RANKS receive
+        // branch (T-03-06: only the client-apply direction exists), so a
+        // mis-called queue here is inert, never a peer-authored ownership claim
+        // reaching another client.
+        std::vector<OwnRanksPacket> ownRanksPkts;
+        EnterCriticalSection(&outCs_);
+        ownRanksPkts.swap(outOwnRanks_);
+        LeaveCriticalSection(&outCs_);
+        for (size_t i = 0; i < ownRanksPkts.size(); ++i) {
+            ENetPacket* out = enet_packet_create(&ownRanksPkts[i], sizeof(OwnRanksPacket),
                                                  ENET_PACKET_FLAG_RELIABLE);
             if (isHost_) {
                 enet_host_broadcast(enetHost_, CH_RELIABLE, out);
@@ -1703,7 +2761,7 @@ void NetLink::threadLoop() {
         // floods the channel - and CH_BULK keeps the megabytes off CH_RELIABLE,
         // so a live transfer no longer stalls door/money/faction events.
         std::vector<SaveReqPacket>   saveReqs;
-        std::vector<SaveBeginPacket> saveBegins;
+        std::vector<OutSaveBegin>    saveBegins;
         std::vector<OutSaveFile>     saveFiles;
         std::vector<OutSaveDone>     saveDones;
         std::vector<SaveAckPacket>   saveAcks;
@@ -1725,11 +2783,20 @@ void NetLink::threadLoop() {
                 enet_packet_destroy(out);
             }
         }
+        // Phase 10 Plan 01 (SAVE-01/SAVE-04): BEGIN/FILE/DONE each carry a
+        // queue-side destId - OWNER_ID_ALL keeps the historical coordinated-
+        // save broadcast (byte-for-byte unchanged at N=2); a specific
+        // PlayerId routes via sendTo (a per-client retry unicast, or Plan
+        // 02's targeted late-join push). Host-only concept, like every other
+        // destId-aware drain - a client (join) has no registry to sendTo, so
+        // it always falls through to its one serverPeer_ send regardless of
+        // the queued destId.
         for (size_t i = 0; i < saveBegins.size(); ++i) {
-            ENetPacket* out = enet_packet_create(&saveBegins[i], sizeof(SaveBeginPacket),
+            ENetPacket* out = enet_packet_create(&saveBegins[i].pkt, sizeof(SaveBeginPacket),
                                                  ENET_PACKET_FLAG_RELIABLE);
             if (isHost_) {
-                enet_host_broadcast(enetHost_, CH_BULK, out);
+                if (saveBegins[i].destId == OWNER_ID_ALL) enet_host_broadcast(enetHost_, CH_BULK, out);
+                else sendTo(saveBegins[i].destId, out, CH_BULK);
             } else if (serverPeer_ && serverPeer_->state == ENET_PEER_STATE_CONNECTED) {
                 enet_peer_send(serverPeer_, CH_BULK, out);
             } else {
@@ -1744,7 +2811,8 @@ void NetLink::threadLoop() {
                 std::memcpy(out->data + sizeof(SaveFileHeader), &saveFiles[i].tail[0],
                             saveFiles[i].tail.size());
             if (isHost_) {
-                enet_host_broadcast(enetHost_, CH_BULK, out);
+                if (saveFiles[i].destId == OWNER_ID_ALL) enet_host_broadcast(enetHost_, CH_BULK, out);
+                else sendTo(saveFiles[i].destId, out, CH_BULK);
             } else if (serverPeer_ && serverPeer_->state == ENET_PEER_STATE_CONNECTED) {
                 enet_peer_send(serverPeer_, CH_BULK, out);
             } else {
@@ -1760,7 +2828,8 @@ void NetLink::threadLoop() {
                 std::memcpy(out->data + sizeof(SaveDoneHeader), &saveDones[i].crcs[0],
                             saveDones[i].crcs.size() * sizeof(u32));
             if (isHost_) {
-                enet_host_broadcast(enetHost_, CH_BULK, out);
+                if (saveDones[i].destId == OWNER_ID_ALL) enet_host_broadcast(enetHost_, CH_BULK, out);
+                else sendTo(saveDones[i].destId, out, CH_BULK);
             } else if (serverPeer_ && serverPeer_->state == ENET_PEER_STATE_CONNECTED) {
                 enet_peer_send(serverPeer_, CH_BULK, out);
             } else {
@@ -1783,8 +2852,10 @@ void NetLink::threadLoop() {
         // (v44). All fixed PODs: GO host -> join, REQ/NACK join -> host. They
         // share CH_BULK with the save transfer they gate (a NACK's fallback
         // stream must stay ordered behind its GO), and off CH_RELIABLE so they
-        // do not queue behind - or ahead of - live game events.
-        std::vector<LoadGoPacket>   loadGos;
+        // do not queue behind - or ahead of - live game events. GO carries a
+        // queue-side destId (Phase 10 Plan 01), same OWNER_ID_ALL-broadcast-
+        // or-sendTo convention as the save packets above.
+        std::vector<OutLoadGo>      loadGos;
         std::vector<LoadReqPacket>  loadReqs;
         std::vector<LoadNackPacket> loadNacks;
         EnterCriticalSection(&outCs_);
@@ -1793,10 +2864,11 @@ void NetLink::threadLoop() {
         loadNacks.swap(outLoadNack_);
         LeaveCriticalSection(&outCs_);
         for (size_t i = 0; i < loadGos.size(); ++i) {
-            ENetPacket* out = enet_packet_create(&loadGos[i], sizeof(LoadGoPacket),
+            ENetPacket* out = enet_packet_create(&loadGos[i].pkt, sizeof(LoadGoPacket),
                                                  ENET_PACKET_FLAG_RELIABLE);
             if (isHost_) {
-                enet_host_broadcast(enetHost_, CH_BULK, out);
+                if (loadGos[i].destId == OWNER_ID_ALL) enet_host_broadcast(enetHost_, CH_BULK, out);
+                else sendTo(loadGos[i].destId, out, CH_BULK);
             } else if (serverPeer_ && serverPeer_->state == ENET_PEER_STATE_CONNECTED) {
                 enet_peer_send(serverPeer_, CH_BULK, out);
             } else {
@@ -1823,6 +2895,73 @@ void NetLink::threadLoop() {
                 enet_peer_send(serverPeer_, CH_BULK, out);
             } else {
                 enet_packet_destroy(out);
+            }
+        }
+
+        // Drain + send queued positive coordinated-load ACKs on CH_BULK
+        // (protocol 61, join -> host, SAVE-02's missing half of the NACK-
+        // only pair).
+        std::vector<LoadAckPacket> loadAcks;
+        EnterCriticalSection(&outCs_);
+        loadAcks.swap(outLoadAck_);
+        LeaveCriticalSection(&outCs_);
+        for (size_t i = 0; i < loadAcks.size(); ++i) {
+            ENetPacket* out = enet_packet_create(&loadAcks[i], sizeof(LoadAckPacket),
+                                                 ENET_PACKET_FLAG_RELIABLE);
+            if (isHost_) {
+                enet_host_broadcast(enetHost_, CH_BULK, out);
+            } else if (serverPeer_ && serverPeer_->state == ENET_PEER_STATE_CONNECTED) {
+                enet_peer_send(serverPeer_, CH_BULK, out);
+            } else {
+                enet_packet_destroy(out);
+            }
+        }
+
+        // Drain + send queued first-wins arbitration rejects on CH_BULK
+        // (protocol 61, HOST ONLY in practice - queueCoordReject's doc
+        // comment). Class D unicast to the rejected requester ONLY - never
+        // broadcast (a leaked reject to every client would be information
+        // disclosure about another client's in-flight request). A mis-called
+        // join falls into the else-branch and sends toward the host, which
+        // rejects it (the isHost_ && type==PKT_COORD_REJECT receive branch),
+        // the same inert-mis-call shape as PKT_CLAIM_VERDICT/PKT_MONEY_REJECT.
+        std::vector<CoordRejectPacket> coordRejects;
+        EnterCriticalSection(&outCs_);
+        coordRejects.swap(outCoordReject_);
+        LeaveCriticalSection(&outCs_);
+        for (size_t i = 0; i < coordRejects.size(); ++i) {
+            ENetPacket* out = enet_packet_create(&coordRejects[i], sizeof(CoordRejectPacket),
+                                                 ENET_PACKET_FLAG_RELIABLE);
+            if (isHost_) {
+                sendTo(coordRejects[i].requesterId, out, CH_BULK);
+            } else if (serverPeer_ && serverPeer_->state == ENET_PEER_STATE_CONNECTED) {
+                enet_peer_send(serverPeer_, CH_BULK, out);
+            } else {
+                enet_packet_destroy(out);
+            }
+        }
+
+        // Drain + process any marshaled kick requests (Phase 10 Plan 01,
+        // SAVE-01): the net-thread-purity drop lever for a client whose
+        // save/load transfer exhausted its bounded retries. HOST ONLY - a
+        // join has no registry to kick from. The resulting DISCONNECT event
+        // drives the EXISTING leave edge (pushLeave -> clearPeerReplication
+        // State + roster LEFT) - no new cleanup path here.
+        std::vector<u32> kicks;
+        EnterCriticalSection(&outCs_);
+        kicks.swap(outKick_);
+        LeaveCriticalSection(&outCs_);
+        if (isHost_) {
+            for (size_t i = 0; i < kicks.size(); ++i) {
+                std::map<u32, PeerState>::iterator it = registry_.find(kicks[i]);
+                if (it != registry_.end() && it->second.peer) {
+                    char kb[64];
+                    _snprintf(kb, sizeof(kb) - 1, "kickPeer: disconnecting player=%u",
+                              (unsigned)kicks[i]);
+                    kb[sizeof(kb) - 1] = '\0';
+                    netLog(kb);
+                    enet_peer_disconnect(it->second.peer, 0);
+                }
             }
         }
 

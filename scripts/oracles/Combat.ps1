@@ -528,14 +528,14 @@ function Test-ProxyDrift {
     # the peak: it is whether the copy is FIGHTING out there, and whether the
     # distance keeps growing instead of being pulled back.
     $runaway = @($rows | Where-Object { $_.d -gt $RunawayDrift })
-    $worst = ($rows | Sort-Object d -Descending | Select-Object -First 1)
+    $worst = ($rows | Sort-Object { $_.d } -Descending | Select-Object -First 1)
     $m = @{ samples = $rows.Count; lagged = $lagged; maxDrift = $max; medDrift = $med
             over = $over.Count; overFighting = $overFighting.Count
             runaway = $runaway.Count
             worstHand = $worst.hand; worstStreamed = $worst.streamed }
     $bad = @()
     if ($overFighting.Count -gt 0) {
-        $w = ($overFighting | Sort-Object d -Descending | Select-Object -First 1)
+        $w = ($overFighting | Sort-Object { $_.d } -Descending | Select-Object -First 1)
         $bad += ("proxy $($w.hand) was FIGHTING $([int]$w.d) u from where its owner has it " +
                  "($($overFighting.Count) samples): the two screens disagree about where " +
                  "the fight is happening")
@@ -669,8 +669,8 @@ function Measure-FightDisagreement {
     $worstHostHand = ''; $worstHostOnly = 0
     foreach ($hand in $JoinMap.Keys) {
         if (-not $HostMap.ContainsKey($hand)) { continue }
-        $jSamples = @($JoinMap[$hand] | Sort-Object t)
-        $hSamples = @($HostMap[$hand] | Sort-Object t)
+        $jSamples = @($JoinMap[$hand] | Sort-Object { $_.t })
+        $hSamples = @($HostMap[$hand] | Sort-Object { $_.t })
         $handJoinOnly = 0; $handHostOnly = 0
         foreach ($jr in $jSamples) {
             $best = $null; $bd = [int]::MaxValue
@@ -1249,12 +1249,12 @@ function Get-CombatParity {
     $pairs = 0; $joinOnly = 0; $hostOnly = 0; $agree = 0
     $joinToggles = 0; $tSpanMax = 0
     foreach ($hand in $joinMap.Keys) {
-        $jSamples = @($joinMap[$hand] | Sort-Object t)
+        $jSamples = @($joinMap[$hand] | Sort-Object { $_.t })
         $prev = $null
         foreach ($s in $jSamples) { if ($null -ne $prev -and $s.fight -ne $prev) { $joinToggles++ }; $prev = $s.fight }
         if ($jSamples.Count -ge 2) { $span = [int]$jSamples[-1].t - [int]$jSamples[0].t; if ($span -gt $tSpanMax) { $tSpanMax = $span } }
         if (-not $hostMap.ContainsKey($hand)) { continue }
-        $hSamples = @($hostMap[$hand] | Sort-Object t)
+        $hSamples = @($hostMap[$hand] | Sort-Object { $_.t })
         foreach ($jr in $jSamples) {
             $best = $null; $bd = [int]::MaxValue
             foreach ($hr in $hSamples) { $dd = [Math]::Abs([int]$hr.t - [int]$jr.t); if ($dd -lt $bd) { $bd = $dd; $best = $hr } }

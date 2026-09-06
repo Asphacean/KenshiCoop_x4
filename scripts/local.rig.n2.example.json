@@ -1,0 +1,30 @@
+{
+  "_comment": "Phase 11 plan 02 (TEST-01): committed N=2 rig TEMPLATE for run_test4.ps1 - copy to local.rig.n2.json (gitignored, like the N=4 local.rig.json) and adjust installDir/save/seconds per the scenario being run. Mirrors local.rig.json's real dev-machine layout (Clone4 as host so the primary Steam install is never written; Clone1 as the sole join) with only 2 instances declared. Pass -ExpectedInstances 2 to run_test4.ps1 (it refuses to run fewer instances than requested unless told to explicitly, per its own guard) and -ExpectedInstances 2 (or rely on run_meta.json's instanceCount) to analyze_run4.ps1/analyze_wnpc_diff4.ps1 for the offline judge.",
+  "save": "wanderer4",
+  "_save_comment": "wanderer4 = the same baked 4-squad start the N=4 gates use (tools/MultiplayerStartGen). At N=2 only ranks 0/1 are ever connected; ranks 2/3 stay idle baked furniture for the whole run (research Risk 2, budgeted for live verification in Plan 03) - do not assume they need a different save.",
+  "port": 27800,
+  "ip": "127.0.0.1",
+  "seconds": 320,
+  "_seconds_comment": "320 matches ScenarioSaveLoad.cpp's HOST_DURATION_MS/1000 - the longest of the three locked N=2/N=3 gates (milestone_a_gate/player_state_gate finish sooner); lower this to match scenarios.psd1's entry for a shorter gate.",
+  "instances": [
+    {
+      "role": "host",
+      "installDir": "F:\\KenshiCoop-Clone4",
+      "port": 27800,
+      "logName": "host.log",
+      "env": {},
+      "disconnectAtSec": null,
+      "reconnectAtSec": null
+    },
+    {
+      "role": "join",
+      "installDir": "F:\\KenshiCoop-Clone1",
+      "port": 27800,
+      "logName": "join1.log",
+      "env": {},
+      "disconnectAtSec": null,
+      "reconnectAtSec": 20,
+      "_comment": "join1 is ALSO the mirrored 'late-launching' instance (reconnectAtSec, same lever local.rig.json's join3 uses for save_load_gate) - at N=2 there is only one join, so it doubles as both 'the sole established join' AND 'the deferred one' depending on which gate is running. ScenarioSaveLoad.cpp's identity fix (KENSHICOOP_SCENARIO_JOIN_DURATION_SEC, not a rank comparison) resolves this correctly regardless of rank number. Set to null for a plain N=2 connect with no deferred-launch lever (milestone_a_gate/player_state_gate do not need it)."
+    }
+  ]
+}

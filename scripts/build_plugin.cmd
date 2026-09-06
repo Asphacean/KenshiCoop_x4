@@ -34,7 +34,25 @@ set "ENET=%REPO%\third_party\enet\enet\include"
 
 REM Locate MSBuild via vswhere (falls back to a common path).
 set "MSBUILD="
-for /f "usebackq delims=" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -requires Microsoft.Component.MSBuild -find "MSBuild\**\Bin\MSBuild.exe" 2^>nul`) do set "MSBUILD=%%i"
+REM -products * is required so vswhere also matches Build Tools-only installs
+REM (without it, a machine with only VS Build Tools falls through to the fallback).
+for /f "usebackq delims=" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.Component.MSBuild -find "MSBuild\**\Bin\MSBuild.exe" 2^>nul`) do set "MSBUILD=%%i"
+REM The vswhere for/f capture above has been observed to silently come back
+REM empty under some shell-wrapped invocations (e.g. a Git Bash `cmd //c
+REM "script.cmd"` host) even though vswhere itself works fine when invoked
+REM directly - discard a resolved path that doesn't actually exist so the
+REM fallback chain below still runs instead of failing on a phantom path.
+if defined MSBUILD if not exist "%MSBUILD%" set "MSBUILD="
+REM Fallback chain: try each VS "wave" (newest first) across every edition
+REM that ships MSBuild, so a machine with only an older Build Tools install
+REM (e.g. 2019, not 2022) still resolves instead of failing outright.
+if not defined MSBUILD (
+    for %%v in (2022 2019 2017) do (
+        for %%e in (BuildTools Community Professional Enterprise) do (
+            if not defined MSBUILD if exist "C:\Program Files (x86)\Microsoft Visual Studio\%%v\%%e\MSBuild\Current\Bin\MSBuild.exe" set "MSBUILD=C:\Program Files (x86)\Microsoft Visual Studio\%%v\%%e\MSBuild\Current\Bin\MSBuild.exe"
+        )
+    )
+)
 if not defined MSBUILD set "MSBUILD=C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\MSBuild\Current\Bin\MSBuild.exe"
 
 REM x64 native toolchain on PATH so cl.exe finds its sibling DLLs (mspdb100, etc).

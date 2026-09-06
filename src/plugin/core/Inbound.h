@@ -62,13 +62,25 @@ struct InboundWorldRemove {
     std::vector<u32> netIds;
 };
 
-// One received world-item CLAIM (protocol 47): a peer consumed the proxies it held for these
-// netIds, so WE (the author) must destroy our real ground objects. netIds are in OUR netId
-// space; authorId lets a receiver ignore a claim addressed to a different author.
+// One received world-item CLAIM (protocol 47; protocol 58: now the claim INTENT,
+// claimant -> host): a peer consumed the proxies it held for these netIds. netIds
+// are in the AUTHOR's netId space; authorClaimMs (protocol 58) is the claimant's
+// own nowMs() at the claim-detection edge, in the same frame as
+// EntityBatchHeader.sendMs so the host's peerClock_ mapping applies to it -
+// ClaimArbiter.h arbitrates contention over (authorId, netId) using it.
 struct InboundWorldClaim {
-    u32              ownerId;  // the claiming peer
-    u32              authorId; // whose netId space the ids belong to
+    u32              ownerId;       // the claiming peer
+    u32              authorId;      // whose netId space the ids belong to
+    u32              authorClaimMs; // protocol 58: claimant's nowMs() at claim-detection
     std::vector<u32> netIds;
+};
+
+// One received host-committed claim-contention VERDICT (protocol 58, Phase 7
+// Plan 02, INV-03): the host's single authoritative winner for one item
+// identity (authorId, netId), delivered to every client. World-state: a
+// verdict for a world that no longer exists is meaningless.
+struct InboundClaimVerdict {
+    ClaimVerdictPacket pkt;
 };
 
 // One received NPC existence census (protocol 36, join side): the hands of
@@ -106,13 +118,29 @@ struct InboundInvXfer {
     InvXferPacket pkt;
 };
 
-// One received transfer VERDICT (protocol 50): the answer to an intent WE
-// authored, saying how many units actually landed on the receiver. World-state:
-// a verdict for a world that no longer exists is meaningless, and the author's
-// latches were dropped by the same reset.
+// One received transfer VERDICT (protocol 50, SUPERSEDED by protocol 58's
+// InboundXferCommit below): the answer to an intent WE authored, saying how
+// many units actually landed on the receiver. World-state: a verdict for a
+// world that no longer exists is meaningless, and the author's latches were
+// dropped by the same reset.
 struct InboundInvXferAck {
     u32              ownerId;
     InvXferAckPacket pkt;
+};
+
+// One received host-committed transfer VERDICT (protocol 58): the host's
+// single authoritative outcome for a transfer intent, delivered to every
+// client. World-state: a commit for a world that no longer exists is
+// meaningless, and the author's latches were dropped by the same reset.
+struct InboundXferCommit {
+    XferCommitPacket pkt;
+};
+
+// One received transfer-commit bookkeeping ACK (protocol 58, host side):
+// audit/correlation only - never settles anything (the commit already did).
+struct InboundXferCommitAck {
+    u32                 ownerId;
+    XferCommitAckPacket pkt;
 };
 
 // One received owner-authoritative medical snapshot (phase 2): the subject's
@@ -166,6 +194,13 @@ struct InboundMoney {
 struct InboundMoneyDelta {
     u32              ownerId;
     MoneyDeltaPacket pkt;
+};
+
+// One received insufficient-funds VERDICT (protocol 60, CONS-01, host ->
+// all): the host's single authoritative reject for one (buyerId, seq).
+// World-state: a verdict for a world that no longer exists is meaningless.
+struct InboundMoneyReject {
+    MoneyRejectPacket pkt;
 };
 
 // One received player-faction relation row (protocol 24): from the host it is
@@ -231,8 +266,11 @@ struct InboundProd {
     ProdPacket pkt;
 };
 
-// One received known-research row (protocol 38): the HOST reports a RESEARCH
-// stringID as known; the join applies via Research::startResearch (idempotent
+// One received known-research row (protocol 38): from the host it is the
+// authoritative broadcast (the join applies it); since Phase 8 (08-01,
+// WORLD-02), from a join it is a post-baseline-unlock INTENT (the host
+// applies it, then its own stream re-broadcasts so every other join
+// converges). Applied via Research::startResearch either way (idempotent
 // against already-known sids).
 struct InboundResearch {
     u32            ownerId;
@@ -339,6 +377,20 @@ struct InboundLoadNack {
     LoadNackPacket pkt;
 };
 
+// One received positive coordinated-load completion (protocol 61, host
+// side, SAVE-02): the join's coordinated load succeeded (or failed) - the
+// missing half of the LoadNack-only pair.
+struct InboundLoadAck {
+    u32           ownerId;
+    LoadAckPacket pkt;
+};
+
+// One received first-wins arbitration reject (protocol 61, join side,
+// SAVE-03): host-authored, Class D unicast to this requester only.
+struct InboundCoordReject {
+    CoordRejectPacket pkt;
+};
+
 // One received camera hint (protocol 43, host side): the join's camera world
 // center, folded into interestCenters as an extra anchor. Latest wins.
 struct InboundCamHint {
@@ -352,6 +404,25 @@ struct InboundCamHint {
 struct InboundCellClaim {
     u32             ownerId;
     CellClaimPacket pkt;
+};
+
+// One received cell-claim MAP (protocol 59, WORLD-03, host -> all): the
+// host's single authoritative verdict. World-state, like InboundCellClaim -
+// the map describes THIS world's presence-authority partition, so a reload
+// drops it and the host re-broadcasts within a tick of the new world going
+// live (same disposition as the census/claim channels it supersedes).
+struct InboundCellMap {
+    CellMapPacket pkt;
+};
+
+// One received ownership-rank announcement (protocol 57, join side): the
+// host's authoritative map<PlayerId,set<rank>>, encoded per Wire.h's
+// OwnRanksPacket. Session-preserving, like the roster presence edges
+// (conn_/leave_) - ownership assignment describes WHO the players are, not
+// the current world's geometry, so it survives a reload; the host
+// re-announces on the next roster/tab-set change if anything actually moved.
+struct InboundOwnRanks {
+    OwnRanksPacket pkt;
 };
 
 // --- Structural world-state classification (Phase 4) -------------------------
@@ -421,19 +492,22 @@ public:
         // are ~1 Hz refreshes. Every other queue is reliable and stays unbounded.
         ent_(worldReset_, 4096),  evt_(worldReset_),        inv_(worldReset_),
         wi_(worldReset_),         wir_(worldReset_),        wic_(worldReset_),
+        claimVerdict_(worldReset_),
         npcCensus_(worldReset_),
         wd_(worldReset_),         invXfer_(worldReset_),    invXferAck_(worldReset_),
+        xferCommit_(worldReset_), xferCommitAck_(worldReset_),
         wp_(worldReset_),
         med_(worldReset_),        treat_(worldReset_),      combatHit_(worldReset_),
         speed_(worldReset_),
         stats_(worldReset_),      money_(worldReset_),      moneyDelta_(worldReset_),
+        moneyReject_(worldReset_),
         faction_(worldReset_),
         time_(worldReset_),       door_(worldReset_),       prod_(worldReset_),
         research_(worldReset_),   deed_(worldReset_),       fixture_(worldReset_),
         buildPlace_(worldReset_), buildState_(worldReset_),
         buildDoor_(worldReset_),  buildRemove_(worldReset_), stealth_(worldReset_, 512),
         spawnReq_(worldReset_),   spawnInfo_(worldReset_),  camHint_(worldReset_, 64),
-        cellClaim_(worldReset_, 64) {
+        cellClaim_(worldReset_, 64), cellMap_(worldReset_, 16) {
         InitializeCriticalSection(&cs_);
     }
     ~Inbound() { DeleteCriticalSection(&cs_); }
@@ -499,12 +573,19 @@ public:
         if (netIds && count > 0) wr.netIds.assign(netIds, netIds + count);
         EnterCriticalSection(&cs_); wir_.push_back(wr); LeaveCriticalSection(&cs_);
     }
-    // NET thread: one received world-item claim (protocol 47), owner-tagged.
-    void pushWorldClaim(u32 ownerId, u32 authorId, const u32* netIds, unsigned int count) {
+    // NET thread: one received world-item claim INTENT (protocol 58: claimant
+    // -> host), owner-tagged, carrying the claimant's authorClaimMs.
+    void pushWorldClaim(u32 ownerId, u32 authorId, u32 authorClaimMs,
+                        const u32* netIds, unsigned int count) {
         InboundWorldClaim wc;
-        wc.ownerId = ownerId; wc.authorId = authorId;
+        wc.ownerId = ownerId; wc.authorId = authorId; wc.authorClaimMs = authorClaimMs;
         if (netIds && count > 0) wc.netIds.assign(netIds, netIds + count);
         EnterCriticalSection(&cs_); wic_.push_back(wc); LeaveCriticalSection(&cs_);
+    }
+    // NET thread: one received host-committed claim-contention verdict (protocol 58).
+    void pushClaimVerdict(const ClaimVerdictPacket& pkt) {
+        InboundClaimVerdict cv; cv.pkt = pkt;
+        EnterCriticalSection(&cs_); claimVerdict_.push_back(cv); LeaveCriticalSection(&cs_);
     }
     // NET thread: one received NPC existence census (protocol 36), owner-tagged.
     void pushNpcCensus(u32 ownerId, const u32* hands, const float* pos,
@@ -534,6 +615,16 @@ public:
     void pushInvXferAck(u32 ownerId, const InvXferAckPacket& pkt) {
         InboundInvXferAck ia; ia.ownerId = ownerId; ia.pkt = pkt;
         EnterCriticalSection(&cs_); invXferAck_.push_back(ia); LeaveCriticalSection(&cs_);
+    }
+    // NET thread: one received host-committed transfer verdict (protocol 58).
+    void pushXferCommit(const XferCommitPacket& pkt) {
+        InboundXferCommit xc; xc.pkt = pkt;
+        EnterCriticalSection(&cs_); xferCommit_.push_back(xc); LeaveCriticalSection(&cs_);
+    }
+    // NET thread: one received transfer-commit bookkeeping ack (protocol 58), owner-tagged.
+    void pushXferCommitAck(u32 ownerId, const XferCommitAckPacket& pkt) {
+        InboundXferCommitAck xa; xa.ownerId = ownerId; xa.pkt = pkt;
+        EnterCriticalSection(&cs_); xferCommitAck_.push_back(xa); LeaveCriticalSection(&cs_);
     }
     // NET thread: one received medical snapshot, owner-tagged.
     void pushMedical(u32 ownerId, const MedicalPacket& pkt) {
@@ -569,6 +660,13 @@ public:
     void pushMoneyDelta(u32 ownerId, const MoneyDeltaPacket& pkt) {
         InboundMoneyDelta imd; imd.ownerId = ownerId; imd.pkt = pkt;
         EnterCriticalSection(&cs_); moneyDelta_.push_back(imd); LeaveCriticalSection(&cs_);
+    }
+    // NET thread: one received insufficient-funds verdict (protocol 60,
+    // CONS-01), host-authored. Client receive branch only - the host never
+    // receives its own broadcast back.
+    void pushMoneyReject(const MoneyRejectPacket& pkt) {
+        InboundMoneyReject imr; imr.pkt = pkt;
+        EnterCriticalSection(&cs_); moneyReject_.push_back(imr); LeaveCriticalSection(&cs_);
     }
     // NET thread: one received faction-relation row (protocol 24), owner-tagged.
     void pushFaction(u32 ownerId, const FactionPacket& pkt) {
@@ -682,6 +780,19 @@ public:
         InboundLoadNack ln; ln.ownerId = ownerId; ln.pkt = pkt;
         EnterCriticalSection(&cs_); loadNack_.push_back(ln); LeaveCriticalSection(&cs_);
     }
+    // NET thread: one received positive coordinated-load completion (protocol
+    // 61, SAVE-02), owner-tagged.
+    void pushLoadAck(u32 ownerId, const LoadAckPacket& pkt) {
+        InboundLoadAck la; la.ownerId = ownerId; la.pkt = pkt;
+        EnterCriticalSection(&cs_); loadAck_.push_back(la); LeaveCriticalSection(&cs_);
+    }
+    // NET thread: one received first-wins arbitration reject (protocol 61,
+    // SAVE-03), host-authored. Client receive branch only - the host never
+    // receives its own unicast back.
+    void pushCoordReject(const CoordRejectPacket& pkt) {
+        InboundCoordReject cr; cr.pkt = pkt;
+        EnterCriticalSection(&cs_); coordReject_.push_back(cr); LeaveCriticalSection(&cs_);
+    }
     // NET thread: one received camera hint (protocol 43), owner-tagged.
     void pushCamHint(u32 ownerId, const CamHintPacket& pkt) {
         InboundCamHint ch; ch.ownerId = ownerId; ch.pkt = pkt;
@@ -691,6 +802,18 @@ public:
     void pushCellClaim(u32 ownerId, const CellClaimPacket& pkt) {
         InboundCellClaim cc; cc.ownerId = ownerId; cc.pkt = pkt;
         EnterCriticalSection(&cs_); cellClaim_.push_back(cc); LeaveCriticalSection(&cs_);
+    }
+    // NET thread: one received cell-claim map (protocol 59, WORLD-03),
+    // host-authored. Client receive branch only - the host never receives
+    // its own broadcast back.
+    void pushCellMap(const CellMapPacket& pkt) {
+        InboundCellMap cm; cm.pkt = pkt;
+        EnterCriticalSection(&cs_); cellMap_.push_back(cm); LeaveCriticalSection(&cs_);
+    }
+    // NET thread: one received ownership-rank announcement (protocol 57).
+    void pushOwnRanks(const OwnRanksPacket& pkt) {
+        InboundOwnRanks r; r.pkt = pkt;
+        EnterCriticalSection(&cs_); ownRanks_.push_back(r); LeaveCriticalSection(&cs_);
     }
 
     // MAIN thread: move all pending items into 'out' (empty on entry).
@@ -718,6 +841,9 @@ public:
     void drainWorldClaim(std::deque<InboundWorldClaim>& out) {
         EnterCriticalSection(&cs_); out.swap(wic_); LeaveCriticalSection(&cs_);
     }
+    void drainClaimVerdicts(std::deque<InboundClaimVerdict>& out) {
+        EnterCriticalSection(&cs_); out.swap(claimVerdict_); LeaveCriticalSection(&cs_);
+    }
     void drainNpcCensus(std::deque<InboundNpcCensus>& out) {
         EnterCriticalSection(&cs_); out.swap(npcCensus_); LeaveCriticalSection(&cs_);
     }
@@ -732,6 +858,12 @@ public:
     }
     void drainInvXferAcks(std::deque<InboundInvXferAck>& out) {
         EnterCriticalSection(&cs_); out.swap(invXferAck_); LeaveCriticalSection(&cs_);
+    }
+    void drainXferCommits(std::deque<InboundXferCommit>& out) {
+        EnterCriticalSection(&cs_); out.swap(xferCommit_); LeaveCriticalSection(&cs_);
+    }
+    void drainXferCommitAcks(std::deque<InboundXferCommitAck>& out) {
+        EnterCriticalSection(&cs_); out.swap(xferCommitAck_); LeaveCriticalSection(&cs_);
     }
     void drainMedical(std::deque<InboundMedical>& out) {
         EnterCriticalSection(&cs_); out.swap(med_); LeaveCriticalSection(&cs_);
@@ -787,6 +919,9 @@ public:
     void drainMoneyDeltas(std::deque<InboundMoneyDelta>& out) {
         EnterCriticalSection(&cs_); out.swap(moneyDelta_); LeaveCriticalSection(&cs_);
     }
+    void drainMoneyRejects(std::deque<InboundMoneyReject>& out) {
+        EnterCriticalSection(&cs_); out.swap(moneyReject_); LeaveCriticalSection(&cs_);
+    }
     void drainStealth(std::deque<InboundStealth>& out) {
         EnterCriticalSection(&cs_); out.swap(stealth_); LeaveCriticalSection(&cs_);
     }
@@ -820,11 +955,23 @@ public:
     void drainLoadNacks(std::deque<InboundLoadNack>& out) {
         EnterCriticalSection(&cs_); out.swap(loadNack_); LeaveCriticalSection(&cs_);
     }
+    void drainLoadAcks(std::deque<InboundLoadAck>& out) {
+        EnterCriticalSection(&cs_); out.swap(loadAck_); LeaveCriticalSection(&cs_);
+    }
+    void drainCoordRejects(std::deque<InboundCoordReject>& out) {
+        EnterCriticalSection(&cs_); out.swap(coordReject_); LeaveCriticalSection(&cs_);
+    }
     void drainCamHints(std::deque<InboundCamHint>& out) {
         EnterCriticalSection(&cs_); out.swap(camHint_); LeaveCriticalSection(&cs_);
     }
     void drainCellClaims(std::deque<InboundCellClaim>& out) {
         EnterCriticalSection(&cs_); out.swap(cellClaim_); LeaveCriticalSection(&cs_);
+    }
+    void drainCellMaps(std::deque<InboundCellMap>& out) {
+        EnterCriticalSection(&cs_); out.swap(cellMap_); LeaveCriticalSection(&cs_);
+    }
+    void drainOwnRanks(std::deque<InboundOwnRanks>& out) {
+        EnterCriticalSection(&cs_); out.swap(ownRanks_); LeaveCriticalSection(&cs_);
     }
 
     // MAIN thread, session reset (protocol 32): drop every queued packet that
@@ -863,6 +1010,10 @@ private:
     // SESSION-PRESERVING: presence edges (the connection persists across a swap).
     SessionQ<u32>                  conn_;
     SessionQ<u32>                  leave_;
+    // SESSION-PRESERVING (protocol 57): ownership assignment describes WHO the
+    // players are, not the current world - it survives a reload exactly like
+    // the presence edges above.
+    SessionQ<InboundOwnRanks>      ownRanks_;
 
     // WORLD-STATE: describe the current world; auto-cleared on a session reset.
     WorldQ<InboundEntity>          ent_;
@@ -871,10 +1022,13 @@ private:
     WorldQ<InboundWorldItems>      wi_;
     WorldQ<InboundWorldRemove>     wir_;
     WorldQ<InboundWorldClaim>      wic_;
+    WorldQ<InboundClaimVerdict>    claimVerdict_;
     WorldQ<InboundNpcCensus>       npcCensus_;
     WorldQ<InboundWorldDrop>       wd_;
     WorldQ<InboundInvXfer>         invXfer_;
     WorldQ<InboundInvXferAck>      invXferAck_;
+    WorldQ<InboundXferCommit>      xferCommit_;
+    WorldQ<InboundXferCommitAck>   xferCommitAck_;
     WorldQ<InboundWorldPickup>     wp_;
     WorldQ<InboundMedical>         med_;
     WorldQ<InboundTreatment>       treat_;
@@ -883,6 +1037,7 @@ private:
     WorldQ<InboundStats>           stats_;
     WorldQ<InboundMoney>           money_;
     WorldQ<InboundMoneyDelta>      moneyDelta_;
+    WorldQ<InboundMoneyReject>     moneyReject_;
     WorldQ<InboundFaction>         faction_;
     WorldQ<InboundTime>            time_;
     WorldQ<InboundDoor>            door_;
@@ -899,6 +1054,7 @@ private:
     WorldQ<InboundSpawnInfo>       spawnInfo_;
     WorldQ<InboundCamHint>         camHint_;
     WorldQ<InboundCellClaim>       cellClaim_;
+    WorldQ<InboundCellMap>         cellMap_;
 
     // SESSION-PRESERVING: coordinated save (protocol 31) + load (protocol 32)
     // handshake - a GO/NACK/chunk arriving mid-swap must survive the reset.
@@ -910,6 +1066,8 @@ private:
     SessionQ<InboundLoadGo>        loadGo_;
     SessionQ<InboundLoadReq>       loadReq_;
     SessionQ<InboundLoadNack>      loadNack_;
+    SessionQ<InboundLoadAck>       loadAck_;
+    SessionQ<InboundCoordReject>   coordReject_;
 
     Inbound(const Inbound&);
     Inbound& operator=(const Inbound&);

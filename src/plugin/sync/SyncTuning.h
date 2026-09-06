@@ -26,6 +26,15 @@ struct SyncTuning {
     // resend. Join DELTAS are never throttled: each one is a conservation event.
     unsigned long moneyMinSendMs;   // sampling floor between pool-total sends
     unsigned long moneyResendMs;    // unchanged-total safety resend
+    // Overdraft contention window (protocol 60, CONS-01, MoneyFold.h): how
+    // long the host holds a would-overdraw window open before finalizing the
+    // deterministic timestamp-ordered verdict. Same one-RTT physics as the
+    // claim-contention window (CLAIM_WINDOW_MS default 250 ms,
+    // ReplicatorItems.cpp), so the default matches it - a single owned field
+    // (like every other SyncTuning knob) rather than a second getenv() site;
+    // WAN A/B tuning is a future config-wiring pass, deferred like the rest
+    // of this struct's fields (none of which read an env var today either).
+    unsigned long moneyWindowMs;
 
     // Faction relations (protocol 24): relations move in bursts; 1 Hz sample,
     // long safety resend for rows we ever sent.
@@ -62,7 +71,7 @@ struct SyncTuning {
     unsigned long bdoorResendMs;
 
     SyncTuning()
-        : moneyMinSendMs(1000),   moneyResendMs(5000),
+        : moneyMinSendMs(1000),   moneyResendMs(5000), moneyWindowMs(250),
           factionSampleMs(1000),  factionResendMs(10000),
           doorSampleMs(1000),     doorResendMs(10000),
           prodSampleMs(1000),     prodResendMs(10000),

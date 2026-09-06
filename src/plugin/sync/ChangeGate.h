@@ -28,6 +28,12 @@
 #ifndef KENSHICOOP_CHANGE_GATE_H
 #define KENSHICOOP_CHANGE_GATE_H
 
+// Phase 8 (WORLD-01): gateSeqAcceptPerSender needs a per-owner map for its
+// signature. This is the ONLY new include this header ever needed (the
+// FoldDedup.h precedent - engine/wire/logger-free stays true, <map> is a
+// pure-STL container).
+#include <map>
+
 namespace coop {
 namespace sync {
 
@@ -71,6 +77,36 @@ inline bool gateShouldSend(bool changed, unsigned long nowMs,
 // stamps seqSeen = incomingSeq when this returns true.
 inline bool gateSeqAccept(unsigned int seqSeen, unsigned int incomingSeq) {
     return seqSeen == 0 || incomingSeq > seqSeen;
+}
+
+// PER-SENDER SEQ ACCEPT (apply level, Phase 8 WORLD-01: the N>=3 fix).
+// gateSeqAccept above tracks ONE bare counter across every sender - correct
+// only when a receiver ever hears from a single other sender (the two-player
+// design target it was built for). It is WRONG for a SYMMETRIC channel where
+// more than one client may author the SAME row (a door either P2 or P3 might
+// toggle, a build-door either author might touch): at N>=3 a receiver
+// hearing the row from two senders would compare the second sender's seq
+// against the FIRST sender's counter, silently dropping the second author's
+// genuinely-newer fact the moment the first author's counter passes it
+// (ChangeGate.h's own pre-Phase-8 comment named this the exact P2/P3/P4-
+// collide-on-seq=1 scenario, then mistakenly declared every seq-guarded
+// channel structurally immune - true only for hand-partitioned channels,
+// false for the symmetric ones; see docs/TWO_PLAYER_ASSUMPTIONS.md finding
+// 11's Phase 8 partial overturn). Keying the accept decision on the SENDER
+// (ownerId) closes the gap: each sender's monotonic seq is tracked
+// independently in the caller's map, so a second author's first-ever row is
+// never compared against a first author's counter. Same "first-ever or
+// strictly newer" rule as gateSeqAccept, scoped per ownerId. Decision-only,
+// matching gateSeqAccept's contract exactly: the caller stamps
+// seqSeen[ownerId] = incomingSeq on accept - this function does not mutate
+// the map (FoldDedup.h's foldMonotonic is the mutating sibling of this same
+// per-owner idiom, for channels that want stamp-on-check-in-one-call
+// instead).
+inline bool gateSeqAcceptPerSender(const std::map<unsigned int, unsigned int>& seqSeen,
+                                    unsigned int ownerId, unsigned int incomingSeq) {
+    std::map<unsigned int, unsigned int>::const_iterator it = seqSeen.find(ownerId);
+    if (it == seqSeen.end()) return true;         // first sight from this sender
+    return incomingSeq > it->second;               // strictly newer than THIS sender's last
 }
 
 } // namespace sync

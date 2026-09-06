@@ -66,7 +66,7 @@ function Test-NpcVitals {
     $Hv = @(); $Jv = @()
     foreach ($id in (Get-HandAliases -File $HostFile -WireIndexSerial $handIS)) { $Hv += Get-VitalsSeries -File $HostFile -HandIS $id }
     foreach ($id in (Get-HandAliases -File $JoinFile -WireIndexSerial $handIS)) { $Jv += Get-VitalsSeries -File $JoinFile -HandIS $id }
-    $Hv = @($Hv | Sort-Object -Property t); $Jv = @($Jv | Sort-Object -Property t)
+    $Hv = @($Hv | Sort-Object { $_.t }); $Jv = @($Jv | Sort-Object { $_.t })
     if ($Hv.Count -lt 3 -or $Jv.Count -lt 3) {
         Write-Host "  NPC-VITALS SKIP - insufficient vitals series (host=$($Hv.Count) join=$($Jv.Count))"
         return (Add-GateResult -Name "npc_vitals" -Status SKIP -Metrics @{ host = $Hv.Count; join = $Jv.Count } -Detail "insufficient series")

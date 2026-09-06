@@ -137,6 +137,22 @@ void Replicator::syncSpawns(GameWorld* gw, Inbound& in, NetLink& net, u32 ownerI
             pkt.hContainerSerial = rq.hContainerSerial;
             pkt.hIndex = rq.hIndex; pkt.hSerial = rq.hSerial;
             Character* c = engine::resolveCharByHand(k.i, k.s, k.t, k.c, k.cs);
+            // Phase 6 (PLAY-03, run 20260902_174928): a minted proxy lives
+            // under a LOCAL hand that never equals the wire hand, so the
+            // hand resolve above can NEVER answer for a body we only have as
+            // a proxy - the host kept replying found=0 for a join-authored
+            // runtime recruit it was itself driving, leaving the unit
+            // permanently invisible to every other join (their REQs
+            // terminate at the host; the author's found=1 INFO is
+            // deliberately never relayed - Class D/E FAILSAFE). Resolve via
+            // the proxy binding instead, the same fix class as the census
+            // captureNpcByPointer routing (commit 2ce7284). The pointer is
+            // liveness-swept at ~1 Hz just above, and describeCharacter is
+            // SEH-guarded like every engine read.
+            if (!c) {
+                std::map<Key, Character*>::const_iterator pit = proxyByKey_.find(k);
+                if (pit != proxyByKey_.end()) c = pit->second;
+            }
             bool dead = false;
             float age = 0.0f;
             bool found = c && engine::describeCharacter(
@@ -173,12 +189,24 @@ void Replicator::syncSpawns(GameWorld* gw, Inbound& in, NetLink& net, u32 ownerI
     // this range of the reply position defers the mint (far-retry cadence).
     const float MINT_DUPE_RADIUS = 20.0f;
     const unsigned long CENSUS_SCAN_MS = 2000;
-    if (spawnMintRadius_ > 0.0f && !censusHands_.empty() &&
+    if (spawnMintRadius_ > 0.0f && !census_.empty() &&
         censusRecvMs_ != 0 && (now - censusRecvMs_) <= 5000 &&
         (now - censusScanMs_) >= CENSUS_SCAN_MS) {
         censusScanMs_ = now;
-        for (std::set<Key>::iterator it = censusHands_.begin();
-             it != censusHands_.end(); ++it) {
+        // Task 3 (WORLD-03): scan every OWNER's census-vouched hands, not one
+        // bare set - a hand any owner vouches for is a scan candidate.
+        // Phase 8 review WR-02: only while that owner's OWN stamp is fresh -
+        // the aggregate gate above stays satisfied off everyone else's 1 Hz
+        // arrivals, so without the per-owner skip a connected-but-silent
+        // owner's frozen hands would keep arming far-mint dwells for bodies
+        // it no longer speaks for.
+        for (std::map<u32, CensusSet>::iterator oi = census_.begin();
+             oi != census_.end(); ++oi) {
+            if (oi->second.recvMs == 0 ||
+                (now - oi->second.recvMs) > (unsigned long)CENSUS_OWNER_STALE_MS)
+                continue;
+        for (std::set<Key>::iterator it = oi->second.hands.begin();
+             it != oi->second.hands.end(); ++it) {
             const Key& k = *it;
             if (proxyByKey_.find(k) != proxyByKey_.end()) continue;
             if (ownHands_.find(k) != ownHands_.end()) continue;
@@ -237,6 +265,7 @@ void Replicator::syncSpawns(GameWorld* gw, Inbound& in, NetLink& net, u32 ownerI
                     k.t, k.c, k.cs, k.i, k.s);
                 b[sizeof(b) - 1] = '\0'; coop::logLine(b);
             }
+        }
         }
     }
 
@@ -396,7 +425,7 @@ void Replicator::syncSpawns(GameWorld* gw, Inbound& in, NetLink& net, u32 ownerI
                 if (engine::readHand(twin, th)) {
                     Key tk; tk.t = th[0]; tk.c = th[1]; tk.cs = th[2];
                     tk.i = th[3]; tk.s = th[4];
-                    if (censusHands_.find(tk) != censusHands_.end()) twin = 0;
+                    if (censusHasAny(tk)) twin = 0;
                 }
             }
             if (twin) {
@@ -599,8 +628,38 @@ void Replicator::syncSpawns(GameWorld* gw, Inbound& in, NetLink& net, u32 ownerI
         // member on this client too (same as the ok=1 path) and retire the
         // force-REQ. Only force-REQ hands become members: an ordinary world-NPC
         // census mint must NOT be dropped into the player squad.
-        if (forceReqHands_.erase(k))
-            insertPeerMember(gw, proxy, k, "recruit");
+        if (forceReqHands_.erase(k)) {
+            // 06-01 GAP-3: this deferred drain has no EventPacket in scope
+            // (it runs off a spawn-INFO reply, not an EVT_RECRUIT/SQUAD_MOVE
+            // receive), but rekeyPeerBody already recorded k's author into
+            // pinnedOwner_ the moment the ORIGINAL event force-REQ'd this
+            // hand (the ok=0 branch below runs after the same unconditional
+            // pinPeer_.insert(newK)/pinRecord above) - look it up rather
+            // than threading a fresh authenticated owner through a reply
+            // path that was never told one.
+            //
+            // Phase 6 review WR-02: NEVER mint an OWNER_NONE-pinned record.
+            // The author record CAN be legitimately gone by drain time (a
+            // destOwned squad-move whose rekey ran ok=0 pinForget()s newK but
+            // still enrolls the force-REQ), and an insertPeerMember pin
+            // attributed to no player can never be released by ANY
+            // disconnect (clearPeerReplicationState matches pinnedOwner_ by
+            // owner) - the exact GAP-3 orphan pin this phase closed. On a
+            // miss, skip the squad-insert/pin entirely: the minted body
+            // stays an ordinary driven proxy (bound above), and the next
+            // reliable recruit/move edge - which DOES carry an authenticated
+            // owner - re-establishes membership. Greppable for triage.
+            std::map<Key, u32>::const_iterator poIt = pinnedOwner_.find(k);
+            if (poIt != pinnedOwner_.end()) {
+                insertPeerMember(gw, proxy, k, "recruit", false, poIt->second);
+            } else {
+                char pb[176]; _snprintf(pb, sizeof(pb) - 1,
+                    "[recruit] PIN-OWNER MISS hand=%u,%u,%u,%u,%u "
+                    "(force-REQ mint left unpinned, membership deferred)",
+                    k.t, k.c, k.cs, k.i, k.s);
+                pb[sizeof(pb) - 1] = '\0'; coop::logLine(pb);
+            }
+        }
     }
 
     // Force-REQ injection (protocol 23 interest-split recruit fix): a recruit/
@@ -748,6 +807,12 @@ void Replicator::applyEvents(GameWorld* gw, Inbound& in) {
     in.drainEvents(got);
     for (std::deque<InboundEvent>::iterator it = got.begin(); it != got.end(); ++it) {
         const EventPacket& ev = it->ev;
+        // Phase 5 (ID-02): additive (ownerId,eventId) dedup ahead of the latch
+        // switch below - a reliable-channel resend/replay of the same sender's
+        // eventId is skipped here before any koLatched/deathLatched mutation,
+        // while three different owners' eventId=1 each still reach the switch
+        // (the existing per-subject-hand latch logic is untouched).
+        if (!coop::foldOnce(appliedEvents_, ev.ownerId, ev.eventId, 4096)) continue;
         Key k; k.t = ev.sType; k.c = ev.sContainer; k.cs = ev.sContainerSerial;
         k.i = ev.sIndex; k.s = ev.sSerial;
         Driven& d = targets_[k]; // creates a placeholder if the body isn't streamed yet
@@ -885,7 +950,7 @@ void Replicator::applyEvents(GameWorld* gw, Inbound& in) {
                 if (!recruitSync_) break;
                 Key nk; nk.t = ev.aType; nk.c = ev.aContainer;
                 nk.cs = ev.aContainerSerial; nk.i = ev.aIndex; nk.s = ev.aSerial;
-                rekeyPeerBody(gw, k, nk, "recruit");
+                rekeyPeerBody(gw, k, nk, "recruit", ev.ownerId);
                 break;
             }
             case EVT_SQUAD_MOVE: {
@@ -900,9 +965,21 @@ void Replicator::applyEvents(GameWorld* gw, Inbound& in) {
                 nk.cs = ev.aContainerSerial; nk.i = ev.aIndex; nk.s = ev.aSerial;
                 if ((nk.t | nk.c | nk.cs | nk.i | nk.s) == 0) {
                     pinPeer_.erase(k);
+                    coop::pinForget(pinnedOwner_, k); // 06-01 GAP-3
                     pinOwned_.erase(k);
                     proxyByKey_.erase(k);
                     targets_.erase(k);
+                    // Phase 6 review WR-02: the dismissed hand's REQ channel
+                    // dies with its pins. A recruit dismissed before the
+                    // observer's mint completed would otherwise keep force-
+                    // REQ-ing past the rekeyedOld_ grace and, if the wire hand
+                    // still resolves host-side (baked recruit dismissed back
+                    // to the world), mint + squad-insert the dismissed body
+                    // under a pin whose author record was just forgotten - an
+                    // unreleasable pin (GAP-3 re-opened).
+                    forceReqHands_.erase(k);
+                    unresolvedHands_.erase(k);
+                    spawnReq_.erase(k);
                     rekeyedOld_[k] = nowMs(); // no REQ for the dead key's tail
                     char xb[128]; _snprintf(xb, sizeof(xb) - 1,
                         "[squad] RECV EXIT old=%u,%u,%u,%u,%u (pins cleared)",
@@ -910,7 +987,7 @@ void Replicator::applyEvents(GameWorld* gw, Inbound& in) {
                     xb[sizeof(xb) - 1] = '\0'; coop::logLine(xb);
                     break;
                 }
-                rekeyPeerBody(gw, k, nk, "squad");
+                rekeyPeerBody(gw, k, nk, "squad", ev.ownerId);
                 break;
             }
             default: break;
@@ -933,7 +1010,7 @@ void Replicator::applyEvents(GameWorld* gw, Inbound& in) {
 // hand doesn't resolve here (runtime-born subject), the bidirectional
 // describe/mint channel covers it instead.
 void Replicator::rekeyPeerBody(GameWorld* gw, const Key& oldK, const Key& newK,
-                               const char* tag) {
+                               const char* tag, u32 ownerId) {
     // A hand WE authored must never enter pinPeer_ (that set vetoes
     // publishing): an echo - or both sides recruiting the SAME baked NPC,
     // which lands on the SAME new hand (run 120738) - would otherwise
@@ -963,11 +1040,31 @@ void Replicator::rekeyPeerBody(GameWorld* gw, const Key& oldK, const Key& newK,
     // The author owns a peer-tab hand even if a local tab census would rank it
     // into a tab we own; but a transfer INTO a tab we own is exactly the control
     // hand-off, so we claim it instead of pinning it peer.
-    if (!destOwned) pinPeer_.insert(newK);
+    // 06-03 (GAP-3 live-run finding, 20260902_174928): a RUNTIME recruit
+    // keeps its hand - the engine re-containers nothing, so the event's OLD
+    // and NEW hands are IDENTICAL. Every "retire the old key" teardown below
+    // (pin drop, stream-state erase, rekeyedOld_ REQ-suppression stamp,
+    // life_ erase) would then destroy the NEW key's freshly-written state:
+    // the pin recorded 3 lines above was erased again immediately, so
+    // pinnedOwner_ never carried the author and the disconnect cleanup
+    // released 0 pins on every survivor ("[leave] cleared pins=0 owner=3").
+    // Guard all old-key teardown on the hands actually differing.
+    bool sameKey = (oldK.t == newK.t && oldK.c == newK.c && oldK.cs == newK.cs &&
+                    oldK.i == newK.i && oldK.s == newK.s);
+    if (!destOwned) {
+        pinPeer_.insert(newK);
+        coop::pinRecord(pinnedOwner_, newK, ownerId); // 06-01 GAP-3
+    }
     // A chained edge (recruit then move, move then move) leaves the OLD key's
     // pin dead - drop it so the pin sets track only live hands.
-    pinPeer_.erase(oldK);
-    if (destOwned) pinPeer_.erase(newK);
+    if (!sameKey) {
+        pinPeer_.erase(oldK);
+        coop::pinForget(pinnedOwner_, oldK); // 06-01 GAP-3
+    }
+    if (destOwned) {
+        pinPeer_.erase(newK);
+        coop::pinForget(pinnedOwner_, newK); // 06-01 GAP-3
+    }
     // Carry the down/death LATCH across the re-key. A body that dies (or is
     // KO'd) and then re-containers (host un-squads a corpse, tab move) streams
     // its EVT_DEATH/EVT_KNOCKOUT under the OLD hand, so deathLatched/koLatched
@@ -989,10 +1086,16 @@ void Replicator::rekeyPeerBody(GameWorld* gw, const Key& oldK, const Key& newK,
     // Drop the old key's stream state too (run 192211: the interp TAIL of a
     // re-keyed hand kept replaying after the migration, went unresolved and
     // REQ'd a duplicate proxy). The grace stamp suppresses spawn REQs/mints
-    // from any batch or reply still in flight for the dead key.
-    targets_.erase(oldK);
-    spawnReq_.erase(oldK);
-    rekeyedOld_[oldK] = nowMs();
+    // from any batch or reply still in flight for the dead key. sameKey: the
+    // "old" key IS the live new key - erasing it would drop the live stream
+    // state, and the rekeyedOld_ stamp would suppress the very force-REQ the
+    // ok=0 branch below is about to enroll for 10s (observed on run
+    // 20260902_174928: every receiver's first REQ delayed to +10s).
+    if (!sameKey) {
+        targets_.erase(oldK);
+        spawnReq_.erase(oldK);
+        rekeyedOld_[oldK] = nowMs();
+    }
     if (carryDeath || carryKo) {
         Driven& nd = targets_[newK]; // stream fills interp; we seed only the latch
         coop::LatchState merged = coop::rekeyCarryLatch(
@@ -1108,7 +1211,7 @@ void Replicator::rekeyPeerBody(GameWorld* gw, const Key& oldK, const Key& newK,
         // into our squad), insertPeerMember pins the actual local hand OWNED so
         // publishOwned streams it and the local player controls it. Idempotent +
         // tab-aware, so a squad-move re-containers an existing member too.
-        insertPeerMember(gw, c, newK, tag, destOwned);
+        insertPeerMember(gw, c, newK, tag, destOwned, ownerId);
         if (destOwned) {
             // Control hand-off: drop every residual DRIVE artifact so publishOwned
             // streams the body immediately and applyTargets never fights our own
@@ -1153,7 +1256,7 @@ void Replicator::rekeyPeerBody(GameWorld* gw, const Key& oldK, const Key& newK,
             tag, newK.t, newK.c, newK.cs, newK.i, newK.s);
         fb[sizeof(fb) - 1] = '\0'; coop::logLine(fb);
     }
-    life_.erase(oldK); // the old hand's journey ends with the re-key
+    if (!sameKey) life_.erase(oldK); // the old hand's journey ends with the re-key
     char rb[224]; _snprintf(rb, sizeof(rb) - 1,
         "[%s] REKEY old=%u,%u,%u,%u,%u new=%u,%u,%u,%u,%u ok=%d repaired=%d culled=%d",
         tag, oldK.t, oldK.c, oldK.cs, oldK.i, oldK.s,
@@ -1162,7 +1265,7 @@ void Replicator::rekeyPeerBody(GameWorld* gw, const Key& oldK, const Key& newK,
 }
 
 void Replicator::insertPeerMember(GameWorld* gw, Character* c, const Key& newK,
-                                  const char* tag, bool ownIt) {
+                                  const char* tag, bool ownIt, u32 ownerId) {
     if (!c) return;
     unsigned int nh[5] = { newK.t, newK.c, newK.cs, newK.i, newK.s };
     bool ok = engine::joinPlayerSquadAt(gw, c, nh);
@@ -1179,7 +1282,11 @@ void Replicator::insertPeerMember(GameWorld* gw, Character* c, const Key& newK,
     //     OWNED so publishOwned streams the body and the local player controls it.
     // readObjectHand re-reads post-move in Key order [type,container,
     // containerSerial,index,serial].
-    if (ownIt) { pinOwned_.insert(newK); pinPeer_.erase(newK); }
+    if (ownIt) {
+        pinOwned_.insert(newK);
+        pinPeer_.erase(newK);
+        coop::pinForget(pinnedOwner_, newK); // 06-01 GAP-3: hand flipped to owned
+    }
     // The re-container we just performed will surface as a roster MOVE edge on
     // the next poll. Claim it as ours-to-ignore before publishSquadMoves can
     // read it as a user action and publish it (see moveEcho_).
@@ -1194,8 +1301,15 @@ void Replicator::insertPeerMember(GameWorld* gw, Character* c, const Key& newK,
                       lk.i == newK.i && lk.s == newK.s);
     bool pinnedLocal = false;
     if (haveLh && (lh[0] | lh[1] | lh[2] | lh[3] | lh[4]) && !sameAsNew) {
-        if (ownIt) { pinPeer_.erase(lk); pinOwned_.insert(lk); }
-        else       { pinOwned_.erase(lk); pinPeer_.insert(lk); }
+        if (ownIt) {
+            pinPeer_.erase(lk);
+            coop::pinForget(pinnedOwner_, lk); // 06-01 GAP-3: flipped to owned
+            pinOwned_.insert(lk);
+        } else {
+            pinOwned_.erase(lk);
+            pinPeer_.insert(lk);
+            coop::pinRecord(pinnedOwner_, lk, ownerId); // 06-01 GAP-3
+        }
         if (ok) moveEcho_[lk.s] = nowMs();  // the engine may renumber the serial
         pinnedLocal = true;
     }

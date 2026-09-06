@@ -84,6 +84,12 @@ void setLoadSuppress(bool on);
 // (the join's coordinated load issued on PKT_LOAD_GO / post-transfer).
 void setLoadBypassOnce();
 unsigned int drainLoadEdges(LoadEdge* out, unsigned int maxOut);
+// Phase 11 review WR-04: the save name of the last UNSUPPRESSED local load
+// the detour actually let through ("" until any load has run this process).
+// A suppressed load changes no world, so it never updates this. Lets the
+// join's gameplay-live LOAD_ACK edge verify WHICH world went live before
+// reporting a coordinated load as complete.
+const char* lastLocalLoadName();
 
 // Protocol 32 probe: the deferred-signal mechanism's state. SaveManager::load
 // sets signal=LOADGAME(2) + a frame delay; SOMETHING must then call
@@ -157,6 +163,38 @@ bool walkTo(Character* c, float x, float y, float z, float speed);
 
 // SEH-guarded: halt + teleport to an exact transform (a clean stop at rest).
 bool park(Character* c, float x, float y, float z, float heading);
+// SEH-guarded: relocate a character's WHOLE SQUAD to an absolute position via
+// the engine's own ActivePlatoon::teleport (the player-squad teleport path).
+// Unlike park(), this moves a LOCALLY PLAYER-CONTROLLED squad: run
+// 20260903_135913_N4 measured park() returning ok=1 with readPos() unchanged
+// across 9 retries on the host's own leader (the walkTo Stage-1 class of gap -
+// a player body ignores bare CharMovement calls), while the platoon machinery
+// owns squad placement + zone streaming. The engine may DEFER the move
+// (teleportTo is processed on the platoon's own update), so callers must
+// verify via readPos() with a retry deadline rather than trusting the bool.
+// Returns false when the lever/platoon is unresolved or on a fault.
+// NOTE (run 20260903_144325_N4): measured NOT to move a player-controlled
+// leader either (mode=1 ok=1, zero readPos movement) - kept as a resolved
+// lever for reference, but the claim leg's ladder no longer leans on it.
+bool teleportSquad(Character* c, float x, float y, float z);
+// SEH-guarded: CHARACTER-level teleport to an ABSOLUTE position. The walkTo
+// Stage-1 split, applied to teleports: a locally player-controlled body
+// ignores CharMovement-level position writes (park's _setPositionDirection
+// AndTeleport: run 20260903_135913_N4; ActivePlatoon::teleport: run
+// 20260903_144325_N4 - both ok=1, zero movement; park stayed dead even into
+// a camera-pre-streamed zone=1 target: run 20260903_145920_N4), while
+// Character::teleport moves the body in ONE frame, unloaded destination
+// included. NOTE: its Vector3 is an ABSOLUTE destination - KenshiLib's
+// 'moveBy' arg name is wrong (measured: run 20260903_145920_N4). Returns
+// false when the lever is unresolved or on a fault.
+bool teleportCharTo(Character* c, float x, float y, float z);
+// SEH-guarded: move the LOCAL camera to an absolute world position
+// (CameraClass::teleport). The camera is a zone-streaming anchor: parking it
+// at a far destination streams that zone in, giving a subsequent body
+// teleport loaded terrain to land on (run 20260903_144325_N4 measured
+// zone=0 at the claim leg's 8000u target on every attempt). Purely local -
+// never crosses the wire. Returns false when the camera is absent/uninit.
+bool cameraTeleport(GameWorld* gw, float x, float y, float z);
 // Halt an in-flight movement goal without teleporting (census-freeze upkeep:
 // the AI-suspend hook blocks new decisions, not a committed destination).
 bool haltMovement(Character* c);
@@ -209,6 +247,14 @@ bool peerCamAnchor(float out[3]);
 // the camera anchors (squad-tab leaders only - the pre-43 behavior).
 void setCamInterest(bool on);
 
+// 04-07 gap-closure diagnostics: read back the LAST interestCenters() call's
+// raw playerCharacters count (tabsSeen) vs. distinct squad-tab-leader centers
+// actually resolved (centersResolved), captured before the camera-anchor
+// fold-in. Lets the scenario layer log "SCENARIO MAGATE CENSUSDBG" and
+// discriminate a progressive-roster-sync race (tabsSeen/centersResolved < 4)
+// from a different-mechanism census divergence. Main-thread only.
+void lastInterestDebug(unsigned int& tabsSeen, unsigned int& centersResolved);
+
 // SEH-guarded: expose the current interest anchors (up to 4 x,y,z triples
 // into out[12]) to the sync layer - the mid-band nearest-first ordering
 // prioritizes by distance to the closest ANCHOR (tab leaders + cameras), so
@@ -232,6 +278,14 @@ unsigned int captureNpcs(GameWorld* gw, EntityState* out, unsigned int maxOut);
 bool captureNpcByHand(GameWorld* gw, unsigned int hIndex, unsigned int hSerial,
                       unsigned int hType, unsigned int hContainer,
                       unsigned int hContainerSerial, EntityState* out);
+
+// SEH-guarded: capture a KNOWN-live Character* directly (no hand resolution).
+// For a minted proxy, the caller already holds the live pointer (proxyByKey_)
+// and must NOT re-derive it via captureNpcByHand's wire-hand resolve - a
+// proxy's local engine hand is a rekeyed value that never equals the wire
+// key, so that resolve always misses (see the definition site for the full
+// 04-09 finding). Returns false on a null pointer or a capture fault.
+bool captureNpcByPointer(Character* c, EntityState* out);
 
 // SEH-guarded: clear a character's autonomous AI goals so it stops wandering /
 // re-pathing on its own. The body is kept IN the engine update list (removing it
@@ -662,6 +716,20 @@ int addTestItemsToContainer(GameWorld* gw, const unsigned int cHand[5], int qty,
 // just adds) propagate cross-client without loss.
 int removeTestItemsFromContainer(GameWorld* gw, const unsigned int cHand[5], int qty);
 
+// SEH-guarded CONSERVATION primitive (Phase 7 review CR-02): remove up to `qty`
+// UNITS of the exact (sid, typeCat) from the object at cHand - unit-scoped
+// stack decrement (removeItemAutoDestroy splits a stack rather than dropping
+// whole Item entries), LOOSE copies first, WORN ones only for any remaining
+// shortfall (a claimed gear pickup may have auto-equipped). No transient
+// ground object is ever created - the units are destroyed straight from the
+// bag. Used by the losing claimant's rollback (applyClaimOutcome), where the
+// old drop-then-destroy path conflated the claimed stack's UNIT count with
+// whole-Item drop iterations (dup with pre-owned same-sid singles; loss when
+// the pickup merged into a pre-owned stack). Top-level only, matching
+// captureContainerContents' own reach. Returns the number of units removed.
+int removeItemUnitsFromContainer(GameWorld* gw, const unsigned int cHand[5],
+                                 const char* sid, unsigned int typeCat, int qty);
+
 // SEH-guarded: report the deterministic common test-item template (the one
 // addTestItemsToContainer uses) WITHOUT adding anything, so both clients can track the
 // same probe sid independently (same gamedata -> same template). Returns 1 on success.
@@ -861,6 +929,15 @@ int groundItemLiveness(const unsigned int itemHand[5], float outPos[3]);
 // plausible-looking isInInventory off a dead object. Validate through the hand
 // (spawnWorldItemProxy hands one back) before calling.
 int groundObjectLiveness(RootObject* obj, float outPos[3], bool* outPickedUp);
+
+// SEH-guarded (Phase 7 Plan 02, INV-03): read a LIVE object's item identity
+// (template stringID/itemType/quantity) directly off the pointer, no spatial
+// re-query. Used at W1 claim-detection time to capture the identity a losing
+// claim's rollback needs later (the object is still readable once picked up -
+// isInInventory true, not destroyed). Returns 1 on success, 0 on a null
+// pointer or a fault. outSid must have room for at least sidLen bytes.
+int readItemIdentity(RootObject* obj, char* outSid, unsigned int sidLen,
+                     unsigned int* outType, unsigned short* outQty);
 
 // SEH-guarded (join): spawn a LOCAL proxy ground item from the template (sid, typeCat) at
 // world position (x,y,z), so the join renders a host-dropped item where the host sees it.
@@ -1590,9 +1667,16 @@ bool vetoLocalDeath(Character* c);
 // second exclude lets a window drop a DUD striker that never engages without
 // re-picking it, run 033318). Fills outHand (readObjectHand layout). Returns
 // true if one was found.
+// radius (new, Plan 09-04 live-run fix): search half-extent in world units,
+// default 30.0f preserves every existing caller's calibrated-for-close-
+// encounter behavior (e.g. the "sync" bar-crowd fixture). A caller running
+// against an isolated/wilderness spawn with no nearby NPCs at 30u (no
+// upright-NPC candidates within the default box) can pass a much larger
+// value to reach wandering wildlife/bandits instead.
 bool pickCombatVictim(GameWorld* gw, const unsigned int refHand[5],
                       const unsigned int excludeHand[5], unsigned int outHand[5],
-                      const unsigned int excludeHand2[5] = 0);
+                      const unsigned int excludeHand2[5] = 0,
+                      float radius = 30.0f);
 
 // Order the body at atkHand to focus-melee the body at vicHand (UNPROVOKED, same
 // goal path as startDuel). Both hands readObjectHand layout. Returns true if the

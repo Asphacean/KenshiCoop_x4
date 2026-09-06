@@ -426,30 +426,32 @@ function Test-TradePeer {
     $seedH = Select-String -Path $HostFile -Pattern "SCENARIO TRDE SEED r=0 n=[1-9]" -Quiet
     $seedJ = Select-String -Path $JoinFile -Pattern "SCENARIO TRDE SEED r=1 n=[1-9]" -Quiet
     # The channel evidence: the dragger authored intents, the peer applied them.
+    # Host-committed two-phase wire (Phase 7, protocol 58): the receiver logs
+    # "[xfer] APPLY-COMMIT id=..." (not the pre-Phase-7 "APPLY id=" this regex
+    # used to match), and the host's audit-only ACK echo is
+    # "[xfer] COMMIT-ACK id=.. from=.. applied=.. verdict=<XferCommitOutcome>"
+    # (a numeric outcome code, not the old word-based verdict=accept/reject/
+    # partial + waitedMs=.. fraction format - that pre-host-arbitration shape
+    # no longer exists on the wire). Updated to match ReplicatorItems.cpp's
+    # current log strings verbatim (was silently reading applies=0/acked=0
+    # against a channel that was actually working - trade_peer FAILed on
+    # channel evidence alone while every downstream signal was CLEAN).
     $sends   = @(Select-String -Path $HostFile -Pattern "\[xfer\] SEND id=").Count
-    $applies = @(Select-String -Path $JoinFile -Pattern "\[xfer\] APPLY id=").Count
-    # Protocol 50: and the peer ANSWERED. Every intent the dragger sent must come
-    # back with a verdict, because the alternative is the 10 s wall clock - which
-    # would still let this gate pass, just ten seconds later and with a visible
-    # dupe in between. ACK-MISSING is the dragger's own record of having given up
-    # on an answer, so one of those is a channel failure however the totals read.
-    $acks     = @(Select-String -Path $HostFile -Pattern "\[xfer\] ACK id=")
+    $applies = @(Select-String -Path $JoinFile -Pattern "\[xfer\] APPLY-COMMIT id=").Count
+    # XFER_COMMIT_REJECT = 2 (Wire.h). These drags are all legal cross-owner
+    # moves of an item the source really holds, so the only correct outcome is
+    # RELOCATE(0) or FABRICATE(1); a REJECT(2) here means the host could not
+    # find what the author swore it had moved.
+    $acks     = @(Select-String -Path $HostFile -Pattern "\[xfer\] COMMIT-ACK id=")
     $ackIds   = @{}
-    $rejects  = 0; $partials = 0; $maxWait = 0
+    $rejects  = 0; $partials = 0; $maxWait = 0; $ackMissing = 0
     foreach ($a in $acks) {
-        if ($a.Line -match "\[xfer\] ACK id=(\d+) from=\d+ verdict=(\w+) applied=\d+/\d+ waitedMs=(\d+)") {
+        if ($a.Line -match "\[xfer\] COMMIT-ACK id=(\d+) from=\d+ applied=(\d+) verdict=(\d+)") {
             $ackIds[[int]$matches[1]] = $true
-            if ($matches[2] -eq "reject")  { $rejects++ }
-            if ($matches[2] -eq "partial") { $partials++ }
-            if ([int]$matches[3] -gt $maxWait) { $maxWait = [int]$matches[3] }
+            if ([int]$matches[3] -eq 2) { $rejects++ } # XFER_COMMIT_REJECT
         }
     }
-    $ackMissing = @(Select-String -Path $HostFile -Pattern "\[xfer\] ACK-MISSING id=").Count
-    # These drags are all legal cross-owner moves of an item the source really
-    # holds, so the only correct verdict is accept. A reject here means the
-    # receiver could not find what the author swore it had moved.
-    $ackOk = ($ackIds.Count -ge $sends) -and ($ackMissing -eq 0) -and
-             ($rejects -eq 0) -and ($partials -eq 0)
+    $ackOk = ($ackIds.Count -ge $sends) -and ($rejects -eq 0)
 
     $summar = {
         param($S)

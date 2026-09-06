@@ -119,6 +119,16 @@ typedef hand*      (__fastcall* HandCtorFn)(hand* self, unsigned int index,
 
 // locomotion / spatial query / AI quieting
 typedef void (__fastcall* CharSetDestFn)(Character* self, const Ogre::Vector3* pos, bool shift);
+// Character::teleport - the CHARACTER-level teleport (Phase 8 gap closure).
+// The walkTo Stage-1 lesson generalized: a locally player-controlled body
+// ignores bare CharMovement calls (setDestination then, _setPosition
+// DirectionAndTeleport now - run 20260903_144325_N4 also retired
+// ActivePlatoon::teleport: mode=1 ok=1 but zero readPos movement), while the
+// Character-level entry points are the ones a player body obeys. The Vector3
+// is an ABSOLUTE destination - KenshiLib's 'moveBy' arg name is WRONG
+// (measured, run 20260903_145920_N4: a delta of (8000,dy,0) landed the body
+// at world (8000,0) exactly). The reference crosses as a pointer (thunk ABI).
+typedef void (__fastcall* CharTeleportFn)(Character* self, const Ogre::Vector3* pos);
 typedef void (__fastcall* GetCharsInSphereFn)(
     GameWorld* self, lektor<RootObject*>* results, const Ogre::Vector3* pos,
     float farRadius, float nearRadius, float always, int maxFar, int maxNear,
@@ -206,6 +216,14 @@ typedef void           (__fastcall* CamFocusFn)(CameraClass* self,
                                                 RootObject* object,
                                                 const Ogre::Vector3* offset,
                                                 bool nearZoom);
+// CameraClass::teleport(pos) - move the LOCAL camera to an absolute world
+// position (Phase 8 gap closure). The camera is a zone-streaming anchor, so
+// teleporting it to a far destination FIRST streams that zone in, after which
+// a body teleport into it has loaded terrain to land on (run
+// 20260903_144325_N4 measured zone=0 at the 8000u claim-leg target for every
+// attempt while both body-level levers no-opped).
+typedef void           (__fastcall* CamTeleportFn)(CameraClass* self,
+                                                   const Ogre::Vector3* pos);
 
 // game speed / clock
 typedef void (__fastcall* SetGameSpeedFn)(GameWorld* self, float speed, bool click);
@@ -240,6 +258,14 @@ typedef void  (__fastcall* OwnSetMoneyFn)(Ownerships* self, int amount);
 typedef Item* (__fastcall* BuyItemFn)(Inventory* self, Item* itemToBuy,
                                       RootObject* sendingTo);
 typedef void  (__fastcall* PlatoonRefreshInvFn)(ActivePlatoon* self, bool firstTime);
+// Contested-claim teleport (Phase 8 gap closure): ActivePlatoon::teleport is
+// the engine's OWN squad-scope relocation (teleportTo/teleportMessage deferred
+// machinery - the player-squad teleport path). Run 20260903_135913_N4 measured
+// CharMovement::_setPositionDirectionAndTeleport (engine::park) returning ok=1
+// with readPos() unchanged across 9 retries on a locally player-controlled
+// leader - the walkTo Stage-1 class of gap (player bodies ignore bare
+// CharMovement calls). Vector3 reference crosses as a pointer (thunk ABI).
+typedef void  (__fastcall* PlatoonTeleportFn)(ActivePlatoon* self, const Ogre::Vector3* pos);
 
 // property deeds (protocol 54): the owned-object SET on the player faction's
 // Ownerships. Reference params cross as pointers (the __fastcall thunk ABI the
@@ -391,6 +417,7 @@ extern HandCtorFn    g_handCtorFn;
 
 // locomotion / spatial query / AI quieting
 extern CharSetDestFn      g_charSetDestFn;
+extern CharTeleportFn     g_charTeleportFn;
 extern GetCharsInSphereFn g_getCharsFn;
 extern GetObjsInSphereFn  g_getObjsFn;
 extern ClearGoalsFn       g_clearGoalsFn;
@@ -430,6 +457,7 @@ extern NotifySeeSneakFn  g_notifySeeSneakFn;
 extern CamGetCenterFn    g_camGetCenterFn;
 extern CamIsInitFn       g_camIsInitFn;
 extern CamFocusFn        g_camFocusFn;
+extern CamTeleportFn     g_camTeleportFn;
 extern AttackTargetFn    g_attackTargetFn;
 
 // game speed / clock (+ intent hooks state)
@@ -492,6 +520,7 @@ extern OwnGetMoneyFn g_ownGetMoneyFn;
 extern OwnSetMoneyFn g_ownSetMoneyFn;
 extern BuyItemFn     g_buyItemFn;
 extern PlatoonRefreshInvFn g_platoonRefreshInvFn;
+extern PlatoonTeleportFn   g_platoonTeleportFn;
 extern ShopGetTraderFn     g_shopGetTraderFn;
 
 // property deeds (protocol 54)

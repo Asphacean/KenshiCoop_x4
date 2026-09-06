@@ -366,8 +366,8 @@ void Replicator::applyTreatments(GameWorld* gw, Inbound& in) {
         if (!c) continue;
         int n = engine::applyBandageParts(c, p.partBand);
         char b[160]; _snprintf(b, sizeof(b) - 1,
-            "[med] TREAT RECV id=%u hand=%u,%u applied=%d",
-            p.treatId, k.i, k.s, n);
+            "[med] TREAT RECV id=%u hand=%u,%u applied=%d owner=%u",
+            p.treatId, k.i, k.s, n, p.ownerId);
         b[sizeof(b) - 1] = '\0'; coop::logLine(b);
     }
 }
@@ -418,8 +418,30 @@ void Replicator::applyCombatHits(GameWorld* gw, Inbound& in) {
         k.i = p.sIndex; k.s = p.sSerial;
         if (ownHands_.find(k) != ownHands_.end()) {
             char b[160]; _snprintf(b, sizeof(b) - 1,
-                "[combat] HIT RECV id=%u hand=%u,%u SKIP (own body)",
-                p.hitId, k.i, k.s);
+                "[combat] HIT RECV id=%u hand=%u,%u SKIP (own body) owner=%u",
+                p.hitId, k.i, k.s, p.ownerId);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            continue;
+        }
+        // Phase 4 Plan 03 Task 2 (T-04-08 dormant N>2 fail-safe): the target
+        // hand is tracked in allSquad_ (the FULL squad roster, own + every
+        // other player's - see ReplicatorPublish.cpp) but is not the host's
+        // own body, so at N>=3 it could be a DIFFERENT player's squad member
+        // (e.g. join2 reporting a "hit" on join3's body) rather than a world
+        // NPC the host is authoritative for. Never apply - the host is never
+        // the combat authority for another player's own squad body, and doing
+        // so would silently corrupt that player's own authoritative copy
+        // without their knowledge (the same class of hazard NetLink's
+        // RELAY_FAILSAFE_LOG guards at the net-thread relay layer). Currently
+        // unreachable: ReplicatorDrive.cpp's join-side capture already
+        // filters isSquad out before pendingHits_ is ever populated (PvP is
+        // out of scope), so this is a defense-in-depth backstop, not a fix
+        // for a reachable corruption - logged and dropped exactly like the
+        // own-body skip above, never silently ignored.
+        if (allSquad_.find(k) != allSquad_.end()) {
+            char b[160]; _snprintf(b, sizeof(b) - 1,
+                "[combat] FAILSAFE no-apply id=%u hand=%u,%u reason=cross-owner-squad-target owner=%u",
+                p.hitId, k.i, k.s, p.ownerId);
             b[sizeof(b) - 1] = '\0'; coop::logLine(b);
             continue;
         }
@@ -432,8 +454,8 @@ void Replicator::applyCombatHits(GameWorld* gw, Inbound& in) {
         // never reflect the host-applied wound.
         if (applied && streamNpcs_) medNpc_[k] = nowMs();
         char b[160]; _snprintf(b, sizeof(b) - 1,
-            "[combat] HIT RECV id=%u hand=%u,%u flesh=%.1f blood=%.1f applied=%d",
-            p.hitId, k.i, k.s, p.flesh, p.blood, applied ? 1 : 0);
+            "[combat] HIT RECV id=%u hand=%u,%u flesh=%.1f blood=%.1f applied=%d owner=%u",
+            p.hitId, k.i, k.s, p.flesh, p.blood, applied ? 1 : 0, p.ownerId);
         b[sizeof(b) - 1] = '\0'; coop::logLine(b);
     }
 }
@@ -574,13 +596,18 @@ void Replicator::publishMoneyPool(const SyncContext& ctx) {
         memset(&pkt, 0, sizeof(pkt));
         pkt.type    = (u8)PKT_MONEY;
         pkt.ownerId = ownerId;
-        pkt.ackSeq  = poolAcked_;
+        fillMoneyAcks(pkt); // protocol 60 (CONS-01): per-owner ack vector, not a single scalar
         pkt.money   = poolTotal_;
         net.queueMoney(pkt);
         if (changed) { // resends stay silent; the change is the signal
-            char b[112];
-            _snprintf(b, sizeof(b) - 1, "[wallet] POOL SEND t=%d ack=%u",
-                      poolTotal_, poolAcked_);
+            char b[176];
+            int off = _snprintf(b, sizeof(b) - 1, "[wallet] POOL SEND t=%d acks=", poolTotal_);
+            if (off < 0) off = 0;
+            for (unsigned int i = 0; i < pkt.ackCount && (unsigned)off < sizeof(b) - 1; ++i) {
+                int w = _snprintf(b + off, sizeof(b) - 1 - (size_t)off, "%s%u:%u",
+                                   i ? "," : "", pkt.acks[i].ownerId, pkt.acks[i].ackSeq);
+                if (w > 0) off += w;
+            }
             b[sizeof(b) - 1] = '\0'; coop::logLine(b);
         }
         return;
@@ -596,10 +623,13 @@ void Replicator::publishMoneyPool(const SyncContext& ctx) {
     poolPending_.push_back(PoolDelta(poolSeq_, delta));
     MoneyDeltaPacket pkt;
     memset(&pkt, 0, sizeof(pkt));
-    pkt.type    = (u8)PKT_MONEY_DELTA;
-    pkt.ownerId = ownerId;
-    pkt.seq     = poolSeq_;
-    pkt.delta   = delta;
+    pkt.type          = (u8)PKT_MONEY_DELTA;
+    pkt.ownerId       = ownerId;
+    pkt.seq           = poolSeq_;
+    pkt.delta         = delta;
+    pkt.authorSpendMs = now; // protocol 60 (CONS-01): stamp at delta-detection,
+                              // same frame as the wallet sample - the host maps
+                              // it via peerClock_ for overdraft arbitration.
     net.queueMoneyDelta(pkt);
     char b[128];
     _snprintf(b, sizeof(b) - 1, "[wallet] POOL DELTA seq=%u delta=%d local=%d",
@@ -611,44 +641,172 @@ void Replicator::applyMoneyPool(const SyncContext& ctx) {
     GameWorld* gw = ctx.gw; Inbound& in = *ctx.in; NetLink& net = *ctx.net;
     std::deque<InboundMoney> totals;
     std::deque<InboundMoneyDelta> deltas;
+    std::deque<InboundMoneyReject> rejects;
     in.drainMoney(totals);
     in.drainMoneyDeltas(deltas);
-    if (totals.empty() && deltas.empty()) return;
+    in.drainMoneyRejects(rejects);
     if (!moneySync_) return;
     const bool hostRole = isHostRole();
+    // Plan 04 live-run fix (run 20260904_035226_N4): an open contention
+    // window must still be checked every tick even when nothing NEW arrived
+    // this tick - the ClaimArbiter.h/ReplicatorItems.cpp precedent, whose
+    // own comment states this explicitly ("runs every tick ... so a single-
+    // claimant window still closes on its own ... even with no further
+    // traffic"). The ORIGINAL blanket early-return here skipped the
+    // window-finalize check below whenever totals/deltas/rejects were all
+    // empty - exactly the queued-window-then-silence case. Genuine defect,
+    // reproduced live: rank2's seq=2 overdraft delta opened a contention
+    // window (queued at pool=4300, over the 4300 available), no further
+    // money traffic arrived from anyone for the rest of the run, and the
+    // window was NEVER finalized - no REJECT, no refund, forever stuck open.
+    // A JOIN never opens a window (it only reacts to received totals/
+    // rejects) and a HOST with no window open has nothing to check
+    // (moneyWindowExpired is a cheap, safe false while idle - MoneyFold.h's
+    // own doc) - only those two cases may still skip the tick entirely.
+    // Phase 9 review WR-03: moneyDeferred_ (deltas retained from a prior
+    // tick's failed seed read - see the member's doc comment, Replicator.h)
+    // counts as pending work too, or a deferred batch with no NEW traffic
+    // would never be retried.
+    if (totals.empty() && deltas.empty() && rejects.empty() &&
+        (!hostRole || (!moneyFold_.windowOpen && moneyDeferred_.empty()))) {
+        return;
+    }
+    // Overdraft contention window epsilon (protocol 60, CONS-01): within this
+    // many ms of the earliest mapped stamp is a tie, broken by the lowest
+    // ownerId - the same magnitude as ClaimArbiter's CLAIM_EPS_MS
+    // (ReplicatorItems.cpp), money contention has the same one-RTT physics.
+    const unsigned long MONEY_EPS_MS = 30;
 
     if (hostRole) {
-        // Fold the join's deltas into the pool. Clamped at 0: both players can
-        // commit purchases against the same cats before either delta lands, and
-        // the goods are already handed over locally, so the pool absorbs the
-        // shortfall rather than going negative.
+        // Drive MoneyFold.h's deterministic arbitration: a solvent delta with
+        // no window open folds immediately (no added latency); a delta that
+        // would overdraw the pool - or ANY delta while a window is already
+        // open (the determinism keystone) - joins the bounded contention
+        // window instead of folding unconditionally and clamping at 0 (the
+        // old OVERDRAFT behavior this replaces, CONS-01).
         bool moved = false;
+        unsigned long now = nowMs();
+        // Phase 9 review WR-03: deltas deferred by a prior tick's failed seed
+        // read retry FIRST, ahead of anything drained this tick, so a
+        // per-owner seq never folds out of emission order (an older seq
+        // processed after a newer one would read as MONEY_DUP and be lost).
+        if (!moneyDeferred_.empty()) {
+            deltas.insert(deltas.begin(), moneyDeferred_.begin(), moneyDeferred_.end());
+            moneyDeferred_.clear();
+        }
+        // Phase 9 review WR-03: the seed adoption is hoisted OUT of the
+        // per-delta loop. The old in-loop `return` on a failed wallet read
+        // abandoned the tick with the deltas already swapped OUT of the
+        // Inbound queue - the reliable channel never redelivers them, and a
+        // dropped delta was never folded, never rejected, and never
+        // re-answerable (the same owner's NEXT delta advanced
+        // moneyFold_.processed past the lost seq, the ack vector popped the
+        // join's pending entry, and the spend silently reverted while the
+        // purchased goods remained - minted value, conservation priority #2).
+        // Now a failed read defers the WHOLE untouched batch to next tick.
+        if (!deltas.empty() && poolTotal_ < 0) { // no seed yet - adopt the wallet first
+            int cur = -1;
+            if (!engine::readPlayerWallet(gw, &cur) || cur < 0) {
+                moneyDeferred_.insert(moneyDeferred_.end(), deltas.begin(), deltas.end());
+                char b[112];
+                _snprintf(b, sizeof(b) - 1,
+                          "[wallet] WARN pool seed read FAILED; deferring %u delta(s) to next tick",
+                          (unsigned)deltas.size());
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+                return; // nothing processed: no fold, no ack advance, no drop
+            }
+            poolTotal_ = cur; poolSeen_ = cur;
+        }
         for (std::deque<InboundMoneyDelta>::iterator it = deltas.begin();
              it != deltas.end(); ++it) {
             const MoneyDeltaPacket& p = it->pkt;
-            if (p.seq <= poolAcked_) continue; // already folded (defensive)
-            if (poolTotal_ < 0) {              // no seed yet - adopt the wallet first
-                int cur = -1;
-                if (!engine::readPlayerWallet(gw, &cur) || cur < 0) return;
-                poolTotal_ = cur; poolSeen_ = cur;
+            coop::MoneyDelta d;
+            d.ownerId  = p.ownerId;
+            d.seq      = p.seq;
+            d.delta    = p.delta;
+            // Protocol 60 (CONS-01) stamp mapping: map the join's
+            // authorSpendMs into the host's local clock via the EXISTING
+            // per-owner peerClock_ offset (read-only here - the offset
+            // itself is maintained by ingest() from the regular entity
+            // stream), the exact ReplicatorItems.cpp:802-831 shape. No
+            // mapping yet (first packets, sendStamp off) means an automatic
+            // tie-band member, never an unusable delta. The host's own
+            // spends never build a MoneyDelta at all (they are pre-folded at
+            // sample time, publishMoneyPool's host branch) - documented
+            // there as the host's inherent first-writer advantage.
+            d.mappedMs = now;
+            d.mappable = false;
+            std::map<u32, PeerClock>::iterator pc = peerClock_.find(p.ownerId);
+            if (pc != peerClock_.end() && pc->second.have) {
+                long t = (long)p.authorSpendMs + pc->second.offsetMs;
+                if ((long)now - t < 0) t = (long)now; // clamp: never in the future
+                d.mappedMs = (unsigned long)t;
+                d.mappable = true;
             }
-            int want = poolTotal_ + p.delta;
-            if (want < 0) {
-                char b[128];
+            coop::MoneyVerdict v = coop::moneyOffer(moneyFold_, d, poolTotal_, now);
+            if (v == coop::MONEY_DUP) continue;
+            if (v == coop::MONEY_QUEUE) {
+                char b[160];
                 _snprintf(b, sizeof(b) - 1,
-                          "[wallet] OVERDRAFT want=%d clamped=0 seq=%u delta=%d",
-                          want, p.seq, p.delta);
+                          "[wallet] POOL QUEUE owner=%u seq=%u delta=%d pool=%d",
+                          p.ownerId, p.seq, p.delta, poolTotal_);
                 b[sizeof(b) - 1] = '\0'; coop::logLine(b);
-                want = 0;
+                continue;
             }
-            poolTotal_ = want;
-            poolAcked_ = p.seq;
+            // MONEY_FOLD: solvent, no window open - fold immediately and
+            // advance this owner's processed high-water (the ack vector's
+            // source) the same way moneyFinalize does for a queued verdict.
+            poolTotal_ += p.delta;
+            coop::foldMonotonic(moneyFold_.processed, p.ownerId, p.seq);
             moved = true;
-            char b[144];
-            _snprintf(b, sizeof(b) - 1, "[wallet] POOL FOLD seq=%u delta=%d t=%d",
-                      p.seq, p.delta, poolTotal_);
+            char b[160];
+            _snprintf(b, sizeof(b) - 1,
+                      "[wallet] POOL FOLD owner=%u seq=%u delta=%d t=%d",
+                      p.ownerId, p.seq, p.delta, poolTotal_);
             b[sizeof(b) - 1] = '\0'; coop::logLine(b);
         }
+
+        // Finalize an open overdraft window once it has run its course - every
+        // tick, not just when a fresh delta arrived, so a single-buyer window
+        // still closes on its own with no further traffic.
+        if (coop::moneyWindowExpired(moneyFold_, now, tuning_.moneyWindowMs)) {
+            // Re-read the live wallet before finalizing (research Pitfall 3):
+            // the host's OWN spend between window-open and finalize must be
+            // reflected, so the verdict never pays with cats the host itself
+            // just spent.
+            int live = -1;
+            if (engine::readPlayerWallet(gw, &live) && live >= 0) poolTotal_ = live;
+            std::vector<coop::MoneyDelta> folded, rejected;
+            coop::moneyFinalize(moneyFold_, poolTotal_, MONEY_EPS_MS, folded, rejected);
+            for (size_t i = 0; i < folded.size(); ++i) {
+                moved = true;
+                char b[176];
+                _snprintf(b, sizeof(b) - 1,
+                          "[wallet] POOL FOLD owner=%u seq=%u delta=%d t=%d (window)",
+                          folded[i].ownerId, folded[i].seq, folded[i].delta, poolTotal_);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            }
+            for (size_t i = 0; i < rejected.size(); ++i) {
+                // The ack still advances even though nothing folded - "highest
+                // seq PROCESSED (folded OR rejected)" is what pops the buyer's
+                // optimistic pending delta and produces the visible refund.
+                moved = true;
+                char b[160];
+                _snprintf(b, sizeof(b) - 1,
+                          "[wallet] REJECT owner=%u seq=%u delta=%d pool=%d",
+                          rejected[i].ownerId, rejected[i].seq, rejected[i].delta, poolTotal_);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+                MoneyRejectPacket mr;
+                memset(&mr, 0, sizeof(mr));
+                mr.type          = (u8)PKT_MONEY_REJECT;
+                mr.buyerId       = rejected[i].ownerId;
+                mr.seq           = rejected[i].seq;
+                mr.delta         = rejected[i].delta;
+                mr.poolAtVerdict = poolTotal_;
+                net.queueMoneyReject(mr);
+            }
+        }
+
         if (!moved) return;
         if (engine::writePlayerWallet(gw, poolTotal_)) {
             poolSeen_ = poolTotal_;
@@ -657,32 +815,53 @@ void Replicator::applyMoneyPool(const SyncContext& ctx) {
             // cats are about to be dropped when the next sample re-reads the
             // unchanged wallet. Never silent: this is money going missing.
             char b[112];
-            _snprintf(b, sizeof(b) - 1, "[wallet] WARN pool write FAILED t=%d ack=%u",
-                      poolTotal_, poolAcked_);
+            _snprintf(b, sizeof(b) - 1, "[wallet] WARN pool write FAILED t=%d",
+                      poolTotal_);
             b[sizeof(b) - 1] = '\0'; coop::logLine(b);
         }
-        // Publish immediately rather than waiting on the send floor: the join is
-        // holding a pending delta and we now know the answer.
+        // Publish immediately rather than waiting on the send floor: a join is
+        // holding a pending delta (folded or rejected) and we now know the
+        // answer.
         poolSent_ = poolTotal_; poolSentMs_ = nowMs();
         MoneyPacket out;
         memset(&out, 0, sizeof(out));
         out.type    = (u8)PKT_MONEY;
         out.ownerId = ctx.localId;
-        out.ackSeq  = poolAcked_;
+        fillMoneyAcks(out); // protocol 60 (CONS-01): per-owner ack vector
         out.money   = poolTotal_;
         net.queueMoney(out);
         return;
     }
 
-    // Join: adopt the newest authoritative total, then re-apply whatever the
-    // host has not acked yet so a purchase made moments ago is not reverted for
-    // a round trip and then re-applied.
+    // Join: log every drained reject for the cross-instance oracle evidence
+    // (the actual refund falls out of the ack-vector pop below - a rejected
+    // seq's ack advance is what pops the pending delta, no separate engine
+    // write needed here).
+    for (std::deque<InboundMoneyReject>::iterator it = rejects.begin();
+         it != rejects.end(); ++it) {
+        const MoneyRejectPacket& r = it->pkt;
+        char b[160];
+        _snprintf(b, sizeof(b) - 1,
+                  "[wallet] REJECT owner=%u seq=%u delta=%d pool=%d",
+                  r.buyerId, r.seq, r.delta, r.poolAtVerdict);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+
+    // Join: adopt the newest authoritative total, then pop poolPending_
+    // against OUR OWN ack entry only - never a foreign owner's (the at-N
+    // bounce/double-count this plan exists to kill, MoneyFold.h::
+    // moneyShouldPop) - then re-apply whatever remains unacked so a purchase
+    // made moments ago is not reverted for a round trip and then re-applied.
     if (totals.empty()) return;
     const MoneyPacket& p = totals.back().pkt;
     if (p.money < 0) return;
-    while (!poolPending_.empty() && poolPending_.front().seq <= p.ackSeq)
+    u32 myAck = poolAcked_; // unchanged if our entry is absent this broadcast
+    for (unsigned int i = 0; i < p.ackCount && i < MAX_PLAYERS; ++i) {
+        if (p.acks[i].ownerId == ctx.localId) { myAck = p.acks[i].ackSeq; break; }
+    }
+    while (!poolPending_.empty() && coop::moneyShouldPop(poolPending_.front().seq, myAck))
         poolPending_.pop_front();
-    poolAcked_ = p.ackSeq;
+    poolAcked_ = myAck;
     int want = p.money;
     for (std::deque<PoolDelta>::iterator it = poolPending_.begin();
          it != poolPending_.end(); ++it)
@@ -696,8 +875,20 @@ void Replicator::applyMoneyPool(const SyncContext& ctx) {
     char b[176];
     _snprintf(b, sizeof(b) - 1,
               "[wallet] POOL RECV t=%d ack=%u pending=%u want=%d was=%d ok=%d",
-              p.money, p.ackSeq, (unsigned)poolPending_.size(), want, cur, ok ? 1 : 0);
+              p.money, myAck, (unsigned)poolPending_.size(), want, cur, ok ? 1 : 0);
     b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+}
+
+// Fills pkt's per-owner ack vector from moneyFold_.processed (protocol 60,
+// CONS-01) - see the declaration doc comment in Replicator.h.
+void Replicator::fillMoneyAcks(MoneyPacket& pkt) const {
+    pkt.ackCount = 0;
+    for (std::map<u32, u32>::const_iterator it = moneyFold_.processed.begin();
+         it != moneyFold_.processed.end() && pkt.ackCount < MAX_PLAYERS; ++it) {
+        pkt.acks[pkt.ackCount].ownerId = it->first;
+        pkt.acks[pkt.ackCount].ackSeq  = it->second;
+        ++pkt.ackCount;
+    }
 }
 
 void Replicator::publishFactions(const SyncContext& ctx) {
@@ -759,6 +950,7 @@ void Replicator::publishFactions(const SyncContext& ctx) {
 
 void Replicator::applyFactions(const SyncContext& ctx) {
     GameWorld* gw = ctx.gw; Inbound& in = *ctx.in;
+    bool isHost = ctx.isHost;
     std::deque<InboundFaction> got;
     in.drainFaction(got);
     if (got.empty()) return;
@@ -768,21 +960,41 @@ void Replicator::applyFactions(const SyncContext& ctx) {
         const FactionPacket& p = it->pkt;
         if (p.sid[0] == '\0') continue;
         FacRow& fr = facRows_[std::string(p.sid)];
-        if (!sync::gateSeqAccept(fr.seqSeen, p.seq)) continue; // stale/dup row
-        fr.seqSeen = p.seq;
+        // Phase 8 review CR-01: per-SENDER accept, the applyDoors precedent.
+        // The HOST intake hears up to N-1 joins' intents, each with an
+        // independent facSeqOut_ counter - a bare scalar compared join B's
+        // genuinely-newer intent against join A's higher counter and
+        // silently dropped it (B's relation change never committed, and the
+        // host's periodic resend converged B back to the stale value).
+        if (!sync::gateSeqAcceptPerSender(fr.seqSeen, p.ownerId, p.seq)) continue; // stale/dup row
+        fr.seqSeen[p.ownerId] = p.seq;
         float us = -999.0f, them = -999.0f;
         engine::readRelationBySid(gw, p.sid, &us, &them);
-        // Updating the baseline FIRST is the echo guard: the local change this
-        // write causes must not be re-detected as ours next sample.
-        fr.known = p.relation;
-        fr.seeded = true;
+        // Phase 8 (WORLD-02): PKT_FACTION is now a host-terminated intent, so
+        // this row means two different things depending on role. On a JOIN
+        // it is still the host's authoritative broadcast - the echo guard is
+        // unchanged: update the baseline FIRST so the local change this write
+        // causes is never re-detected as ours next sample. On the HOST it is
+        // a JOIN'S INTENT, not a fact to echo-suppress - the baseline must
+        // NOT absorb it: mark seeded (so the host's own publishFactions does
+        // not silently re-seed against the value this apply is about to
+        // commit) but leave `known` at its PRIOR value, so the host's own
+        // next sample sees a genuine change against the committed relation
+        // and RE-EMITS it under the host's own ownerId/seq - every other
+        // join converges to the host's value, never the intent author's.
+        if (isHost) fr.seeded = true;
+        else        { fr.known = p.relation; fr.seeded = true; }
         if (us > -900.0f && (us - p.relation < EPS) && (p.relation - us < EPS))
             continue; // already converged (resend or echo)
         bool ok = engine::writeRelationBySid(gw, p.sid, p.relation,
                                              /*reciprocal*/ true, 0, 0);
-        char b[160];
-        _snprintf(b, sizeof(b) - 1, "[fac] RECV sid='%s' rel=%.1f was=%.1f ok=%d seq=%u",
-                  p.sid, p.relation, us, ok ? 1 : 0, p.seq);
+        // Phase 11 plan 02 (TEST-01) log identity audit: append owner=%u
+        // (p.ownerId, the sender - the per-sender seq space this same gate
+        // already keys on above via gateSeqAcceptPerSender) - append-only,
+        // end-of-line, names the sender the way [event] RECV already does.
+        char b[176];
+        _snprintf(b, sizeof(b) - 1, "[fac] RECV sid='%s' rel=%.1f was=%.1f ok=%d seq=%u owner=%u",
+                  p.sid, p.relation, us, ok ? 1 : 0, p.seq, p.ownerId);
         b[sizeof(b) - 1] = '\0'; coop::logLine(b);
     }
 }
@@ -859,8 +1071,12 @@ void Replicator::applyDoors(const SyncContext& ctx) {
         Key k; k.t = p.hand[0]; k.c = p.hand[1]; k.cs = p.hand[2];
         k.i = p.hand[3]; k.s = p.hand[4];
         DoorRow& dr = doorRows_[k];
-        if (!sync::gateSeqAccept(dr.seqSeen, p.seq)) continue; // stale/dup row
-        dr.seqSeen = p.seq;
+        // Phase 8 (WORLD-01): per-SENDER accept - two authors of the SAME
+        // door hand each carry an independent monotonic seq, so a second
+        // author's newer row is never dropped by a first author's higher
+        // counter (the N>=3 fix; see ChangeGate.h's gateSeqAcceptPerSender).
+        if (!sync::gateSeqAcceptPerSender(dr.seqSeen, p.ownerId, p.seq)) continue; // stale/dup row
+        dr.seqSeen[p.ownerId] = p.seq;
         // Updating the baseline FIRST is the echo guard: the local change this
         // write causes must not be re-detected as ours next sample.
         dr.knownOpen = (int)p.open; dr.knownLocked = (int)p.locked;
@@ -1085,15 +1301,73 @@ void Replicator::publishResearch(const SyncContext& ctx) {
     const unsigned int SID_CAP   = 48;
     static char sids[MAX_KNOWN * SID_CAP]; // main-thread only
     unsigned int n = engine::researchEnumKnown(gw, sids, SID_CAP, MAX_KNOWN);
+
+    if (ctx.isHost) {
+        // HOST: unchanged from pre-Phase-8 - the authoritative broadcast every
+        // join (and every join-authored intent, once committed) converges
+        // against. Known-set membership is monotonic (no value to diff): send
+        // on first sight then resend periodically. No silent seed ->
+        // resendUnsent=true.
+        for (unsigned int i = 0; i < n; ++i) {
+            const char* sid = sids + (size_t)i * SID_CAP;
+            ResearchRow& rr = researchRows_[std::string(sid)];
+            bool first  = !rr.sent;
+            if (!sync::gateShouldSend(/*changed*/ false, now, rr.lastSendMs,
+                                      /*minSendMs*/ 0, RESEND_MS, /*resendUnsent*/ true))
+                continue;
+            rr.sent = true; rr.lastSendMs = now;
+            ResearchPacket pkt;
+            memset(&pkt, 0, sizeof(pkt));
+            pkt.type    = (u8)PKT_RESEARCH;
+            pkt.ownerId = ownerId;
+            pkt.seq     = researchSeqOut_++;
+            strncpy(pkt.sid, sid, sizeof(pkt.sid) - 1);
+            net.queueResearch(pkt);
+            if (first) { // resends stay silent; the new unlock is the signal
+                char b[128];
+                _snprintf(b, sizeof(b) - 1, "[research] SEND sid='%s' seq=%u",
+                          pkt.sid, pkt.seq);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            }
+        }
+        return;
+    }
+
+    // JOIN (Phase 8, WORLD-02): a join's own locally-earned unlock never used
+    // to cross at all (this function was hostAuth-gated to never run on a
+    // join). Now it does, in two passes:
+    //   1. First pass ever: silently seed the shared-save baseline - mark
+    //      EVERY currently-known sid `sent` WITHOUT queueing anything (the
+    //      facRows_ silent-seed precedent), so a join does not dump its
+    //      ~384-sid baseline at connect. `lastSendMs` is deliberately left at
+    //      0 during this seed (not "now") so a baseline row can never satisfy
+    //      the periodic-safety-resend arithmetic below and leak out later.
+    //   2. Every pass after: any sid NOT already marked `sent` is a genuine
+    //      post-baseline unlock - send it ONCE as a host-terminated intent
+    //      (PKT_RESEARCH already falls to default RELAY_NONE; no routing
+    //      change). No resend logic here by design: the intent rides
+    //      CH_RELIABLE (guaranteed delivery while connected), and once the
+    //      host commits it, the HOST's own broadcast above (resendUnsent=
+    //      true) is the convergence safety net for every OTHER join - the
+    //      original author does not need to keep re-asserting its own intent.
+    if (!researchIntentSeeded_) {
+        // Phase 8 review WR-03: never latch on an EMPTY enumeration - if the
+        // store is not up yet (the same condition applyResearch already
+        // defends against), a latched flag with nothing seeded would make the
+        // next pass treat the whole baseline as post-baseline unlocks and
+        // dump it as ~384 reliable intents. Seed on the next pass instead.
+        if (n == 0) return;
+        for (unsigned int i = 0; i < n; ++i) {
+            const char* sid = sids + (size_t)i * SID_CAP;
+            researchRows_[std::string(sid)].sent = true; // silent baseline seed
+        }
+        researchIntentSeeded_ = true;
+        return; // nothing to send on the seed pass itself
+    }
     for (unsigned int i = 0; i < n; ++i) {
         const char* sid = sids + (size_t)i * SID_CAP;
         ResearchRow& rr = researchRows_[std::string(sid)];
-        bool first  = !rr.sent;
-        // Known-set membership is monotonic (no value to diff): send on first
-        // sight then resend periodically. No silent seed -> resendUnsent=true.
-        if (!sync::gateShouldSend(/*changed*/ false, now, rr.lastSendMs,
-                                  /*minSendMs*/ 0, RESEND_MS, /*resendUnsent*/ true))
-            continue;
+        if (rr.sent) continue; // already baseline-seeded or already sent as an intent
         rr.sent = true; rr.lastSendMs = now;
         ResearchPacket pkt;
         memset(&pkt, 0, sizeof(pkt));
@@ -1102,15 +1376,26 @@ void Replicator::publishResearch(const SyncContext& ctx) {
         pkt.seq     = researchSeqOut_++;
         strncpy(pkt.sid, sid, sizeof(pkt.sid) - 1);
         net.queueResearch(pkt);
-        if (first) { // resends stay silent; the new unlock is the signal
-            char b[128];
-            _snprintf(b, sizeof(b) - 1, "[research] SEND sid='%s' seq=%u",
-                      pkt.sid, pkt.seq);
-            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
-        }
+        char b[144];
+        _snprintf(b, sizeof(b) - 1, "[research] SEND (join intent) sid='%s' seq=%u",
+                  pkt.sid, pkt.seq);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
     }
 }
 
+// Applies a known-research row (protocol 38). Phase 8 (WORLD-02): this
+// function is now genuinely role-symmetric (no isHost branch needed) - on a
+// JOIN the row is the host's authoritative broadcast (unchanged pre-Phase-8
+// behavior); on the HOST it is a join's intent (rejectIfForgedOwner already
+// gated the receive, NetLink.cpp). Both cases resolve through the SAME
+// idempotent researchStartBySid (isKnown pre-check), so a HOST applying a
+// join's newly-known sid is safe by construction, and the host's OWN
+// publishResearch above then broadcasts it (first-sight, resendUnsent=true)
+// so every OTHER join converges - no per-sender seq keying is needed here
+// (unlike doors/build-doors): two different joins' intents for the SAME sid
+// can only ever race to the SAME idempotent outcome ("known"), never
+// conflict, so a seq collision at worst drops a redundant duplicate, never
+// corrupts state.
 void Replicator::applyResearch(const SyncContext& ctx) {
     GameWorld* gw = ctx.gw; Inbound& in = *ctx.in;
     std::deque<InboundResearch> got;
@@ -1131,11 +1416,16 @@ void Replicator::applyResearch(const SyncContext& ctx) {
         int known = -1, can = -1;
         int rc = engine::researchQueryBySid(gw, sid, &known, &can);
         if (rc != 1) continue; // store/levers not up yet; the resend retries
-        if (known == 1) { rr.applied = true; continue; } // already converged
+        // Phase 8 review IN-01: an applied/converged row is accounted for by
+        // the HOST's own stream - mark it `sent` so a join's next publish
+        // pass never echoes it back as a spurious "join intent" (one
+        // redundant reliable packet per unlock per join, and a spurious
+        // "[research] SEND (join intent)" line on the tag the oracle counts).
+        if (known == 1) { rr.applied = true; rr.sent = true; continue; } // already converged
         int started = engine::researchStartBySid(gw, sid);
         int knownAfter = -1;
         engine::researchQueryBySid(gw, sid, &knownAfter, &can);
-        if (knownAfter == 1) rr.applied = true;
+        if (knownAfter == 1) { rr.applied = true; rr.sent = true; }
         char b[160];
         _snprintf(b, sizeof(b) - 1,
                   "[research] RECV sid='%s' known %d->%d start=%d seq=%u",
@@ -1274,6 +1564,7 @@ void Replicator::publishDeeds(const SyncContext& ctx) {
 
 void Replicator::applyDeeds(const SyncContext& ctx) {
     GameWorld* gw = ctx.gw; Inbound& in = *ctx.in;
+    bool isHost = ctx.isHost;
     std::deque<InboundDeed> got;
     in.drainDeed(got);
     if (got.empty()) return;
@@ -1284,8 +1575,15 @@ void Replicator::applyDeeds(const SyncContext& ctx) {
         Key k; k.t = p.hand[0]; k.c = p.hand[1]; k.cs = p.hand[2];
         k.i = p.hand[3]; k.s = p.hand[4];
         DeedRow& dr = deedRows_[k];
-        if (!sync::gateSeqAccept(dr.seqSeen, p.seq)) continue; // stale/dup row
-        dr.seqSeen = p.seq;
+        // Phase 8 review CR-01: per-SENDER accept, the applyDoors precedent.
+        // The HOST intake hears up to N-1 joins' purchase intents with
+        // independent deedSeqOut_ counters - a bare scalar dropped join B's
+        // intent for a hand join A had authored at a higher seq: B already
+        // paid locally (the money pool syncs the debit), the host never
+        // recorded ownership, and the host's deed resend reverted B's deed -
+        // money gone, no building (the item/money-loss class).
+        if (!sync::gateSeqAcceptPerSender(dr.seqSeen, p.ownerId, p.seq)) continue; // stale/dup row
+        dr.seqSeen[p.ownerId] = p.seq;
         int want = p.owned ? 1 : 0;
         if (dr.applied && dr.knownOwned == want) continue; // converged; resend no-op
         engine::DeedRead cur;
@@ -1300,21 +1598,36 @@ void Replicator::applyDeeds(const SyncContext& ctx) {
             dr.applied = true; dr.knownOwned = want;
             continue;
         }
-        // Baseline BEFORE the engine write, and count it as sent: the ownership
-        // change this causes must not be re-detected as a local purchase and
-        // bounced straight back at the author.
-        dr.knownOwned = want; dr.sent = true; dr.lastSendMs = now;
+        // Phase 8 (WORLD-02): PKT_DEED is now a host-terminated intent, so
+        // this write means two different things depending on role. On a JOIN
+        // this row is still the host's authoritative broadcast - the echo
+        // guard is unchanged: baseline BEFORE the engine write (and count it
+        // as sent) so the ownership change this causes is never re-detected
+        // as a local purchase and bounced straight back at the author. On
+        // the HOST this row is a JOIN'S INTENT, not a fact to echo-suppress -
+        // dr.knownOwned/dr.sent/dr.lastSendMs are publishDeeds' OWN
+        // bookkeeping and must NOT be pre-empted here: leaving dr.knownOwned
+        // stale means the host's own next publishDeeds sample sees a genuine
+        // `changed` against the committed ownership and RE-EMITS it under
+        // the host's own ownerId/seq - every other join converges to the
+        // host's value, never the intent author's.
+        if (!isHost) { dr.knownOwned = want; dr.sent = true; dr.lastSendMs = now; }
         engine::DeedRead post;
         bool ok = engine::writeDeedByHand(gw, p.hand, want, p.ownerSid, &post);
         if (ok && post.owned == want) dr.applied = true;
-        char b[224];
+        // Phase 11 plan 02 (TEST-01) log identity audit: seq=%u (p.seq) was
+        // already logged; append sender=%u (p.ownerId, the per-sender seq
+        // space this same gate already keys on above via
+        // gateSeqAcceptPerSender) AFTER it - append-only, end-of-line.
+        // owner='%s' above is the FACTION name (p.ownerSid), not a playerId.
+        char b[240];
         _snprintf(b, sizeof(b) - 1,
                   "[deed] RECV hand=%u.%u.%u.%u.%u owned=%d->%d ok=%d "
-                  "forSale=%d->%d owner='%s' name='%s' seq=%u",
+                  "forSale=%d->%d owner='%s' name='%s' seq=%u sender=%u",
                   p.hand[0], p.hand[1], p.hand[2], p.hand[3], p.hand[4],
                   cur.owned, ok ? post.owned : cur.owned, ok ? 1 : 0,
                   cur.forSale, ok ? post.forSale : cur.forSale,
-                  p.ownerSid, cur.name, p.seq);
+                  p.ownerSid, cur.name, p.seq, p.ownerId);
         b[sizeof(b) - 1] = '\0'; coop::logLine(b);
     }
 }
@@ -1754,7 +2067,12 @@ void Replicator::driveSampledChannels(const SyncContext& ctx) {
         // so a pairing that arrives this tick is usable by the very next row.
         { &Replicator::fixtureSync_,  0,                     &Replicator::publishFixtures,   &Replicator::applyFixtures,   false },
         { &Replicator::prodSync_,     0,                     &Replicator::publishProd,       &Replicator::applyProd,       true  },
-        { &Replicator::researchSync_, 0,                     &Replicator::publishResearch,   &Replicator::applyResearch,   true  },
+        // Phase 8 (WORLD-02): hostAuth true->false - a join now also runs
+        // publishResearch (its own post-baseline unlocks, host-terminated
+        // intent) and applyResearch (a host may now receive a join's
+        // intent); the role split lives INSIDE the two functions instead of
+        // the host-publishes/join-applies gate this row used pre-Phase-8.
+        { &Replicator::researchSync_, 0,                     &Replicator::publishResearch,   &Replicator::applyResearch,   false },
         { &Replicator::deedSync_,     0,                     &Replicator::publishDeeds,      &Replicator::applyDeeds,      false }
     };
     const int n = (int)(sizeof(kCh) / sizeof(kCh[0]));
@@ -1773,6 +2091,15 @@ void Replicator::driveSampledChannels(const SyncContext& ctx) {
 }
 
 void Replicator::onPeerConnected(NetLink& net, u32 ownerId) {
+    resyncPeer(net, ownerId);
+}
+
+// Phase 10 Plan 02 (SAVE-04): the resend-pass body, extracted verbatim from
+// onPeerConnected above (which now delegates here) so Plugin.cpp can also
+// call it a SECOND time on a bootstrap-pushed joiner's post-load LC_LOADED
+// edge. See the doc comment on the declaration (Replicator.h) for why a
+// second pass is safe.
+void Replicator::resyncPeer(NetLink& net, u32 ownerId) {
     // 1. One-shot edges, replayed: every live placed building's PLACE (and
     // the REMOVE for removed ones) goes out again. The receiver's session
     // maps dedupe - a known key skips the mint, a tombstoned key skips the
@@ -1817,7 +2144,8 @@ void Replicator::onPeerConnected(NetLink& net, u32 ownerId) {
     // hostBody_, stealthPub_) are left alone: re-seeding them would author
     // phantom drop/KO edges rather than heal state.
     unsigned int nFac = 0, nDoor = 0, nBdoor = 0, nMed = 0, nStats = 0,
-                 nMoney = 0, nInv = 0, nWorld = 0, nProd = 0, nDeed = 0;
+                 nMoney = 0, nInv = 0, nWorld = 0, nProd = 0, nDeed = 0,
+                 nResearch = 0;
     for (std::map<std::string, FacRow>::iterator it = facRows_.begin();
          it != facRows_.end(); ++it)
         if (it->second.lastSendMs != 0) { it->second.lastSendMs = 1; ++nFac; }
@@ -1851,15 +2179,52 @@ void Replicator::onPeerConnected(NetLink& net, u32 ownerId) {
     for (std::map<Key, DeedRow>::iterator it = deedRows_.begin();
          it != deedRows_.end(); ++it)
         if (it->second.lastSendMs != 0) { it->second.lastSendMs = 1; ++nDeed; }
+    // Phase 10 Plan 02 (SAVE-04, 10-RESEARCH.md catch-up table): research
+    // was the ONE change-gated channel absent from this aging pass - it had
+    // only its own slow lost-row corrector (researchResendMs, 15 s) to fall
+    // back on. Aging here means a research row committed between a
+    // bootstrap's bake and the joiner's load converges on the NEXT sample
+    // instead of waiting out that cadence. Meaningful on the HOST side only
+    // (publishResearch's host branch is resendUnsent=true, so the periodic
+    // broadcast already covers every known sid - aging just makes it fire
+    // immediately instead of waiting up to RESEND_MS); the join branch keeps
+    // baseline rows at lastSendMs=0 by design (no resend logic there), so
+    // this loop is a harmless no-op on a join's own researchRows_.
+    for (std::map<std::string, ResearchRow>::iterator it = researchRows_.begin();
+         it != researchRows_.end(); ++it)
+        if (it->second.lastSendMs != 0) { it->second.lastSendMs = 1; ++nResearch; }
 
-    char b[240];
+    char b[264];
     _snprintf(b, sizeof(b) - 1,
               "[latejoin] RESYNC place=%u remove=%u fac=%u door=%u bdoor=%u "
-              "med=%u stats=%u money=%u inv=%u world=%u prod=%u deed=%u",
+              "med=%u stats=%u money=%u inv=%u world=%u prod=%u deed=%u "
+              "research=%u",
               nPlace, nRemove, nFac, nDoor, nBdoor, nMed, nStats, nMoney,
-              nInv, nWorld, nProd, nDeed);
+              nInv, nWorld, nProd, nDeed, nResearch);
     b[sizeof(b) - 1] = '\0'; coop::logLine(b);
 }
+
+// Phase 10 Plan 02 (SAVE-04, 10-RESEARCH.md "Joiner Catch-Up Channel Table"):
+// audit of every OTHER channel in the table - confirming each already
+// converges without a redundant nudge here, so resyncPeer above adds ONLY
+// the research aging line and nothing else:
+//   roster            - WELCOME-preceding unicast (NetLink.cpp), none needed
+//   own-ranks         - host announceOwnRanks broadcast on roster change, none
+//   entity batches    - unreliable 20 Hz self-healing stream, none
+//   runtime proxies   - request-driven PKT_SPAWN_REQ/INFO, none
+//   build/doors/bdoors/factions/deeds/medical/stats/inventory/world/prod
+//                     - covered by the lastSendMs=1 aging loop above already
+//   pool              - poolSentMs_ aging above (ack-vector re-broadcast), covered
+//   cells             - PKT_CELL_MAP + CELL_ASSERT_MS=5000 re-assert, covered
+//   speed/time        - SET resend + ~1 Hz TimePacket broadcast, covered
+//   one-shot EVT_*    - reliable broadcast + idempotent latches; the residual
+//                       mid-swap flush window is a GENERAL-rejoin risk (an
+//                       ALREADY-LIVE rejoiner's world-swap flush loses a
+//                       one-shot in flight), pre-existing 2p behavior and
+//                       OUT of this plan's scope (see TWO_PLAYER_ASSUMPTIONS.md) -
+//                       the LATE-JOIN case this plan targets has no such
+//                       flush window (the joiner is not yet gameplayLive
+//                       when its own WORLD-RELOAD edge runs)
 
 void Replicator::publishBuildDoors(const SyncContext& ctx) {
     NetLink& net = *ctx.net; u32 ownerId = ctx.localId;
@@ -1956,8 +2321,9 @@ void Replicator::applyBuildDoors(const SyncContext& ctx) {
                 localHand = pit->second.localHand;
         }
         BdoorRow& row = bdoorRows_[std::make_pair(k, (int)p.doorIndex)];
-        if (!sync::gateSeqAccept(row.seqSeen, p.seq)) continue; // stale/dup row
-        row.seqSeen = p.seq;
+        // Phase 8 (WORLD-01): per-SENDER accept, the same door fix.
+        if (!sync::gateSeqAcceptPerSender(row.seqSeen, p.ownerId, p.seq)) continue; // stale/dup row
+        row.seqSeen[p.ownerId] = p.seq;
         // Updating the baseline FIRST is the echo guard: the local change this
         // write causes must not be re-detected as ours next sample.
         row.knownOpen = (int)p.open; row.knownLocked = (int)p.locked;
@@ -2061,6 +2427,7 @@ void Replicator::publishSquadMoves(GameWorld* gw, NetLink& net, u32 ownerId) {
         // recruit / a re-moved member must not leave a stale claim behind).
         pinOwned_.erase(ok);
         pinPeer_.erase(ok);
+        coop::pinForget(pinnedOwner_, ok); // 06-01 GAP-3
         // Pin ownership BEFORE the wire (the recruit pattern): every edge
         // polled from OUR roster is OUR user's action, so the new hand
         // publishes from this side no matter which rank its container latched
@@ -2196,11 +2563,40 @@ void Replicator::applyStealthFeedback(GameWorld* gw, Inbound& in) {
         // whoSeesMeSneaking while its stealth update runs, so after the sneak
         // ends the last replayed set stays frozen on the owner. Clear it here or
         // the detection arrows/status linger for the rest of the session.
-        unsigned int cleared = 0;
-        if (n == 0 && engine::clearStealthSeers(c)) cleared = 1;
+        //
+        // Phase 6 review WR-01 (multi-author clear scoping): at N>=3 the Class A
+        // relay makes SEVERAL detection authorities reachable at once. Honor an
+        // empty snapshot's clear only when it comes from the SAME author whose
+        // active map we replayed last (the falling edge of the live detection),
+        // or when that author has gone quiet past the STEALTH_RESEND_MS safety
+        // resend (departed/stopped authoring - any surviving author's clear may
+        // then release the frozen set). A suppressed clear self-heals: the live
+        // author's next active snapshot (<= STEALTH_RESEND_MS away) re-asserts
+        // the true map. N=2 behavior is unchanged (single author always matches).
+        unsigned int cleared = 0, deferred = 0;
+        if (n > 0) {
+            StealthRecv& rcv = stealthRecv_[k];
+            rcv.lastAuthor   = p.ownerId;
+            rcv.lastActiveMs = nowMs();
+        } else {
+            bool honor = true;
+            std::map<Key, StealthRecv>::iterator rit = stealthRecv_.find(k);
+            if (rit != stealthRecv_.end() &&
+                rit->second.lastAuthor != p.ownerId &&
+                (nowMs() - rit->second.lastActiveMs) < STEALTH_RESEND_MS)
+                honor = false;
+            if (honor) {
+                if (engine::clearStealthSeers(c)) cleared = 1;
+                stealthRecv_.erase(k);
+            } else {
+                deferred = 1;
+            }
+        }
         char b[176]; _snprintf(b, sizeof(b) - 1,
-            "[sneak] DETECT RECV hand=%u,%u seers=%u applied=%u unseen=%u cleared=%u",
-            k.i, k.s, n, applied, (unsigned)p.unseen, cleared);
+            "[sneak] DETECT RECV hand=%u,%u seers=%u applied=%u unseen=%u cleared=%u "
+            "owner=%u deferred=%u",
+            k.i, k.s, n, applied, (unsigned)p.unseen, cleared,
+            p.ownerId, deferred);
         b[sizeof(b) - 1] = '\0'; coop::logLine(b);
     }
 }
@@ -2240,8 +2636,15 @@ void Replicator::syncSpeed(GameWorld* gw, Inbound& in, NetLink& net, u32 ownerId
     }
     // Phase 5 spike: expose the combat-cap state so the speed-setter
     // diagnostics (KENSHICOOP_DEBUG_SPEED) can distinguish an engine-forced
-    // combat cap from a user click by context.
-    engine::setSpeedCombatHint(speedMyCombat_ || speedPeerCombat_);
+    // combat cap from a user click by context. Phase 9 Plan 02 (CONS-02):
+    // "the peer's" combat bit is now an OR over every connected voter, not a
+    // single scalar.
+    bool anyVoteCombat = false;
+    for (std::map<u32, coop::SpeedVoteRec>::const_iterator vit = speedVotes_.begin();
+         vit != speedVotes_.end(); ++vit) {
+        if (vit->second.combat) { anyVoteCombat = true; break; }
+    }
+    engine::setSpeedCombatHint(speedMyCombat_ || anyVoteCombat);
 
     // Local vote capture: the engine-setter hooks (setGameSpeed / userPause /
     // togglePause) record every REAL user action - UI clicks, keyboard pause,
@@ -2274,30 +2677,61 @@ void Replicator::syncSpeed(GameWorld* gw, Inbound& in, NetLink& net, u32 ownerId
         b[sizeof(b) - 1] = '\0'; coop::logLine(b);
     }
 
-    // Drain peer speed packets: the host keeps the join's latest REQUEST; the
-    // join applies the host's arbitrated SET. The reliable channel is ordered,
-    // but the seq guard keeps a (theoretical) stale packet from rolling back.
+    // Drain peer speed packets: the host keeps every connected join's latest
+    // REQUEST in speedVotes_ (Phase 9 Plan 02, CONS-02); the join applies the
+    // host's arbitrated SET. The reliable channel is ordered, but the seq
+    // guard keeps a (theoretical) stale packet from rolling back.
     std::deque<InboundSpeed> got;
     in.drainSpeed(got);
     for (std::deque<InboundSpeed>::iterator it = got.begin(); it != got.end(); ++it) {
         const SpeedPacket& p = it->pkt;
-        if (p.seq != 0 && speedSeqSeen_ != 0 && (long)(p.seq - speedSeqSeen_) <= 0)
-            continue;
-        speedSeqSeen_ = p.seq;
         bool pkPaused = (p.flags & SPEED_PAUSED) != 0 || p.speed <= EPS;
         if (p.type == (u8)PKT_SPEED_REQ && isHost) {
+            // Phase 9 review CR-01: drop a REQ from an owner no longer in the
+            // connected roster. mainLoop_hook runs processNetEvents (which
+            // erases the departing owner's vote in clearPeerReplicationState)
+            // BEFORE this drain, so a final in-flight REQ pushed by the net
+            // thread in the same service window as the DISCONNECT (guaranteed
+            // adjacency on a graceful leave - ENet flushes queued reliables
+            // first) would otherwise re-create the erased entry via the
+            // operator[] below and pin speedReduce's min forever (T-09-07
+            // re-opened). The roster gate is the codebase's own pattern for
+            // this exact race: reduceCellMap gates incumbents on
+            // connectedOwners (CellMap.h) the same way. Safe against the
+            // connect edge too: the handshake CONNECT event precedes any data
+            // from that peer, and processNetEvents drains connects before
+            // this channel drains its queue.
+            if (knownPeers_.find(it->ownerId) == knownPeers_.end()) continue;
+            // Per-SENDER seq guard (Phase 9 Plan 02, CONS-02): the OLD
+            // single speedSeqSeen_ scalar ran BEFORE the type/role split and
+            // censored a second/third join's genuinely-newer votes the
+            // moment ANY join's counter passed them (the FoldDedup collision
+            // shape, in the vote path this time, not just a fold decision).
+            // Each voter's own record now tracks its own high-water.
+            coop::SpeedVoteRec& rec = speedVotes_[it->ownerId];
+            if (p.seq != 0 && rec.seqSeen != 0 && (long)(p.seq - rec.seqSeen) <= 0)
+                continue;
+            rec.seqSeen = p.seq;
             float req = pkPaused ? 0.0f : p.speed;
             bool  cmb = (p.flags & SPEED_IN_COMBAT) != 0;
-            if (speedPeerReq_ < 0.0f || fabs(req - speedPeerReq_) > EPS ||
-                cmb != speedPeerCombat_) {
-                char b[112]; _snprintf(b, sizeof(b) - 1,
-                    "[speed] REQ RECV owner=%u mult=%.2f paused=%d combat=%d",
-                    (unsigned)it->ownerId, req, pkPaused ? 1 : 0, cmb ? 1 : 0);
+            if (rec.req < 0.0f || fabs(req - rec.req) > EPS || cmb != rec.combat) {
+                // Phase 11 plan 02 (TEST-01) log identity audit: seq is on the
+                // wire (p.seq, already the guard's own comparison basis above)
+                // but was not logged - append-only, end-of-line (no existing
+                // oracle regex anchors on this line's tail).
+                char b[128]; _snprintf(b, sizeof(b) - 1,
+                    "[speed] REQ RECV owner=%u mult=%.2f paused=%d combat=%d seq=%u",
+                    (unsigned)it->ownerId, req, pkPaused ? 1 : 0, cmb ? 1 : 0, (unsigned)p.seq);
                 b[sizeof(b) - 1] = '\0'; coop::logLine(b);
             }
-            speedPeerReq_    = req;
-            speedPeerCombat_ = cmb;
+            rec.req    = req;
+            rec.combat = cmb;
         } else if (p.type == (u8)PKT_SPEED_SET && !isHost) {
+            // Join-side: a join hears only the host's single SET stream, so
+            // the pre-split scalar guard stays exactly as it was pre-Phase-9.
+            if (p.seq != 0 && speedSeqSeen_ != 0 && (long)(p.seq - speedSeqSeen_) <= 0)
+                continue;
+            speedSeqSeen_ = p.seq;
             // QUIET apply: drives the sim to the arbitrated effective without
             // touching the UI buttons - they keep showing this player's VOTE.
             // The clock slew (protocol 25) folds in here: the join's sim runs
@@ -2319,14 +2753,46 @@ void Replicator::syncSpeed(GameWorld* gw, Inbound& in, NetLink& net, u32 ownerId
     }
 
     if (isHost) {
-        // Arbitrate: effective = min(my request, peer request), capped at 1x
-        // while either player squad fights. The cap never force-unpauses -
-        // pause (0) is already below 1, so min semantics preserve it.
-        float eff = (speedMyReq_ >= 0.0f) ? speedMyReq_ : 1.0f;
-        if (speedPeerReq_ >= 0.0f && speedPeerReq_ < eff) eff = speedPeerReq_;
-        bool combat = speedMyCombat_ || speedPeerCombat_;
-        if (combat && speedCombatCap_ && eff > 1.0f) eff = 1.0f;
+        // Arbitrate: effective = min(my request, every connected voter's
+        // request), capped at 1x while any player squad fights. The cap
+        // never force-unpauses - pause (0) is already below 1, so min
+        // semantics preserve it. Phase 9 Plan 02 (CONS-02): the OLD
+        // two-scalar min block is replaced by SpeedVote.h's pure reduce over
+        // speedVotes_ - refactor state, not flow (research Pitfall 4): the
+        // reduce's output feeds the SAME changed/broadcast/enforce chain
+        // below unchanged, so a disconnect-triggered drop in speedVotes_
+        // raises `eff` through this exact path on the very next tick.
+        coop::SpeedReduceOut red = coop::speedReduce(speedMyReq_, speedMyCombat_,
+                                                      speedVotes_, speedCombatCap_);
+        float eff    = red.eff;
+        bool  combat = red.combat;
         bool changed = (speedLastSet_ < 0.0f || fabs(eff - speedLastSet_) > EPS);
+        // Phase 9 review WR-04: a REAL host click the reduce did NOT grant
+        // (effective unchanged and below the request) is the min rule
+        // visibly denying a raise - but the [speed] SET log below is
+        // change-gated, so the denial moment used to leave NO production
+        // evidence at all (the live oracle's denied-raise check was provably
+        // vacuous: nothing it could key on existed at that moment). Emit ONE
+        // DENY line per denied click - userActed is a per-click edge from
+        // consumeSpeedIntent, not a per-tick level, so this never spams -
+        // with the same VOTES dump the SET line carries, so Test-Consensus
+        // (CoopOraclesN.psm1) can key on evidence production actually emits.
+        if (userActed && !changed && speedMyReq_ > eff + EPS) {
+            char b[256];
+            int off = _snprintf(b, sizeof(b) - 1,
+                "[speed] DENY req=%.2f eff=%.2f cap=%d VOTES host=%.2f/%d",
+                speedMyReq_, eff, red.combatCapped ? 1 : 0,
+                speedMyReq_, speedMyCombat_ ? 1 : 0);
+            if (off < 0) off = 0;
+            for (std::map<u32, coop::SpeedVoteRec>::const_iterator vit = speedVotes_.begin();
+                 vit != speedVotes_.end() && (size_t)off < sizeof(b) - 1; ++vit) {
+                int w = _snprintf(b + off, sizeof(b) - 1 - (size_t)off,
+                    " %u=%.2f/%d", (unsigned)vit->first, vit->second.req,
+                    vit->second.combat ? 1 : 0);
+                if (w > 0) off += w;
+            }
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        }
         // userActed with an UNCHANGED effective = a denied raise (consensus
         // holdback): re-apply immediately so the host engine doesn't run fast
         // until the enforcement below - a click is a request, not an override.
@@ -2352,10 +2818,24 @@ void Replicator::syncSpeed(GameWorld* gw, Inbound& in, NetLink& net, u32 ownerId
             speedLastSet_    = eff;
             speedLastSendMs_ = now;
             if (changed) {
-                char b[128]; _snprintf(b, sizeof(b) - 1,
-                    "[speed] SET mult=%.2f paused=%d combat=%d (my=%.2f peer=%.2f)",
-                    eff, effPaused ? 1 : 0, combat ? 1 : 0,
-                    speedMyReq_, speedPeerReq_);
+                // Phase 9 Plan 02 (CONS-02): the [speed] VOTES dump names
+                // every voter (owner:req:combat) - the min-vote oracle's
+                // ground truth, replacing the old two-scalar "(my=... peer=
+                // ...)" tail that could only ever name ONE peer.
+                char b[256];
+                int off = _snprintf(b, sizeof(b) - 1,
+                    "[speed] SET mult=%.2f paused=%d combat=%d cap=%d "
+                    "VOTES host=%.2f/%d",
+                    eff, effPaused ? 1 : 0, combat ? 1 : 0, red.combatCapped ? 1 : 0,
+                    speedMyReq_, speedMyCombat_ ? 1 : 0);
+                if (off < 0) off = 0;
+                for (std::map<u32, coop::SpeedVoteRec>::const_iterator vit = speedVotes_.begin();
+                     vit != speedVotes_.end() && (size_t)off < sizeof(b) - 1; ++vit) {
+                    int w = _snprintf(b + off, sizeof(b) - 1 - (size_t)off,
+                        " %u=%.2f/%d", (unsigned)vit->first, vit->second.req,
+                        vit->second.combat ? 1 : 0);
+                    if (w > 0) off += w;
+                }
                 b[sizeof(b) - 1] = '\0'; coop::logLine(b);
             }
         }
@@ -2439,20 +2919,70 @@ void Replicator::syncTime(GameWorld* gw, Inbound& in, NetLink& net, u32 ownerId,
         // join's, which is the same magnitude as the divergence the census park
         // and walk-converge bands spend the whole town correcting. A clock gap
         // is a position gap everywhere at once.
-        const TimePacket* jn = 0;
+        // Per-OWNER seq guard (Phase 9 Plan 02, CONS-03): the OLD single
+        // timeSeqSeen_ scalar ran across every reporting join and censored a
+        // second/third join's genuinely-newer reports the moment ANY join's
+        // counter passed them - the exact FoldDedup collision shape, in the
+        // time-report path this time. Each owner's record now tracks its own
+        // high-water; the record persists across ticks (a join need not
+        // report every tick) until a disconnect erases it (below).
         for (std::deque<InboundTime>::iterator it = got.begin();
              it != got.end(); ++it) {
-            if (timeSeqSeen_ != 0 && (long)(it->pkt.seq - timeSeqSeen_) <= 0)
+            // Phase 9 review CR-01: drop a report from an owner no longer in
+            // the connected roster - the exact syncSpeed REQ-drain rationale
+            // (see the guard there): processNetEvents erases the departing
+            // owner's timeReports_ entry BEFORE this drain runs, so a final
+            // in-flight ~1 Hz report drained after the leave would re-create
+            // the entry via the operator[] below and, as a frozen gameHours,
+            // brake the host's clock forever (T-09-09 re-opened).
+            if (knownPeers_.find(it->ownerId) == knownPeers_.end()) continue;
+            TimeReport& rep = timeReports_[it->ownerId];
+            if (it->pkt.seq != 0 && rep.seqSeen != 0 &&
+                (long)(it->pkt.seq - rep.seqSeen) <= 0)
                 continue;
-            timeSeqSeen_ = it->pkt.seq;
-            jn = &it->pkt;
+            rep.seqSeen   = it->pkt.seq;
+            rep.gameHours = it->pkt.gameHours;
+            rep.recvMs    = now;
         }
-        if (jn && timeBrake_) {
+        // The brake targets the MOST-BEHIND CONNECTED join (the smallest
+        // gameHours across every CURRENT report), not merely the last packet
+        // heard this tick - the old single-`jn` collapse. A departed join's
+        // report is gone from timeReports_ the instant clearPeerReplicationState
+        // erases it (ReplicatorCore.cpp), so a departed laggard can never
+        // brake the host forever.
+        //
+        // Phase 9 review WR-01: FROZEN reports are gated too. Pre-Phase-9 the
+        // brake ran only on ticks where a fresh report arrived; the per-owner
+        // record now persists across ticks, so a CONNECTED join that stops
+        // reporting (mid save-load, stalled process, half-dead link inside
+        // the ENet timeout window) would leave a frozen gameHours whose
+        // apparent lag GROWS with the host's own clock every tick - the host
+        // slewing down against a phantom laggard for the whole silence. Skip
+        // any report older than TIME_REPORT_STALE_MS (5 missed 1 Hz reports -
+        // the CENSUS_OWNER_STALE_MS precedent, ReplicatorAuthority.cpp): the
+        // brake resumes the moment the join reports again.
+        const unsigned long TIME_REPORT_STALE_MS = 5000;
+        bool   haveWorst   = false;
+        double worstHours  = 0.0;
+        u32    worstOwner  = 0;
+        for (std::map<u32, TimeReport>::const_iterator wit = timeReports_.begin();
+             wit != timeReports_.end(); ++wit) {
+            if (wit->second.gameHours < 0.0) continue; // no sample yet
+            if (wit->second.recvMs == 0 ||
+                (now - wit->second.recvMs) > TIME_REPORT_STALE_MS)
+                continue; // stale owner: a frozen report no longer speaks
+            if (!haveWorst || wit->second.gameHours < worstHours) {
+                haveWorst  = true;
+                worstHours = wit->second.gameHours;
+                worstOwner = wit->first;
+            }
+        }
+        if (haveWorst && timeBrake_) {
             double localH = -1.0;
             if (engine::readGameClock(gw, &localH, 0) && localH >= 0.0) {
-                double lag = localH - jn->gameHours; // >0 = the join is BEHIND
-                // How much catch-up the join can still muster on its own,
-                // computed rather than reported: its slew caps at 2x and
+                double lag = localH - worstHours; // >0 = the worst join is BEHIND
+                // How much catch-up the worst join can still muster on its
+                // own, computed rather than reported: its slew caps at 2x and
                 // slewedEffective clamps the product at 5x, so the consensus
                 // speed alone says whether it has anywhere left to go. At 2.5x
                 // and below it can still double; at 5x it has nothing. Braking
@@ -2485,11 +3015,28 @@ void Replicator::syncTime(GameWorld* gw, Inbound& in, NetLink& net, u32 ownerId,
                 if (slewChanged || timeLastLogMs_ == 0 ||
                     (now - timeLastLogMs_) >= 5000) {
                     timeLastLogMs_ = now;
-                    char b[176]; _snprintf(b, sizeof(b) - 1,
+                    char b[208]; _snprintf(b, sizeof(b) - 1,
                         "[time] BRAKE lag=%.4fgh slew=%.2f head=%.2f eff=%.2f "
-                        "local=%.5f join=%.5f",
-                        lag, timeSlew_, head, eff, localH, jn->gameHours);
+                        "local=%.5f worstOwner=%u worst=%.5f",
+                        lag, timeSlew_, head, eff, localH,
+                        (unsigned)worstOwner, worstHours);
                     b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+                    // Phase 9 Plan 02 (CONS-03): per-owner lag dump - the
+                    // N-player convergence oracle's ground truth, naming
+                    // every reporting join's offset from the host, not just
+                    // the worst one the brake reacted to.
+                    char lb[256];
+                    int loff = _snprintf(lb, sizeof(lb) - 1, "[time] LAG");
+                    if (loff < 0) loff = 0;
+                    for (std::map<u32, TimeReport>::const_iterator lit = timeReports_.begin();
+                         lit != timeReports_.end() && (size_t)loff < sizeof(lb) - 1; ++lit) {
+                        if (lit->second.gameHours < 0.0) continue;
+                        int w = _snprintf(lb + loff, sizeof(lb) - 1 - (size_t)loff,
+                            " owner=%u off=%.4fgh", (unsigned)lit->first,
+                            localH - lit->second.gameHours);
+                        if (w > 0) loff += w;
+                    }
+                    lb[sizeof(lb) - 1] = '\0'; coop::logLine(lb);
                 }
             }
         }

@@ -25,6 +25,10 @@
 #include <cstdio>
 #include <string>
 #include <deque>
+#include <map>
+#include <set>
+#include <utility> // std::pair/make_pair (the WR-08 fallback-transfer queue)
+#include <vector>
 
 #include "CoopLog.h"
 #include "core/Config.h"
@@ -39,6 +43,8 @@
 #include "game/EngineScenario.h" // Phase 5a: auto-bake scene builders
 #include "sync/Replicator.h"
 #include "sync/SaveXfer.h"
+#include "sync/SaveCoord.h" // Phase 10 Plan 01 (SAVE-01): per-client save coordinator
+#include "sync/LoadCoord.h" // Phase 10 Plan 01 (SAVE-02/SAVE-03): per-client load coordinator + arbiter
 #ifdef KENSHICOOP_HARNESS
 #include "test/Scenario.h" // scenario runner: Harness/Debug builds only (Phase 1)
 #endif
@@ -71,6 +77,85 @@ coop::u32        g_tick = 0;
 // avoid leaking duplicate bodies into the save. Only touched on the main thread.
 GameWorld*       g_lastGw = 0;
 
+// Phase 3 Plan 04 (PEER-02/03, Pitfall 3): per-PlayerId connected-peer set,
+// replacing the old single g_peerPresent bool. Maintained by the SAME
+// conns/leaves loops in processNetEvents that already iterate per id
+// (insert on connect, erase on leave) - so one peer's departure never
+// changes what a SURVIVOR's `!g_connectedPeers.empty()` check sees.
+std::set<coop::u32> g_connectedPeers;
+
+// Phase 10 Plan 01 (SAVE-01): the HOST-only per-client coordinated-save
+// state machine (SaveCoord.h) - keyed by the connected join's PlayerId, one
+// entry per client tracked for the CURRENT coordinated transfer. Lives here
+// (driveSaveSync/driveLoadSync scope), not inside ReplicatorCore's
+// purgeAuthorConservationState - the save/load coordinator is a SessionController-
+// adjacent concept, not a replication-plane one (10-RESEARCH.md's Save-plane
+// rejoin-state note).
+coop::SaveCoordState g_saveCoord;
+
+// Phase 10 Plan 01 (SAVE-02): the HOST-only per-client coordinated-load
+// state machine (LoadCoord.h) - the SaveCoord.h mirror for the load plane.
+coop::LoadCoordState g_loadCoord;
+
+// Phase 10 Plan 01 (SAVE-03): the shared first-wins arbiter serializing
+// BOTH planes - exactly one active save/load transition host-wide.
+coop::CoordArbiter g_coordArbiter;
+
+// Phase 10 Plan 01 (SAVE-01/SAVE-03): a REQ-admitted save carries its
+// (requesterId,reqId) forward to the detour-fired local edge that actually
+// performs it (armWatch), so that edge's own coordOffer call is an
+// idempotent re-offer of the SAME transition, not a second competing one.
+// Consumed (reset to 0) by the FIRST edge processed after being set. A
+// genuinely organic host-local edge (menu/quicksave/autosave/connect-push)
+// finds these at 0 and mints its own fresh reqId instead (below) - never
+// reusing 0/0, so two DIFFERENT organic saves are never mistaken for the
+// same transition (Pitfall 5: autosave-during-an-active-transition must be
+// REJECTED, not treated as a re-offer of it).
+coop::u32 g_pendingSaveRequesterId = 0;
+coop::u32 g_pendingSaveReqId       = 0;
+// Phase 10 Plan 02 (SAVE-04): requesterId==0 is ALSO the legitimate value for
+// a host-local carry-forward (the connect-push bootstrap offers with
+// requesterId=0 same as any organic host-local edge), so "!= 0" can no
+// longer distinguish "nothing pending" from "a pending HOST-LOCAL pair
+// (0, reqId) to reuse verbatim". This bool is the real sentinel; the two
+// scalars above are only meaningful while it is true.
+bool      g_pendingSaveReqValid    = false;
+coop::u32 g_hostLocalSaveReqCounter = 0;
+coop::u32 g_pendingLoadRequesterId = 0;
+coop::u32 g_pendingLoadReqId       = 0;
+coop::u32 g_hostLocalLoadReqCounter = 0;
+
+// Phase 10 Plan 01 (SAVE-02): the JOIN's positive coordinated-load ACK
+// bookkeeping. loadAckPendingId != 0 means a LOAD_ACK is still owed for
+// that loadId, latched through the WORLD-RELOAD gameplay-live edge
+// (sessionResetForWorldReload) rather than at loadSave()'s deferred-issue
+// point - loads take tens of seconds, so "issued" is not "complete".
+coop::u32 g_loadAckPendingId      = 0;
+// Phase 11 review WR-04: the save name that pending ACK is FOR. The title-
+// boot gameplay-live edge (first gameplay of the process) verifies the last
+// unsuppressed LOCAL-LOAD actually loaded THIS name before ACKing positive -
+// otherwise a GO whose issued load never completed, followed by the user
+// clicking New Game / manually loading a different save, would report the
+// coordinated load as success while host and join sit in different worlds.
+std::string g_loadAckPendingName;
+// The loadId g_loadAfterCommit (the NACK-flow pending latch) answers, so
+// its own terminal LOAD_ACK names the right loadId.
+coop::u32 g_loadAfterCommitLoadId = 0;
+
+// Phase 10 Plan 01 (SAVE-01, host): the most recent LOAD_GO's own payload,
+// remembered so a per-client retry (loadTick's outRetry) can re-issue the
+// SAME GO unicast to just the failed client without recomputing the
+// fingerprint (a fingerprint recompute mid-retry could race a host save).
+std::string g_lastLoadGoName;
+coop::u32   g_lastLoadGoFp = 0;
+
+// Phase 10 review WR-08: the NACK-driven fallback transfers are a QUEUE of
+// (owner, name) pairs, drained one at a time when the serialized SaveXfer
+// sender is idle - the old singular g_loadXferPending string was last-NACK-
+// wins, so with several concurrent NACKers only the last drained owner ever
+// got a stream and the others burned bounded retries while healthy. The
+// queue itself lives in SessionController (g_session.loadXferQueue).
+
 // Cross-owner trade veto owner classifier (engine InvOwnerClassFn): forwards a
 // save-stable owner hand to the Replicator's squad-ownership sets. Free function
 // so the engine layer (which must not know about the Replicator) can call it.
@@ -89,6 +174,35 @@ static bool coopScenarioPickMintedProxy(const unsigned int refHand[5],
     return g_repl.pickMintedProxyNear(g_lastGw, refHand, outLocal, outCanon, outDist);
 }
 
+// milestone_a_gate's disconnect/reconnect detection (ScenarioContext::
+// connectedPeers). Same shape and reason as pickMintedProxy above: the
+// scenario layer must not reach into Plugin.cpp's globals directly, so
+// Plugin.cpp supplies this read-only snapshot of g_connectedPeers (PEER-02/03).
+static unsigned int coopScenarioConnectedPeers(unsigned int* outIds, unsigned int outCap) {
+    unsigned int n = 0;
+    for (std::set<coop::u32>::const_iterator it = g_connectedPeers.begin();
+         it != g_connectedPeers.end() && n < outCap; ++it) {
+        outIds[n++] = *it;
+    }
+    return n;
+}
+
+// world_state_gate's contested-claim leg (ScenarioContext::cellOwnerAt). Same
+// shape and reason as pickMintedProxy/connectedPeers above: the scenario layer
+// must not reach into the Replicator directly, so Plugin.cpp forwards
+// Replicator::authoritySrc's verdict - the SAME host-authoritative cell-claim
+// map every real consumer (authorityFor/census/enforceHostAuthority) reads.
+static unsigned int coopScenarioCellOwnerAt(float x, float z, int* outCx, int* outCz) {
+    if (outCx) *outCx = 0;
+    if (outCz) *outCz = 0;
+    if (!g_lastGw) return 0u; // NetLink gives the host id 0 (authoritySrc's own fail-open)
+    int cx = 0, cz = 0, src = 0;
+    coop::u32 owner = g_repl.authoritySrc(g_lastGw, x, z, &cx, &cz, &src);
+    if (outCx) *outCx = cx;
+    if (outCz) *outCz = cz;
+    return owner;
+}
+
 // SessionController (Phase 3): the mutable per-session lifecycle state that used
 // to live as ~18 loose file globals - peer presence, the gameplay-start edge,
 // the title auto-load gate, and the coordinated save/load (protocol 31/32)
@@ -103,7 +217,13 @@ struct SessionController {
     DWORD        gameStartTick;    // GetTickCount at the gameplay-start edge
     bool         autoLoadDone;     // title auto-load fired (settle gate)
     DWORD        titleFirstTick;   // first title tick (settle gate base)
-    bool         peerPresent;      // a peer is connected right now
+    // Phase 3 Plan 04 (PEER-02/03, Pitfall 3): the single peerPresent bool
+    // used to live here, gating save-suppression/connect-push/load-sync on
+    // "is at least one non-host peer connected" - at N>=3 that flipped false
+    // for EVERY survivor the instant ANY one peer left. Replaced by the
+    // per-PlayerId g_connectedPeers set (declared with the other globals,
+    // maintained by the same conns/leaves loops in processNetEvents); every
+    // former `g_peerPresent` read is now `!g_connectedPeers.empty()`.
     // Coordinated save (protocol 31).
     std::string  savePending;      // host: save name awaiting quiescence
     coop::u32    saveReqId;        // join: monotonic PKT_SAVE_REQ counter
@@ -113,8 +233,15 @@ struct SessionController {
     // identical copy, else NACKs and driveLoadSync's fallback transfer streams
     // the folder first. Lets a joiner enter the host's world with no pre-shared
     // save.
-    bool         bootstrapArmed;   // host: a connect-triggered save is baking
-    std::string  bootstrapName;    // host: that save's name (== savePending)
+    // Phase 10 Plan 02 (SAVE-04): a per-joiner PENDING QUEUE replaces the old
+    // singular bootstrapArmed bool - two joiners connecting in quick
+    // succession each get their OWN targeted bootstrap instead of the second
+    // overwriting the first's bootstrapName string. Drained one at a time
+    // (bootstrapActiveJoiner != 0 while a bake/GO/load is in flight for that
+    // one id) through the shared CoordArbiter - see driveConnectPushQueue().
+    std::deque<coop::u32> bootstrapQueue;       // host: joiner ids awaiting their own connect-push
+    coop::u32    bootstrapActiveJoiner; // host: joiner id the CURRENT bake/GO is FOR (0 = none)
+    std::string  bootstrapName;    // host: that save's name (== savePending) while active
     // World-swap edge detection (protocol 32): once gameplay has started,
     // gameplayLive dropping means the engine is swapping worlds (a load); live
     // again = the reload edge (session-reset point). Sub-second dips are FLICKER
@@ -127,7 +254,11 @@ struct SessionController {
     coop::u32    loadIdOut;        // host: monotonic LOAD_GO id
     coop::u32    loadIdSeen;       // join: newest GO loadId handled
     coop::u32    loadReqId;        // join: monotonic PKT_LOAD_REQ counter
-    std::string  loadXferPending;  // host: save awaiting post-reload transfer (NACK)
+    // host: per-owner fallback transfers awaiting the post-reload window
+    // (phase 10 review WR-08: one queued (owner,name) entry per NACKing
+    // owner, drained one at a time when the serialized sender is idle -
+    // never last-NACK-wins).
+    std::deque<std::pair<coop::u32, std::string> > loadXferQueue;
     std::string  loadAfterCommit;  // join: save to load once its transfer commits
     coop::u32    loadCommitBase;   // join: savexfer::commitSeq() at NACK time
     // Deferred-signal backstop: SaveManager::load only SETS the LOADGAME signal;
@@ -137,8 +268,8 @@ struct SessionController {
 
     SessionController()
       : gameStarted(false), gameStartTick(0), autoLoadDone(false),
-        titleFirstTick(0), peerPresent(false),
-        saveReqId(0), bootstrapArmed(false),
+        titleFirstTick(0),
+        saveReqId(0), bootstrapActiveJoiner(0),
         swapStartTick(0), swapHookTicks(0),
         loadSuppressOn(false), loadIdOut(0), loadIdSeen(0), loadReqId(0),
         loadCommitBase(0), loadPumpArmTick(0) {}
@@ -149,18 +280,18 @@ bool&        g_gameStarted    = g_session.gameStarted;
 DWORD&       g_gameStartTick   = g_session.gameStartTick;
 bool&        g_autoLoadDone    = g_session.autoLoadDone;
 DWORD&       g_titleFirstTick  = g_session.titleFirstTick;
-bool&        g_peerPresent     = g_session.peerPresent;
 std::string& g_savePending     = g_session.savePending;
 coop::u32&   g_saveReqId       = g_session.saveReqId;
-bool&        g_bootstrapArmed  = g_session.bootstrapArmed;
-std::string& g_bootstrapName   = g_session.bootstrapName;
+std::deque<coop::u32>& g_bootstrapQueue        = g_session.bootstrapQueue;
+coop::u32&    g_bootstrapActiveJoiner = g_session.bootstrapActiveJoiner;
+std::string&  g_bootstrapName         = g_session.bootstrapName;
 DWORD&       g_swapStartTick   = g_session.swapStartTick;
 coop::u32&   g_swapHookTicks   = g_session.swapHookTicks;
 bool&        g_loadSuppressOn  = g_session.loadSuppressOn;
 coop::u32&   g_loadIdOut       = g_session.loadIdOut;
 coop::u32&   g_loadIdSeen      = g_session.loadIdSeen;
 coop::u32&   g_loadReqId       = g_session.loadReqId;
-std::string& g_loadXferPending = g_session.loadXferPending;
+std::deque<std::pair<coop::u32, std::string> >& g_loadXferQueue = g_session.loadXferQueue;
 std::string& g_loadAfterCommit = g_session.loadAfterCommit;
 coop::u32&   g_loadCommitBase  = g_session.loadCommitBase;
 DWORD&       g_loadPumpArmTick  = g_session.loadPumpArmTick;
@@ -240,11 +371,103 @@ void warnIfNoPortraits(const std::string& name) {
 // clearing the maps - else a reconnect leaves orphaned duplicates or bakes them
 // into the next save. Falls back to a plain map reset if no world has ticked yet.
 void sessionResetForUi() {
-    g_peerPresent = false;
-    if (g_lastGw) g_repl.clearPeerReplicationState(g_lastGw);
-    else          g_repl.resetSession();
+    // Phase 3 Plan 04: the F2-panel disconnect ends OUR OWN session entirely
+    // (not one peer's departure), so every currently-tracked connected id's
+    // minted proxies/interp state must be torn down - loop the new owner-
+    // scoped cleanup over the whole connected set, then fall through to the
+    // full resetSession() for the remaining session-global members. This IS
+    // the "session-global cleanup only at session end" case (CONTEXT.md);
+    // the owner-scoped clearPeerReplicationState(gw, id) alone would leave a
+    // second/third connected id's proxies standing on our own disconnect.
+    if (g_lastGw) {
+        for (std::set<coop::u32>::iterator it = g_connectedPeers.begin();
+             it != g_connectedPeers.end(); ++it)
+            g_repl.clearPeerReplicationState(g_lastGw, *it);
+    }
+    g_connectedPeers.clear();
+    // WR-02 fix: stopping the net thread (already done by the caller before
+    // this runs) means no further DISCONNECT event ever drains through
+    // processNetEvents()'s leave loop for whoever was connected, so
+    // notePeerLeft() - the only other writer that erases knownPeers_ - never
+    // runs for them. A full UI disconnect is a session boundary (not a
+    // reload), so knownPeers_/allOwnRanks_ must not survive it either,
+    // unlike resetSession() below (which deliberately preserves both across
+    // a world-reload edge where the connection never dropped).
+    g_repl.clearKnownPeers();
+    g_repl.resetSession();
     g_inbound.flushWorldState();
     g_net.bumpSessionEpoch(); // v44: fence off any in-flight prior-session batch
+    // Phase 10 Plan 01 (SAVE-01/SAVE-02/SAVE-03): a full UI disconnect is a
+    // SESSION boundary (not a reload - the connection never dropped there,
+    // sessionResetForWorldReload deliberately leaves the coordinator alone
+    // for that case since a load transition's own reload is what its own
+    // reset edge fires FROM). Here the whole session ends, so the
+    // coordinator must not carry stale state into the NEXT one.
+    g_saveCoord    = coop::SaveCoordState();
+    g_loadCoord    = coop::LoadCoordState();
+    g_coordArbiter = coop::CoordArbiter();
+    // Phase 10 review WR-04: the coordinator objects alone are not the whole
+    // save/load session - the surrounding pipeline/latch state must not leak
+    // into the NEXT session either. A stale bootstrapActiveJoiner wedges the
+    // next session's connect-push queue outright (the CR-02 shape); a
+    // surviving bootstrapQueue bakes + unicasts GOs to prior-session ids; a
+    // stale pending (requester,reqId) pair mislabels the next organic edge;
+    // a join-side g_loadAckPendingId ACKs a stale loadId into the new
+    // session; and a surviving loadAfterCommit latch could fire a LOAD off
+    // an unrelated next-session commit (commitSeq is process-monotonic).
+    g_session.bootstrapQueue.clear();
+    g_session.bootstrapActiveJoiner = 0;
+    g_session.bootstrapName.clear();
+    g_session.savePending.clear();
+    g_session.loadXferQueue.clear();
+    g_session.loadAfterCommit.clear();
+    g_loadAfterCommitLoadId  = 0;
+    g_pendingSaveRequesterId = 0; g_pendingSaveReqId = 0; g_pendingSaveReqValid = false;
+    g_pendingLoadRequesterId = 0; g_pendingLoadReqId = 0;
+    g_loadAckPendingId = 0;
+    g_loadAckPendingName.clear();
+    g_lastLoadGoName.clear();
+    g_lastLoadGoFp = 0;
+}
+
+// Phase 10 Plan 01 (SAVE-02): emit the join's positive/negative coordinated-
+// load completion. Join-only (a host never sends this - it IS load-
+// authoritative); safe to call unconditionally, callers gate on !isHost.
+void sendLoadAck(coop::u32 loadId, bool ok) {
+    coop::LoadAckPacket ack;
+    memset(&ack, 0, sizeof(ack));
+    ack.type    = (coop::u8)coop::PKT_LOAD_ACK;
+    ack.ownerId = g_net.localId();
+    ack.loadId  = loadId;
+    ack.ok      = ok ? 1 : 0;
+    g_net.queueLoadAck(ack);
+    char b[96];
+    _snprintf(b, sizeof(b) - 1, "[load] CLIENT owner=%u loadId=%u state=%s",
+              (unsigned)g_net.localId(), loadId, ok ? "loaded" : "failed");
+    b[sizeof(b) - 1] = '\0'; coopLog(b);
+}
+
+// Phase 10 Plan 01 (SAVE-03): build + queue a PKT_COORD_REJECT for a REQ
+// the arbiter just refused, and log the observable verdict (BOTH the
+// rejected AND the currently-active transition's request ids, per SAVE-03's
+// locked decision - the requester may retry after completion).
+void rejectCoordRequest(coop::u32 requesterId, coop::u32 reqId, int kind) {
+    coop::CoordRejectPacket cr;
+    memset(&cr, 0, sizeof(cr));
+    cr.type              = (coop::u8)coop::PKT_COORD_REJECT;
+    cr.requesterId       = requesterId;
+    cr.reqId             = reqId;
+    cr.kind              = (coop::u8)kind;
+    cr.reason            = 0; // busy - the only reason this phase defines
+    cr.activeRequesterId = g_coordArbiter.requesterId;
+    cr.activeReqId       = g_coordArbiter.reqId;
+    g_net.queueCoordReject(cr);
+    char b[176];
+    _snprintf(b, sizeof(b) - 1,
+              "[coord] REJECT requester=%u reqId=%u reason=busy active=%u/%u kind=%s",
+              (unsigned)requesterId, reqId, (unsigned)g_coordArbiter.requesterId,
+              (unsigned)g_coordArbiter.reqId, kind == coop::COORD_SAVE ? "save" : "load");
+    b[sizeof(b) - 1] = '\0'; coopLog(b);
 }
 
 // World-reload session reset (protocol 32): the old world is gone - every
@@ -257,27 +480,89 @@ void sessionResetForWorldReload() {
     g_inbound.flushWorldState();
     g_net.bumpSessionEpoch(); // v44: post-reload batches supersede the old session
     coopLog("[load] inbound world-state queues flushed");
+    // Phase 10 Plan 01 (SAVE-02): the join's coordinated load just went
+    // truly LIVE - emit the positive LOAD_ACK NOW (gameplay-live completion,
+    // not loadSave()'s earlier deferred-issue point; loads take tens of
+    // seconds, so "issued" is not "complete"). Join-only.
+    if (!g_cfg.isHost && g_loadAckPendingId != 0) {
+        sendLoadAck(g_loadAckPendingId, true);
+        g_loadAckPendingId = 0;
+        g_loadAckPendingName.clear();
+    }
 }
 
-// Push-save-on-connect (host): bake a fresh save of the live world and arm the
-// bootstrap so driveSaveSync announces it to the join with a LOAD_GO once the
-// folder quiesces. Called for either connect ordering: a peer connecting while
-// the host is already in-game (processNetEvents), or the host's gameplay
-// starting with a peer already connected (mainLoop_hook gameplay-start edge).
-// Host + saveSync + in-game are the caller's responsibility.
-void armConnectPush() {
+// Push-save-on-connect (host): queue a per-joiner connect-push bootstrap,
+// drained one at a time by driveConnectPushQueue() (below) through the
+// shared CoordArbiter. Called for either connect ordering: a peer connecting
+// while the host is already in-game (processNetEvents), or the host's
+// gameplay starting with a peer already connected (mainLoop_hook gameplay-
+// start edge - one call per already-connected joiner there). Host + saveSync
+// + in-game are the caller's responsibility. Idempotent per id: a joiner
+// already queued or already the active bake/GO is never double-queued.
+void armConnectPush(coop::u32 joinerId) {
+    if (g_session.bootstrapActiveJoiner == joinerId) return;
+    for (std::deque<coop::u32>::const_iterator it = g_session.bootstrapQueue.begin();
+         it != g_session.bootstrapQueue.end(); ++it)
+        if (*it == joinerId) return;
+    g_session.bootstrapQueue.push_back(joinerId);
+    char b[96];
+    _snprintf(b, sizeof(b) - 1, "[boot] queued connect-push for join id=%u",
+              (unsigned)joinerId);
+    b[sizeof(b) - 1] = '\0'; coopLog(b);
+}
+
+// Phase 10 Plan 02 (SAVE-04): drain the per-joiner pending-bootstrap queue,
+// ONE joiner at a time, through the shared CoordArbiter. Called once per
+// tick (host + saveSync gated by the caller, driveSaveSync).
+//
+// Pitfall 3 (10-RESEARCH.md): a queued joiner is DEFERRED while the arbiter
+// is busy with something else - never REJECTed-and-lost the way a client
+// REQ is. A REQ has a requester to notify (PKT_COORD_REJECT) and its own
+// retry lever (press save again); a queued connect-push joiner has neither -
+// losing its slot here would strand it at the title screen forever with no
+// observable failure. Re-offering next tick is the only safe behavior.
+//
+// The offer happens HERE, BEFORE engine::saveGameAs() runs (unlike an
+// organic host-local save, which lets the LATER detour-fired edge do its
+// one-and-only coordOffer) - saveGameAs's disk write can't be undone if the
+// arbiter were to reject the transition after the fact. Accepting first and
+// carrying the SAME (0, reqId) pair forward via g_pendingSave* makes the
+// detour-fired edge's own coordOffer call (driveSaveSync's local-edge loop)
+// an idempotent re-offer of the transition already admitted here.
+void driveConnectPushQueue() {
+    if (g_session.bootstrapQueue.empty()) return;
+    if (g_session.bootstrapActiveJoiner != 0) return; // one bake/GO/load at a time
+    coop::u32 joinerId = g_session.bootstrapQueue.front();
+    coop::u32 reqId = ++g_hostLocalSaveReqCounter;
+    int verdict = coop::coordOffer(g_coordArbiter, coop::COORD_SAVE, 0, reqId);
+    if (verdict != coop::COORD_ACCEPT) return; // DEFER: stay queued, retry next tick
+    g_session.bootstrapQueue.pop_front();
+    g_session.bootstrapActiveJoiner = joinerId;
+    g_pendingSaveRequesterId = 0;
+    g_pendingSaveReqId       = reqId;
+    g_pendingSaveReqValid    = true;
+
     char cur[64];
     cur[0] = '\0';
     coop::engine::saveInfo(cur, sizeof(cur), 0, 0);
     std::string name = cur[0] ? cur : "coopresume";
-    g_bootstrapArmed = true;
-    g_bootstrapName  = name;
-    char b[144];
+    g_bootstrapName = name;
+    char b[176];
     _snprintf(b, sizeof(b) - 1,
-              "[boot] baking save '%s' to push to join on connect", name.c_str());
+              "[boot] baking save '%s' to push to join id=%u on connect",
+              name.c_str(), (unsigned)joinerId);
     b[sizeof(b) - 1] = '\0'; coopLog(b);
-    if (!coop::engine::saveGameAs(name))
+    if (!coop::engine::saveGameAs(name)) {
         coopErr("[boot] connect-push save FAILED to issue");
+        // Roll back so the arbiter and the joiner's slot are freed - re-queue
+        // at the front so this joiner is retried before any other pending
+        // one (never rejected-and-lost).
+        coop::coordComplete(g_coordArbiter);
+        g_session.bootstrapActiveJoiner = 0;
+        g_bootstrapName.clear();
+        g_pendingSaveRequesterId = 0; g_pendingSaveReqId = 0; g_pendingSaveReqValid = false;
+        g_session.bootstrapQueue.push_front(joinerId);
+    }
 }
 
 // Drain peer connect/leave events and surface a single game-thread confirmation
@@ -293,13 +578,66 @@ void processNetEvents(GameWorld* gw) {
                   (unsigned)*it, (unsigned)g_net.localId());
         b[sizeof(b) - 1] = '\0';
         coopLog(b);
+        // Phase 3 Plan 03: track the connected roster so the HOST can build the
+        // authoritative ownership-rank announcement (Replicator::
+        // announceOwnRanks). Harmless no-op bookkeeping on a join
+        // (announceOwnRanks itself is gated to the host role).
+        g_repl.notePeerConnected(*it);
+        // Protocol 58 (Phase 7 review CR-01): the moment a PlayerId slot is
+        // (re)assigned, purge every conservation-plane record keyed to that
+        // id's PREVIOUS connection - a fresh client process restarts its
+        // per-sender counters (transferId/netId/dropId/pickupId) at 1, so
+        // stale "commit is final" / dedup memory from the old connection
+        // would otherwise re-answer or swallow the new connection's keys
+        // (stale verdicts destroying new items; fresh transfer intents
+        // silently dropped). Runs BEFORE tickReplicateApply drains anything
+        // from the new connection (this loop precedes it in mainLoop_hook,
+        // and the handshake connect precedes any data from that peer). A
+        // harmless no-op on a first-ever connect.
+        g_repl.purgeAuthorConservationState(*it);
+        // Phase 10 Plan 01 (SAVE-01/SAVE-02, Rejoin): purge any stale save/
+        // load coordinator entry for this (possibly REUSED) slot BEFORE any
+        // data from the new connection drains - the claimSlots_ dual-hook
+        // rationale (ReplicatorCore.cpp:708-728) applied to the coordinator
+        // maps. A fresh process on a reused slot must never inherit a stale
+        // SC_FAILED/LC_FAILED (or worse, SC_COMMITTED) verdict from the
+        // PREVIOUS occupant of this id. Harmless no-op on a join (its own
+        // g_saveCoord/g_loadCoord stay empty - only the host seeds them).
+        {
+            unsigned int erasedS = coop::saveEraseOwner(g_saveCoord, *it);
+            unsigned int erasedL = coop::loadEraseOwner(g_loadCoord, *it);
+            if (erasedS || erasedL) {
+                char pb[112];
+                _snprintf(pb, sizeof(pb) - 1,
+                          "[coord] connect-edge purge owner=%u save=%u load=%u",
+                          (unsigned)*it, erasedS, erasedL);
+                pb[sizeof(pb) - 1] = '\0'; coopLog(pb);
+            }
+        }
+        // Phase 3 Plan 04 (PEER-02/03, Pitfall 3): per-PlayerId presence set
+        // replacing the single g_peerPresent bool - maintained by this SAME
+        // per-id loop so a later single leave never flips presence for
+        // every other still-connected id.
+        g_connectedPeers.insert(*it);
+        // Ownership-rank re-resolution (Phase 3 Plan 03, OWN-01/OWN-03): a
+        // JOIN's pre-WELCOME default ({1}) is only a guess - the host may
+        // assign any id in [1, MAX_PLAYERS). id==0 here means "the host is
+        // present", which for a join fires exactly once, right after WELCOME
+        // assigned g_net.localId() (NetLink.cpp's WELCOME receive branch pushes
+        // this connect edge) - the first point localId() is authoritative.
+        // Re-resolve to the real rank={localId} default, preserving an
+        // explicit env override exactly like the panel role-switch path
+        // (coopUiConnect, above).
+        if (!g_cfg.isHost && *it == 0) {
+            coop::resolveOwnRanks(g_cfg.ownRanks, g_net.localId(), g_cfg.ownRanksFromEnv);
+            g_repl.setOwnRanks(g_cfg.ownRanks);
+        }
         // Connect-edge resync (protocol 30): re-announce placed buildings and
         // force an immediate resend pass across all change-gated channels, so
         // a late joiner / reconnector converges now instead of waiting out
         // per-channel safety resends (or never minting a pre-connect build).
         if (g_cfg.latejoinSync) g_repl.onPeerConnected(g_net, g_net.localId());
         else coopLog("[latejoin] connect edge seen, resync OFF (gate)");
-        g_peerPresent = true;
         // Coordinated save (protocol 31): while connected under save-sync,
         // the JOIN never writes a save locally - the host's save is
         // authoritative and a local save press forwards as PKT_SAVE_REQ.
@@ -312,32 +650,161 @@ void processNetEvents(GameWorld* gw) {
         // host is NOT yet in-game (title/loading), the gameplay-start edge in
         // mainLoop_hook arms this instead - covers either connect ordering.
         if (g_cfg.isHost && g_cfg.saveSync && g_gameStarted)
-            armConnectPush();
+            armConnectPush(*it);
     }
     for (std::deque<coop::u32>::iterator it = leaves.begin(); it != leaves.end(); ++it) {
         char b[64];
         _snprintf(b, sizeof(b) - 1, "handshake: peer left id=%u", (unsigned)*it);
         b[sizeof(b) - 1] = '\0';
         coopLog(b);
+        // Phase 3 Plan 03: mirror of notePeerConnected above.
+        g_repl.notePeerLeft(*it);
         // Carried-body sync (protocol 18) + furniture occupancy (protocol 19):
         // the departed peer's stream will never author its drop/exit edges -
         // release any carry or occupancy its driven copies still hold.
         if (gw && (g_cfg.carrySync || g_cfg.furnSync)) g_repl.sweepCarries(gw);
-        g_peerPresent = false;
+        // Phase 3 Plan 04 (PEER-02/03, Pitfall 3): per-PlayerId presence set,
+        // not a single bool - a survivor's save/load/connect-push gating
+        // must not flip just because a DIFFERENT peer left.
+        g_connectedPeers.erase(*it);
+        // Phase 2 crash hardening -> Phase 3 Plan 04 owner-scoped rewrite:
+        // clear ONLY this departing id's minted proxies/interp/driven state
+        // (the "join crash -> host follow-on crash" chain) - runs ONCE PER
+        // DEPARTING id, INSIDE this loop. The old code ran this once after
+        // the whole batch under an explicit "we support a single peer"
+        // comment; at N>=3 that would have wiped every survivor's state too.
+        // WR-03 fix: previously `if (gw) ...` skipped this ENTIRE owner-scoped
+        // cleanup call when no GameWorld has ever ticked (g_lastGw == 0, e.g.
+        // a stray connect/disconnect at the title screen) - a behavior change
+        // from the pre-Phase-3 single-argument clearPeerReplicationState(gw),
+        // which unconditionally reached its own resetSession() regardless of
+        // the gw-null guard. clearPeerReplicationState()'s own internal
+        // `if (gw && it->second)` guards already make it safe to call with
+        // gw == 0 (proxyByKey_/worldProxies_/targets_ entries for `departing`
+        // are still erased; there is just nothing live to destroy), so call
+        // it unconditionally and log the no-world case explicitly rather than
+        // silently skipping cleanup.
+        if (!gw) {
+            char nb[96];
+            _snprintf(nb, sizeof(nb) - 1,
+                      "[leave] no GameWorld yet; clearing bookkeeping only for id=%u",
+                      (unsigned)*it);
+            nb[sizeof(nb) - 1] = '\0';
+            coopLog(nb);
+        }
+        g_repl.clearPeerReplicationState(gw, *it);
+        // Phase 10 Plan 01 (SAVE-01/SAVE-02/SAVE-03): a departed client's
+        // in-flight coordinator entry can never again block saveSettled/
+        // loadSettled for the survivors (the "one client's failure never
+        // blocks the others" invariant applied to disconnect, not just
+        // bounded retry). If the departing client held the ACTIVE arbiter
+        // transition, free it now (ABANDON) - otherwise a later requester
+        // would be rejected forever by a transition nobody is left to
+        // complete.
+        {
+            bool heldArbiter = g_coordArbiter.busy && g_coordArbiter.requesterId == *it;
+            unsigned int erasedS = coop::saveEraseOwner(g_saveCoord, *it);
+            unsigned int erasedL = coop::loadEraseOwner(g_loadCoord, *it);
+            if (erasedS || erasedL) {
+                char pb[112];
+                _snprintf(pb, sizeof(pb) - 1,
+                          "[coord] leave-edge purge owner=%u save=%u load=%u",
+                          (unsigned)*it, erasedS, erasedL);
+                pb[sizeof(pb) - 1] = '\0'; coopLog(pb);
+            }
+            if (heldArbiter) {
+                char ab[112];
+                _snprintf(ab, sizeof(ab) - 1,
+                          "[coord] ABANDON active=%u/%u (requester left)",
+                          (unsigned)g_coordArbiter.requesterId, (unsigned)g_coordArbiter.reqId);
+                ab[sizeof(ab) - 1] = '\0'; coopLog(ab);
+                coop::coordComplete(g_coordArbiter);
+                g_saveCoord.active = false;
+                g_loadCoord.active = false;
+            }
+            // Phase 10 review WR-03: purge the departing id from the
+            // connect-push pipeline too - a ghost bootstrap would bake a
+            // full save + unicast a GO to a nonexistent peer (or, worse, to
+            // a REASSIGNED slot), then hold the arbiter busy through
+            // retries x timeout while every player REQ is rejected. The
+            // bootstrap's own arbiter record has requesterId=0, so the
+            // heldArbiter check above never covers it.
+            for (std::deque<coop::u32>::iterator qit = g_session.bootstrapQueue.begin();
+                 qit != g_session.bootstrapQueue.end(); ) {
+                if (*qit == *it) {
+                    char qb[112];
+                    _snprintf(qb, sizeof(qb) - 1,
+                              "[boot] queued connect-push for join id=%u dropped (peer left)",
+                              (unsigned)*it);
+                    qb[sizeof(qb) - 1] = '\0'; coopLog(qb);
+                    qit = g_session.bootstrapQueue.erase(qit);
+                } else {
+                    ++qit;
+                }
+            }
+            // Phase 10 review WR-08: drop the departing owner's queued
+            // fallback transfer too - streaming a save to a gone (or
+            // reassigned) slot is at best wasted upload.
+            for (std::deque<std::pair<coop::u32, std::string> >::iterator xit =
+                     g_loadXferQueue.begin(); xit != g_loadXferQueue.end(); ) {
+                if (xit->first == *it) xit = g_loadXferQueue.erase(xit);
+                else ++xit;
+            }
+            if (g_session.bootstrapActiveJoiner == *it) {
+                char abj[128];
+                _snprintf(abj, sizeof(abj) - 1,
+                          "[boot] active bootstrap joiner id=%u left - bake abandoned",
+                          (unsigned)*it);
+                abj[sizeof(abj) - 1] = '\0'; coopLog(abj);
+                g_session.bootstrapActiveJoiner = 0;
+                g_bootstrapName.clear();
+                // If the bake is between saveGameAs and quiescence, the
+                // quiescence edge now sees bootstrapActiveJoiner == 0 and
+                // settles through the broadcast/no-peer branch (which frees
+                // the arbiter) instead of unicasting a GO to nobody. The
+                // GO-already-sent case needs nothing here: loadEraseOwner
+                // above emptied LoadCoord, loadSettled turns vacuously true,
+                // and driveLoadSync's settle edge frees the arbiter.
+            }
+        }
         // Coordinated save: disconnected = solo again; local saves must work.
         if (!g_cfg.isHost && g_cfg.saveSync) {
             coop::engine::setSaveSuppress(false);
             coopLog("[save] JOIN save suppression OFF (peer left)");
         }
     }
-    // Phase 2 crash hardening: a peer drop leaves this side's minted proxies
-    // standing AND its drive maps pointing at bodies with no fresh authority
-    // (the engine will eventually reap them, and the next drive touches a freed
-    // pointer - the "join crash -> host follow-on crash" chain). Despawn the
-    // minted proxies and clear the peer maps, mirroring coopUiDisconnect(). Runs
-    // once per leave batch (we support a single peer).
+    // Phase 3 Plan 03 (OWN-01/OWN-03, T-03-06): HOST re-announces the
+    // authoritative ownership-rank map whenever roster membership changed this
+    // drain (no-op on a join - announceOwnRanks is gated to isHostRole()).
+    // The dynamic-tab-set trigger lives in ReplicatorPublish.cpp's publishOwned
+    // (tabsChanged_), so BOTH change classes reach the wire per the plan.
+    if (g_cfg.isHost && (!conns.empty() || !leaves.empty()))
+        g_repl.announceOwnRanks(g_net, g_net.localId());
+
+    // Phase 3 Plan 03 (client apply path): drain host-announced ownership-rank
+    // maps and apply via setAllOwnRanks. T-03-06: this is the ONLY path that
+    // ever writes Replicator::allOwnRanks_ - a client never authors its own
+    // entry, only applies what the host broadcasts.
+    std::deque<coop::InboundOwnRanks> ownRanksMsgs;
+    g_inbound.drainOwnRanks(ownRanksMsgs);
+    for (std::deque<coop::InboundOwnRanks>::iterator it = ownRanksMsgs.begin();
+         it != ownRanksMsgs.end(); ++it) {
+        std::map<coop::u32, std::set<unsigned int> > m;
+        for (unsigned int i = 0; i < it->pkt.count && i < coop::MAX_PLAYERS; ++i) {
+            std::set<unsigned int> ranks;
+            coop::maskToRanks(it->pkt.entries[i].rankMask, ranks);
+            m[it->pkt.entries[i].playerId] = ranks;
+        }
+        g_repl.setAllOwnRanks(m);
+    }
+
+    // flushWorldState() is a genuinely GLOBAL flush (Inbound.h: every WorldQ
+    // clears unconditionally, with no owner filter - Class D-style queues
+    // carry no per-owner scoping to filter on) - it stays ONE call per leave
+    // BATCH, matching its own structural (not per-peer) contract. The
+    // per-owner cleanup itself now runs inside the leaves loop above, once
+    // per departing id (Phase 3 Plan 04).
     if (!leaves.empty()) {
-        g_repl.clearPeerReplicationState(gw);
         g_inbound.flushWorldState();
     }
 }
@@ -350,21 +817,49 @@ void processNetEvents(GameWorld* gw) {
 // being copy-pasted into both. Emits no log line, so the oracle log contract is
 // unaffected by the extraction.
 void pumpSaveReceive() {
+    // Phase 11 (11-03 live matrix, runs 20260905_130015/131934_N4; completed
+    // by review WR-02): drain the three queues in REVERSE wire order (dones,
+    // then begins, then chunks) and process them in wire order (begins, then
+    // chunks, then dones). The net thread pushes BEGIN, FILE chunks and the
+    // terminal DONE into three SEPARATE queues in wire order; the original
+    // drain order (chunks first, dones second) opened a race: a DONE arriving
+    // in the window between the two drains was processed THIS tick while the
+    // tail chunks that preceded it on the wire (pushed into the chunk queue
+    // in that same window, after the chunk drain) were still queued -
+    // onSaveDone computed its verdict with the tail missing (measured live:
+    // shortfalls of exactly the final 1-3 chunks - 2058 = the last partial
+    // chunk, 10250 = 4096+4096+2058) and its FAIL set g_recvActive=false, so
+    // the queued tail was then silently discarded as stale next tick, burning
+    // a coordinator retry per hit. The 11-03 fix drained DONEs before chunks,
+    // which closed the chunk/DONE pair - but BEGINs were still drained FIRST,
+    // leaving the same race open one queue earlier (review WR-02): a SMALL
+    // save whose whole BEGIN+chunks+DONE burst lands between the begin drain
+    // and the done drain had its DONE processed this tick with no receive
+    // armed (NACK for an intact transfer) and its BEGIN processed NEXT tick,
+    // arming a receive whose chunks and DONE were already consumed - wedged
+    // until the coordinator's load-plane deadline re-armed it. Draining DONEs
+    // FIRST and BEGINs SECOND closes the race for all three queues: a DONE
+    // only enters this tick's batch if it was ALREADY pushed when the done
+    // drain ran, and the ordered bulk channel guarantees its BEGIN and every
+    // chunk that preceded it on the wire were pushed before it - all captured
+    // by the LATER begin/chunk drains and processed below, in wire order,
+    // before the DONE verdict runs.
+    std::deque<coop::InboundSaveDone> dones;
+    g_inbound.drainSaveDones(dones);
+
     std::deque<coop::InboundSaveBegin> begins;
     g_inbound.drainSaveBegins(begins);
-    for (std::deque<coop::InboundSaveBegin>::iterator it = begins.begin();
-         it != begins.end(); ++it)
-        coop::savexfer::onSaveBegin(it->pkt);
 
     std::deque<coop::InboundSaveFile> chunks;
     g_inbound.drainSaveFiles(chunks);
+
+    for (std::deque<coop::InboundSaveBegin>::iterator it = begins.begin();
+         it != begins.end(); ++it)
+        coop::savexfer::onSaveBegin(it->pkt);
     for (std::deque<coop::InboundSaveFile>::iterator it = chunks.begin();
          it != chunks.end(); ++it)
         coop::savexfer::onSaveFile(it->hdr, it->path.c_str(),
                                    it->data.empty() ? 0 : &it->data[0]);
-
-    std::deque<coop::InboundSaveDone> dones;
-    g_inbound.drainSaveDones(dones);
     for (std::deque<coop::InboundSaveDone>::iterator it = dones.begin();
          it != dones.end(); ++it) {
         coop::u16 files = 0;
@@ -398,14 +893,55 @@ void pumpSaveReceive() {
 // drives a coordinated save). Received BEGIN/FILE/DONE stage + verify +
 // commit the host's folder; the ACK reports the outcome.
 void driveSaveSync() {
+    // Phase 10 Plan 02 (SAVE-04): drain the per-joiner pending-bootstrap
+    // queue BEFORE this tick's local save edges - a bootstrap's own
+    // saveGameAs() call (inside driveConnectPushQueue) is what SEEDS this
+    // tick's (or a later one's) edges[] loop entry below.
+    if (g_cfg.isHost && g_cfg.saveSync) driveConnectPushQueue();
+
     // Local save edges from the detour (max 8 queued per tick).
     coop::engine::SaveEdge edges[8];
     unsigned int nEdges = coop::engine::drainSaveEdges(edges, 8);
     for (unsigned int i = 0; i < nEdges; ++i) {
         std::string name = edges[i].name[0] ? edges[i].name : "coopresume";
         if (g_cfg.isHost) {
-            g_savePending = name;
-            coop::savexfer::armWatch(name);
+            // Phase 10 Plan 01 (SAVE-03): every host-local save edge (menu/
+            // quicksave/autosave/connect-push) offers to the shared arbiter
+            // before arming the watch. A REQ-admitted save carries its
+            // (requesterId,reqId) forward via the pending scalars (an
+            // idempotent re-offer of the SAME transition); a genuinely
+            // organic edge mints its OWN fresh reqId, so an autosave firing
+            // during an already-active transition is a DIFFERENT offer and
+            // is correctly REJECTED (Pitfall 5) rather than treated as a
+            // re-offer of it.
+            coop::u32 reqOwner, reqId;
+            if (g_pendingSaveReqValid) {
+                reqOwner = g_pendingSaveRequesterId;
+                reqId    = g_pendingSaveReqId;
+            } else {
+                reqOwner = 0;
+                reqId    = ++g_hostLocalSaveReqCounter;
+            }
+            g_pendingSaveRequesterId = 0; g_pendingSaveReqId = 0; g_pendingSaveReqValid = false;
+            int verdict = coop::coordOffer(g_coordArbiter, coop::COORD_SAVE, reqOwner, reqId);
+            if (verdict == coop::COORD_ACCEPT) {
+                g_savePending = name;
+                coop::savexfer::armWatch(name);
+            } else {
+                // A REQ-triggered edge losing the race here would mean the
+                // REQ drain's own earlier coordOffer accepted it - the
+                // idempotent-match rule above makes that structurally
+                // unreachable, so only a genuinely organic edge (host-local,
+                // reqOwner==0) ever lands here.
+                char rb[176];
+                _snprintf(rb, sizeof(rb) - 1,
+                          "[coord] REJECT requester=0 reqId=%u reason=busy active=%u/%u kind=%s "
+                          "(save not re-armed)",
+                          reqId, (unsigned)g_coordArbiter.requesterId,
+                          (unsigned)g_coordArbiter.reqId,
+                          g_coordArbiter.kind == coop::COORD_SAVE ? "save" : "load");
+                rb[sizeof(rb) - 1] = '\0'; coopLog(rb);
+            }
         } else if (edges[i].suppressed && !edges[i].autosave) {
             coop::SaveReqPacket rq;
             memset(&rq, 0, sizeof(rq));
@@ -431,13 +967,28 @@ void driveSaveSync() {
             char name[sizeof(it->pkt.name) + 1];
             memcpy(name, it->pkt.name, sizeof(it->pkt.name));
             name[sizeof(it->pkt.name)] = '\0';
-            char b[144];
-            _snprintf(b, sizeof(b) - 1,
-                      "[save] REQ from join id=%u name='%s' -> saving",
-                      it->pkt.reqId, name);
-            b[sizeof(b) - 1] = '\0'; coopLog(b);
-            if (!coop::engine::saveGameAs(name[0] ? name : "coopresume"))
-                coopErr("[save] join-requested save FAILED to issue");
+            // Phase 10 Plan 01 (SAVE-03): offer to the shared arbiter BEFORE
+            // ever calling engine::saveGameAs - a rejected REQ must not
+            // trigger an unwanted disk write. On accept, remember
+            // (ownerId,reqId) so the resulting detour-fired local edge (a
+            // tick or more later, saveGameAs is deferred) re-offers the SAME
+            // transition idempotently instead of colliding with it.
+            int verdict = coop::coordOffer(g_coordArbiter, coop::COORD_SAVE,
+                                           it->pkt.ownerId, it->pkt.reqId);
+            if (verdict == coop::COORD_ACCEPT) {
+                char b[144];
+                _snprintf(b, sizeof(b) - 1,
+                          "[save] REQ from join id=%u name='%s' -> saving",
+                          it->pkt.reqId, name);
+                b[sizeof(b) - 1] = '\0'; coopLog(b);
+                g_pendingSaveRequesterId = it->pkt.ownerId;
+                g_pendingSaveReqId       = it->pkt.reqId;
+                g_pendingSaveReqValid    = true;
+                if (!coop::engine::saveGameAs(name[0] ? name : "coopresume"))
+                    coopErr("[save] join-requested save FAILED to issue");
+            } else {
+                rejectCoordRequest(it->pkt.ownerId, it->pkt.reqId, coop::COORD_SAVE);
+            }
         }
 
         // Quiescence watch -> start the transfer once the save is on disk.
@@ -453,13 +1004,42 @@ void driveSaveSync() {
                           rc == 1 ? "settled" : "timeout", g_savePending.c_str(),
                           files, bytes, waited);
                 b[sizeof(b) - 1] = '\0'; coopLog(b);
-                if (g_bootstrapArmed && g_savePending == g_bootstrapName) {
-                    // Connect-push: announce the freshly-baked save with a
-                    // LOAD_GO instead of a blind stream. The join loads it
-                    // directly if its on-disk copy matches the fingerprint;
-                    // otherwise it NACKs and driveLoadSync's fallback transfer
-                    // streams the folder before the join loads. Reuses the
-                    // whole existing LOAD_GO/NACK/transfer/commit machinery.
+                // Phase 10 review CR-02 (second trigger): if an organic/
+                // autosave edge drained BEFORE the bootstrap's own detour
+                // edge in the same edges[] batch, it consumed the bake's
+                // pending (0,reqId) pair and armed the watch for its OWN
+                // name - so quiescence fires here with g_savePending !=
+                // g_bootstrapName while the bootstrap latch is still set.
+                // The bake this joiner waits on will never quiesce: requeue
+                // the joiner (front) and clear the latch, then fall through
+                // to the broadcast branch for the organic save itself. The
+                // queue re-drains this joiner once the arbiter frees.
+                if (g_session.bootstrapActiveJoiner != 0 && g_savePending != g_bootstrapName) {
+                    char hb[160];
+                    _snprintf(hb, sizeof(hb) - 1,
+                              "[boot] bake for join id=%u hijacked by organic save '%s' - requeued",
+                              (unsigned)g_session.bootstrapActiveJoiner, g_savePending.c_str());
+                    hb[sizeof(hb) - 1] = '\0'; coopLog(hb);
+                    g_session.bootstrapQueue.push_front(g_session.bootstrapActiveJoiner);
+                    g_session.bootstrapActiveJoiner = 0;
+                    g_bootstrapName.clear();
+                }
+                if (g_session.bootstrapActiveJoiner != 0 && g_savePending == g_bootstrapName) {
+                    // Phase 10 Plan 02 (SAVE-04): connect-push, joiner-
+                    // unicast. Announce the freshly-baked save with a
+                    // LOAD_GO targeted at ONLY the joiner this bake was for
+                    // (destId=joinerId) - established players never see this
+                    // packet (the reload-storm fix; Plugin.cpp's MATCH arm
+                    // stays unconditional, survivors are safe because the GO
+                    // never reaches them, not because of a receiver-side
+                    // skip - the host mid-session load edge below keeps its
+                    // OWN separate broadcast GO). The join loads it directly
+                    // if its on-disk copy matches the fingerprint; otherwise
+                    // it NACKs and driveLoadSync's fallback transfer streams
+                    // the folder to that SAME joiner (destId scoped there
+                    // too). Reuses the whole existing LOAD_GO/NACK/transfer/
+                    // commit machinery.
+                    coop::u32 joinerId = g_session.bootstrapActiveJoiner;
                     coop::LoadGoPacket go;
                     memset(&go, 0, sizeof(go));
                     go.type        = (coop::u8)coop::PKT_LOAD_GO;
@@ -467,21 +1047,73 @@ void driveSaveSync() {
                     go.loadId      = ++g_loadIdOut;
                     go.fingerprint = coop::savexfer::folderFingerprint(g_bootstrapName);
                     strncpy(go.name, g_bootstrapName.c_str(), sizeof(go.name) - 1);
-                    g_net.queueLoadGo(go);
+                    g_net.queueLoadGo(go, joinerId);
                     g_loadPumpArmTick = GetTickCount();
-                    char b2[192];
+                    g_lastLoadGoName = g_bootstrapName;
+                    g_lastLoadGoFp   = go.fingerprint;
+                    char b2[224];
                     _snprintf(b2, sizeof(b2) - 1,
-                              "[boot] GO->join id=%u name='%s' fp=%08x (push on connect)",
-                              go.loadId, g_bootstrapName.c_str(), go.fingerprint);
+                              "[boot] GO->join id=%u dest=%u name='%s' fp=%08x (push on connect)",
+                              go.loadId, (unsigned)joinerId, g_bootstrapName.c_str(), go.fingerprint);
                     b2[sizeof(b2) - 1] = '\0'; coopLog(b2);
                     warnIfNoPortraits(g_bootstrapName);
-                    g_bootstrapArmed = false;
+                    g_session.bootstrapActiveJoiner = 0;
                     g_bootstrapName.clear();
                     g_savePending.clear();
-                } else if (g_peerPresent)
-                    coop::savexfer::beginSend(g_net, g_net.localId(), g_savePending);
-                else
+                    // Phase 10 Plan 01/02 (SAVE-01/02/03/04): the SAVE half
+                    // of this admission is done at quiescence - no per-
+                    // client transfer/ACKs to wait for (g_saveCoord is never
+                    // seeded for a bootstrap bake). Free it, then re-offer
+                    // the LOAD half host-locally so the arbiter STAYS BUSY
+                    // until THIS joiner's coordinated load (per-client
+                    // tracked via LoadCoord, exactly like a general host
+                    // mid-session load) settles - the Plan 01 retry/drop
+                    // machinery (bounded unicast retry, then kickPeer) now
+                    // applies to a stranded bootstrap joiner too, and the
+                    // next queued joiner (if any) only starts baking once
+                    // this one's LC_LOADED/LC_DROPPED frees the arbiter
+                    // (driveLoadSync's existing loadSettled -> coordComplete
+                    // at the bottom of the host branch).
+                    coop::coordComplete(g_coordArbiter);
+                    coop::u32 bootLoadReqId = ++g_hostLocalLoadReqCounter;
+                    coop::coordOffer(g_coordArbiter, coop::COORD_LOAD, 0, bootLoadReqId);
+                    std::set<coop::u32> joinerOnly;
+                    joinerOnly.insert(joinerId);
+                    // Phase 10 review CR-03: the load plane's own deadline
+                    // floor (covers GO + reloads + a possible fallback
+                    // transfer), not the save plane's 30 s ACK floor.
+                    coop::loadBegin(g_loadCoord, go.loadId, joinerOnly,
+                                    (unsigned long)GetTickCount(), g_cfg.loadAckTimeoutMs);
+                } else if (!g_connectedPeers.empty()) {
+                    // Phase 10 Plan 01 (SAVE-01): the coordinated broadcast
+                    // save seeds SaveCoord against every CURRENTLY connected
+                    // client (destId=OWNER_ID_ALL keeps the existing
+                    // broadcast path byte-for-byte unchanged at N=2) - the
+                    // per-client tracer path this task proves end-to-end.
+                    if (coop::savexfer::beginSend(g_net, g_net.localId(), g_savePending)) {
+                        // Size-scaled deadline (SAVE-01): the configured
+                        // floor, or totalBytes/2.5MBps*3 for a large save -
+                        // whichever is greater, so a genuinely slow-but-
+                        // healthy transfer is never mistaken for a dead
+                        // client.
+                        unsigned __int64 totalBytes = coop::savexfer::sendTotalBytes();
+                        double scaledSec = ((double)totalBytes / (2.5 * 1024.0 * 1024.0)) * 3.0;
+                        unsigned long scaledMs = (unsigned long)(scaledSec * 1000.0);
+                        unsigned long timeoutMs =
+                            (scaledMs > g_cfg.saveAckTimeoutMs) ? scaledMs : g_cfg.saveAckTimeoutMs;
+                        coop::saveBegin(g_saveCoord, coop::savexfer::sendXferId(),
+                                        g_connectedPeers, (unsigned long)GetTickCount(), timeoutMs);
+                    } else {
+                        // beginSend refused (missing/empty folder) - nothing
+                        // to coordinate; free the arbiter rather than
+                        // leaving it permanently busy.
+                        coopErr("[save] beginSend refused; freeing the arbiter");
+                        coop::coordComplete(g_coordArbiter);
+                    }
+                } else {
                     coopLog("[save] no peer connected; transfer skipped");
+                    coop::coordComplete(g_coordArbiter); // nothing to coordinate
+                }
             }
         }
         // Paced chunk pump for an in-flight transfer.
@@ -500,11 +1132,142 @@ void driveSaveSync() {
                       (unsigned)it->pkt.files, it->pkt.bytes);
             b[sizeof(b) - 1] = '\0';
             if (it->pkt.ok) coopLog(b); else coopErr(b);
+            // Legacy singular scalar: kept for the existing 2-player scenario
+            // gate accessors (ScenarioSession.cpp/ScenarioWorldItems.cpp read
+            // savexfer::lastAckXferId()/lastAckOk()) - 1-host+1-join parity
+            // through the SAME generalized code means this call stays.
             coop::savexfer::noteAck(it->pkt.xferId, it->pkt.ok ? 1 : 0);
+            // Phase 10 Plan 01 (SAVE-01): the per-owner ACK drain the old
+            // scalar above could never provide - STOP discarding
+            // it->pkt.ownerId. saveNoteAck ignores a stale xferId (a client
+            // acking a superseded transfer can never undo a later state).
+            char cb[144];
+            int newState = coop::saveNoteAck(g_saveCoord, it->pkt.ownerId, it->pkt.xferId,
+                                             it->pkt.ok != 0, (unsigned long)GetTickCount());
+            _snprintf(cb, sizeof(cb) - 1, "[save] CLIENT owner=%u xferId=%u state=%s",
+                      (unsigned)it->pkt.ownerId, it->pkt.xferId,
+                      newState == coop::SC_COMMITTED ? "committed" :
+                      newState == coop::SC_FAILED    ? "failed" : "unknown");
+            cb[sizeof(cb) - 1] = '\0'; coopLog(cb);
+        }
+
+        // Phase 10 Plan 01 (SAVE-01): the per-tick retry/drop decision - one
+        // client's failed/silent transfer never blocks the others, and never
+        // implies the group committed (saveSettled requires EVERY tracked
+        // client COMMITTED or DROPPED).
+        // Phase 10 review WR-02: SaveXfer is ONE serialized sender
+        // (SaveXfer.h's "one transfer at a time" contract) - a second
+        // beginSend in the same tick tears down the first stream mid-flight,
+        // so (a) retry/drop decisions only run while the sender is IDLE (a
+        // deadline can't meaningfully expire while its own stream is still
+        // being paced out), and (b) at most ONE owner's retry stream begins
+        // per tick; the rest are deferred WITHOUT burning their retry budget
+        // (saveDeferRetry refunds the bump saveTick made) and re-flagged on
+        // the next idle tick.
+        if (!coop::savexfer::sending()) {
+            std::vector<coop::u32> retryOwners, dropOwners;
+            coop::saveTick(g_saveCoord, (unsigned long)GetTickCount(), g_cfg.saveRetries,
+                          g_cfg.saveAckTimeoutMs, retryOwners, dropOwners);
+            for (size_t i = 0; i < retryOwners.size(); ++i) {
+                coop::u32 owner = retryOwners[i];
+                if (i > 0) {
+                    // WR-02: the sender is now busy with retryOwners[0]'s
+                    // stream - defer, refunding the retry just charged.
+                    coop::saveDeferRetry(g_saveCoord, owner, (unsigned long)GetTickCount());
+                    continue;
+                }
+                // Phase 10 review CR-01: beginSend mints a FRESH xferId
+                // (++g_sendXferId) even for a retry - retag the coordinator's
+                // tracked id to it (the loadRetagRetryId precedent applied to
+                // the save plane), else this client's retry ACK is judged
+                // stale by saveNoteAck and a fully successful retry still
+                // ends in a kick. Size-scale the retry deadline the same way
+                // the initial broadcast's saveBegin deadline was.
+                coop::u32 logXferId = g_saveCoord.xferId;
+                if (coop::savexfer::beginSend(g_net, g_net.localId(), g_savePending, owner)) {
+                    unsigned __int64 totalBytes = coop::savexfer::sendTotalBytes();
+                    double scaledSec = ((double)totalBytes / (2.5 * 1024.0 * 1024.0)) * 3.0;
+                    unsigned long scaledMs = (unsigned long)(scaledSec * 1000.0);
+                    unsigned long timeoutMs =
+                        (scaledMs > g_cfg.saveAckTimeoutMs) ? scaledMs : g_cfg.saveAckTimeoutMs;
+                    coop::saveRetagRetryId(g_saveCoord, owner, coop::savexfer::sendXferId(),
+                                           (unsigned long)GetTickCount(), timeoutMs);
+                    logXferId = coop::savexfer::sendXferId();
+                }
+                // Phase 10 review IN-03: logged AFTER beginSend so xferId is
+                // the retry stream's REAL (fresh) id, not the stale group id;
+                // retry=N is the 1-based attempt count (post-bump).
+                char rb[144];
+                std::map<coop::u32, coop::SaveClient>::const_iterator cit =
+                    g_saveCoord.clients.find(owner);
+                unsigned int retries = (cit != g_saveCoord.clients.end()) ? cit->second.retries : 0;
+                _snprintf(rb, sizeof(rb) - 1,
+                          "[save] CLIENT owner=%u xferId=%u state=streaming retry=%u",
+                          (unsigned)owner, logXferId, retries);
+                rb[sizeof(rb) - 1] = '\0'; coopLog(rb);
+            }
+            for (size_t i = 0; i < dropOwners.size(); ++i) {
+                coop::u32 owner = dropOwners[i];
+                char db[144];
+                std::map<coop::u32, coop::SaveClient>::const_iterator cit =
+                    g_saveCoord.clients.find(owner);
+                unsigned int retries = (cit != g_saveCoord.clients.end()) ? cit->second.retries : 0;
+                _snprintf(db, sizeof(db) - 1, "[save] DROP owner=%u xferId=%u retries=%u",
+                          (unsigned)owner, g_saveCoord.xferId, retries);
+                db[sizeof(db) - 1] = '\0'; coopErr(db);
+                g_net.kickPeer(owner);
+            }
+        }
+
+        // Phase 10 Plan 01 (SAVE-03): free the arbiter once EVERY tracked
+        // client has independently reached a terminal state (saveSettled) -
+        // g_saveCoord.active guards against re-firing coordComplete every
+        // tick once already settled.
+        // Phase 10 review WR-01: only free an arbiter the SAVE plane still
+        // OWNS - a host load may have preempted mid-save (coordOffer
+        // overwrites the record to COORD_LOAD), and an orphaned save
+        // settling then must not free the LOAD transition still in flight
+        // (that would let a new offer run concurrently with it, and its
+        // beginSend would abort the load's fallback transfer mid-stream).
+        if (g_saveCoord.active && coop::saveSettled(g_saveCoord)) {
+            if (g_coordArbiter.busy && g_coordArbiter.kind == coop::COORD_SAVE)
+                coop::coordComplete(g_coordArbiter);
+            else
+                coopLog("[coord] save settled but arbiter is owned by another "
+                        "transition - not freed (preempted)");
+            g_saveCoord.active = false;
         }
     } else {
         // Receiver half: stage, verify, commit, acknowledge (shared pump).
         pumpSaveReceive();
+
+        // Phase 10 Plan 01 (SAVE-03): this join's own SaveReq/LoadReq lost
+        // the arbitration race - the observable requester-visible receipt
+        // (the requester may retry after the active transition completes).
+        std::deque<coop::InboundCoordReject> rejects;
+        g_inbound.drainCoordRejects(rejects);
+        for (std::deque<coop::InboundCoordReject>::iterator it = rejects.begin();
+             it != rejects.end(); ++it) {
+            char b[176];
+            _snprintf(b, sizeof(b) - 1,
+                      "[coord] REJECTED reqId=%u kind=%s active=%u/%u",
+                      it->pkt.reqId,
+                      it->pkt.kind == (coop::u8)coop::COORD_SAVE ? "save" : "load",
+                      (unsigned)it->pkt.activeRequesterId, (unsigned)it->pkt.activeReqId);
+            b[sizeof(b) - 1] = '\0';
+            // 10-04 live gate finding: this is the OTHER HALF of the SAME
+            // by-design first-wins arbitration event the host logs at INFO
+            // (rejectCoordRequest's symmetric "[coord] REJECT ..." above,
+            // coopLog) - a requester losing the race is the CORRECT, EXPECTED
+            // SAVE-03 outcome (the requester may retry), not a defect. It was
+            // logged via coopErr, which the generic Test-LogHealth gate
+            // (CoreChecks.ps1, "any ERROR: line = unhealthy") treats as an
+            // unconditional failure - so ANY session that legitimately
+            // exercises concurrent-save arbitration (this scenario's Leg R,
+            // or two real players saving moments apart) could never pass a
+            // clean-log health check. Matches the host-side severity.
+            coopLog(b);
+        }
     }
 }
 
@@ -534,9 +1297,67 @@ void driveLoadSync(GameWorld* gw) {
             // The title-screen auto-load precedes gameplay (and any peer) -
             // only a MID-SESSION load edge coordinates.
             if (!g_gameStarted) continue;
+            // Phase 10 Plan 01 (SAVE-03): offer to the shared arbiter. A
+            // HOST-issued load ALWAYS preempts a busy arbiter (coordOffer's
+            // kind==COORD_LOAD && requesterId==0 rule - the existing
+            // abortAll supersede-a-save behavior, generalized); a REQ-
+            // admitted load carries its (requesterId,reqId) forward via the
+            // pending scalars for an idempotent re-offer, exactly like the
+            // save side.
+            coop::u32 reqOwner, reqId;
+            if (g_pendingLoadRequesterId != 0) {
+                reqOwner = g_pendingLoadRequesterId;
+                reqId    = g_pendingLoadReqId;
+            } else {
+                reqOwner = 0;
+                reqId    = ++g_hostLocalLoadReqCounter;
+            }
+            g_pendingLoadRequesterId = 0; g_pendingLoadReqId = 0;
+            coop::coordOffer(g_coordArbiter, coop::COORD_LOAD, reqOwner, reqId);
             // A load supersedes any in-flight save coordination.
             coop::savexfer::abortAll();
             g_savePending.clear();
+            // Phase 10 review CR-04: the preempted save plane's per-client
+            // entries must not keep ticking - their transfer was just
+            // aborted and g_savePending emptied, so an orphaned entry would
+            // expire, retry beginSend("") (which resolves to the save ROOT),
+            // and either mass-stream the whole library or burn the innocent
+            // client's retries into a kick. Terminate the plane outright;
+            // the arbiter record was already overwritten to this load
+            // transition by the preempting coordOffer above (WR-01's settle
+            // guard keeps the orphan from freeing the load's arbiter).
+            if (!g_saveCoord.clients.empty()) {
+                char sb[112];
+                _snprintf(sb, sizeof(sb) - 1,
+                          "[save] PREEMPTED xferId=%u clients=%u (host load supersedes)",
+                          (unsigned)g_saveCoord.xferId,
+                          (unsigned)g_saveCoord.clients.size());
+                sb[sizeof(sb) - 1] = '\0'; coopLog(sb);
+            }
+            g_saveCoord.clients.clear();
+            g_saveCoord.active = false;
+            // Phase 10 review CR-02: abortAll() just disarmed the quiescence
+            // watch - the ONLY edge that clears the active-bootstrap latch.
+            // If a connect-push bake was in flight (between saveGameAs and
+            // quiescence), that latch would stay nonzero FOREVER and
+            // driveConnectPushQueue would never drain another joiner (the
+            // Pitfall 3 "stranded at the title screen with no observable
+            // failure" outcome). Requeue the joiner at the FRONT so its
+            // bootstrap re-bakes once this load's transition settles, and
+            // drop the bake's pending (0,reqId) carry-forward so it can't
+            // mislabel a future organic edge.
+            if (g_session.bootstrapActiveJoiner != 0) {
+                char bb[128];
+                _snprintf(bb, sizeof(bb) - 1,
+                          "[boot] bake for join id=%u preempted by host load - requeued",
+                          (unsigned)g_session.bootstrapActiveJoiner);
+                bb[sizeof(bb) - 1] = '\0'; coopLog(bb);
+                g_session.bootstrapQueue.push_front(g_session.bootstrapActiveJoiner);
+                g_session.bootstrapActiveJoiner = 0;
+                g_bootstrapName.clear();
+                g_pendingSaveRequesterId = 0; g_pendingSaveReqId = 0;
+                g_pendingSaveReqValid    = false;
+            }
             coop::LoadGoPacket go;
             memset(&go, 0, sizeof(go));
             go.type        = (coop::u8)coop::PKT_LOAD_GO;
@@ -552,6 +1373,14 @@ void driveLoadSync(GameWorld* gw) {
                       go.loadId, name.c_str(), go.fingerprint);
             b[sizeof(b) - 1] = '\0'; coopLog(b);
             warnIfNoPortraits(name);
+            // Phase 10 Plan 01 (SAVE-02): seed the per-client load state
+            // machine + remember this GO's payload for a per-client retry.
+            g_lastLoadGoName = name;
+            g_lastLoadGoFp   = go.fingerprint;
+            // Phase 10 review CR-03: load-plane deadline floor (see Config.h
+            // loadAckTimeoutMs) - the GO must survive the join's own reload.
+            coop::loadBegin(g_loadCoord, go.loadId, g_connectedPeers,
+                            (unsigned long)GetTickCount(), g_cfg.loadAckTimeoutMs);
         } else if (edges[i].suppressed) {
             // Forward the swallowed manual load for host arbitration.
             coop::LoadReqPacket rq;
@@ -591,13 +1420,25 @@ void driveLoadSync(GameWorld* gw) {
                 b[sizeof(b) - 1] = '\0'; coopErr(b);
                 continue;
             }
-            char b[144];
-            _snprintf(b, sizeof(b) - 1,
-                      "[load] REQ from join id=%u name='%s' -> loading",
-                      it->pkt.reqId, name);
-            b[sizeof(b) - 1] = '\0'; coopLog(b);
-            if (!coop::engine::loadSave(name))
-                coopErr("[load] join-requested load FAILED to issue");
+            // Phase 10 Plan 01 (SAVE-03): offer to the shared arbiter BEFORE
+            // ever calling engine::loadSave. On accept, remember
+            // (ownerId,reqId) so the detour-fired local edge re-offers the
+            // SAME transition idempotently.
+            int verdict = coop::coordOffer(g_coordArbiter, coop::COORD_LOAD,
+                                           it->pkt.ownerId, it->pkt.reqId);
+            if (verdict == coop::COORD_ACCEPT) {
+                char b[144];
+                _snprintf(b, sizeof(b) - 1,
+                          "[load] REQ from join id=%u name='%s' -> loading",
+                          it->pkt.reqId, name);
+                b[sizeof(b) - 1] = '\0'; coopLog(b);
+                g_pendingLoadRequesterId = it->pkt.ownerId;
+                g_pendingLoadReqId       = it->pkt.reqId;
+                if (!coop::engine::loadSave(name))
+                    coopErr("[load] join-requested load FAILED to issue");
+            } else {
+                rejectCoordRequest(it->pkt.ownerId, it->pkt.reqId, coop::COORD_LOAD);
+            }
         }
 
         // NACKs: the join can't load our save - stream it the folder once
@@ -610,10 +1451,21 @@ void driveLoadSync(GameWorld* gw) {
             memcpy(name, it->pkt.name, sizeof(it->pkt.name));
             name[sizeof(it->pkt.name)] = '\0';
             char b[176];
-            if (it->pkt.loadId != g_loadIdOut) {
+            // Phase 10 review WR-05: judge staleness against THIS OWNER's
+            // tracked loadId, never the global g_loadIdOut - the global
+            // advances on every per-client retry GO and every bootstrap GO,
+            // so at N>=3 it spuriously discarded an innocent concurrent
+            // NACK whenever ANOTHER client's GO minted a newer id first
+            // (loadNoteNack's own per-owner check was bypassed by the old
+            // early continue).
+            std::map<coop::u32, coop::LoadClient>::const_iterator lcit =
+                g_loadCoord.clients.find(it->pkt.ownerId);
+            if (lcit == g_loadCoord.clients.end() ||
+                lcit->second.loadId != it->pkt.loadId) {
                 _snprintf(b, sizeof(b) - 1,
                           "[load] stale NACK id=%u (current %u) ignored",
-                          it->pkt.loadId, g_loadIdOut);
+                          it->pkt.loadId,
+                          lcit != g_loadCoord.clients.end() ? lcit->second.loadId : 0u);
                 b[sizeof(b) - 1] = '\0'; coopLog(b);
                 continue;
             }
@@ -621,22 +1473,177 @@ void driveLoadSync(GameWorld* gw) {
                       "[load] NACK id=%u name='%s' joinFp=%08x -> transfer after reload",
                       it->pkt.loadId, name, it->pkt.fingerprint);
             b[sizeof(b) - 1] = '\0'; coopLog(b);
-            g_loadXferPending = name;
+            // Phase 10 review WR-08: queue this owner's fallback (owner,name)
+            // - never last-NACK-wins. Dedup per owner: a re-NACK (after a
+            // retry GO) REPLACES the stale entry rather than double-queueing.
+            {
+                bool queued = false;
+                for (std::deque<std::pair<coop::u32, std::string> >::iterator qit =
+                         g_loadXferQueue.begin(); qit != g_loadXferQueue.end(); ++qit) {
+                    if (qit->first == it->pkt.ownerId) {
+                        qit->second = name;
+                        queued = true;
+                        break;
+                    }
+                }
+                if (!queued)
+                    g_loadXferQueue.push_back(
+                        std::make_pair(it->pkt.ownerId, std::string(name)));
+            }
+            // Phase 10 review CR-03: an accepted NACK is PROGRESS - re-arm
+            // this client's deadline for the reload + fallback-transfer
+            // window it is now legitimately waiting on.
+            int newState = coop::loadNoteNack(g_loadCoord, it->pkt.ownerId, it->pkt.loadId,
+                                              (unsigned long)GetTickCount(),
+                                              g_cfg.loadAckTimeoutMs);
+            char cb[144];
+            _snprintf(cb, sizeof(cb) - 1, "[load] CLIENT owner=%u loadId=%u state=%s",
+                      (unsigned)it->pkt.ownerId, it->pkt.loadId,
+                      newState == coop::LC_NACKED ? "nacked" : "unknown");
+            cb[sizeof(cb) - 1] = '\0'; coopLog(cb);
         }
-        if (!g_loadXferPending.empty() && coop::engine::gameplayLive(gw) &&
+        // Phase 10 review WR-08: drain ONE queued fallback per tick, and only
+        // while the serialized sender is idle - each owner's stream completes
+        // before the next begins, so no NACKer's transfer is torn down (or
+        // silently skipped) by a sibling's.
+        if (!g_loadXferQueue.empty() && coop::engine::gameplayLive(gw) &&
             !coop::savexfer::sending()) {
-            char b[144];
+            coop::u32   xferOwner = g_loadXferQueue.front().first;
+            std::string xferName  = g_loadXferQueue.front().second;
+            g_loadXferQueue.pop_front();
+            char b[176];
             _snprintf(b, sizeof(b) - 1,
-                      "[load] starting fallback transfer name='%s'",
-                      g_loadXferPending.c_str());
+                      "[load] starting fallback transfer name='%s' dest=%u",
+                      xferName.c_str(), (unsigned)xferOwner);
             b[sizeof(b) - 1] = '\0'; coopLog(b);
-            coop::savexfer::beginSend(g_net, g_net.localId(), g_loadXferPending);
-            g_loadXferPending.clear();
+            // Phase 10 Plan 02 (SAVE-04): the fallback stream's ONLY
+            // legitimate destination is the NACKing owner - a bootstrap
+            // joiner, or a survivor whose copy diverged from the host's own
+            // mid-session reload. Never broadcast: a diverged owner's catch-
+            // up stream has exactly one destination, and per-peer CH_BULK
+            // ordering keeps it behind that owner's own GO.
+            if (coop::savexfer::beginSend(g_net, g_net.localId(), xferName, xferOwner)) {
+                // Phase 10 review CR-03: the transfer start is the second
+                // progress edge - size-scale the re-armed deadline from the
+                // stream's own byte count (the save plane's totalBytes /
+                // 2.5MBps * 3 shape), floored at the load-plane timeout so
+                // the join's post-commit reload is covered too.
+                unsigned __int64 totalBytes = coop::savexfer::sendTotalBytes();
+                double scaledSec = ((double)totalBytes / (2.5 * 1024.0 * 1024.0)) * 3.0;
+                unsigned long scaledMs = (unsigned long)(scaledSec * 1000.0);
+                unsigned long extendMs =
+                    (scaledMs > g_cfg.loadAckTimeoutMs) ? scaledMs : g_cfg.loadAckTimeoutMs;
+                coop::loadNoteXferStart(g_loadCoord, xferOwner,
+                                        (unsigned long)GetTickCount(), extendMs);
+            }
         }
         // The chunk pump normally lives in driveSaveSync; keep the fallback
         // transfer moving even when saveSync is gated off.
         if (!g_cfg.saveSync && coop::savexfer::sending())
             coop::savexfer::tickSend(g_net, g_net.localId());
+
+        // Phase 10 Plan 01 (SAVE-02): the per-owner PKT_LOAD_ACK drain -
+        // the positive half of the ACK/NACK pair the host never had before.
+        std::deque<coop::InboundLoadAck> loadAcks;
+        g_inbound.drainLoadAcks(loadAcks);
+        for (std::deque<coop::InboundLoadAck>::iterator it = loadAcks.begin();
+             it != loadAcks.end(); ++it) {
+            int newState = coop::loadNoteAck(g_loadCoord, it->pkt.ownerId, it->pkt.loadId,
+                                             it->pkt.ok != 0, (unsigned long)GetTickCount());
+            char b[144];
+            _snprintf(b, sizeof(b) - 1, "[load] CLIENT owner=%u loadId=%u state=%s",
+                      (unsigned)it->pkt.ownerId, it->pkt.loadId,
+                      newState == coop::LC_LOADED ? "loaded" :
+                      newState == coop::LC_FAILED ? "failed" : "unknown");
+            b[sizeof(b) - 1] = '\0';
+            if (it->pkt.ok) coopLog(b); else coopErr(b);
+            // Phase 10 Plan 02 (SAVE-04): this peer's coordinated load just
+            // went truly LIVE - re-run OUR OWN resend pass (resyncPeer, the
+            // SAME body onPeerConnected already runs at every connect edge)
+            // a SECOND time, closing the catch-up windows a multi-minute
+            // title wait can open (one-shot PLACE/EVT broadcasts risking
+            // BACKLOG OVERFLOW; research rows committed between the bake
+            // and the load). A second pass is idempotent (see Replicator.h's
+            // resyncPeer doc comment). resyncPeer's own ownerId param is
+            // authorship for OUR OWN re-announced rows (every existing call
+            // site passes the CALLER's own localId, never a target-peer
+            // filter - the caches hold no per-peer state to scope by), so
+            // this is g_net.localId(), NOT it->pkt.ownerId; the log line
+            // below still names the peer whose load-ACK triggered the pass.
+            if (newState == coop::LC_LOADED && g_cfg.latejoinSync) {
+                g_repl.resyncPeer(g_net, g_net.localId());
+                char rb[96];
+                _snprintf(rb, sizeof(rb) - 1,
+                          "[boot] RESYNC dest=%u (post-load catch-up)",
+                          (unsigned)it->pkt.ownerId);
+                rb[sizeof(rb) - 1] = '\0'; coopLog(rb);
+            }
+        }
+
+        // Phase 10 Plan 01 (SAVE-02): the per-tick retry/drop decision for
+        // the load plane - the SaveCoord::saveTick shape applied to
+        // LoadCoord.
+        {
+            std::vector<coop::u32> retryOwners, dropOwners;
+            // Phase 10 review CR-03: retries re-arm with the load-plane
+            // deadline floor, not the save plane's 30 s one.
+            coop::loadTick(g_loadCoord, (unsigned long)GetTickCount(), g_cfg.saveRetries,
+                          g_cfg.loadAckTimeoutMs, retryOwners, dropOwners);
+            for (size_t i = 0; i < retryOwners.size(); ++i) {
+                coop::u32 owner = retryOwners[i];
+                // A retry MUST carry a FRESH loadId (mint via the same
+                // monotonic host counter every GO uses) - the join's own
+                // stale-GO guard (`loadId <= g_loadIdSeen`) would silently
+                // drop a retry that reused the original id (LoadCoord.h's
+                // loadRetagRetryId doc comment; unlike SAVE's xferId, which
+                // the receiver re-stages unconditionally on any BEGIN).
+                coop::u32 retryLoadId = ++g_loadIdOut;
+                coop::loadRetagRetryId(g_loadCoord, owner, retryLoadId);
+                coop::LoadGoPacket rgo;
+                memset(&rgo, 0, sizeof(rgo));
+                rgo.type        = (coop::u8)coop::PKT_LOAD_GO;
+                rgo.ownerId     = g_net.localId();
+                rgo.loadId      = retryLoadId;
+                rgo.fingerprint = g_lastLoadGoFp;
+                strncpy(rgo.name, g_lastLoadGoName.c_str(), sizeof(rgo.name) - 1);
+                g_net.queueLoadGo(rgo, owner);
+                char rb[144];
+                std::map<coop::u32, coop::LoadClient>::const_iterator cit =
+                    g_loadCoord.clients.find(owner);
+                unsigned int retries = (cit != g_loadCoord.clients.end()) ? cit->second.retries : 0;
+                _snprintf(rb, sizeof(rb) - 1,
+                          "[load] CLIENT owner=%u loadId=%u state=go_sent retry=%u",
+                          (unsigned)owner, retryLoadId, retries);
+                rb[sizeof(rb) - 1] = '\0'; coopLog(rb);
+            }
+            for (size_t i = 0; i < dropOwners.size(); ++i) {
+                coop::u32 owner = dropOwners[i];
+                std::map<coop::u32, coop::LoadClient>::const_iterator cit =
+                    g_loadCoord.clients.find(owner);
+                unsigned int retries = (cit != g_loadCoord.clients.end()) ? cit->second.retries : 0;
+                char db[144];
+                _snprintf(db, sizeof(db) - 1, "[load] DROP owner=%u loadId=%u retries=%u",
+                          (unsigned)owner, g_loadCoord.loadId, retries);
+                db[sizeof(db) - 1] = '\0'; coopErr(db);
+                g_net.kickPeer(owner);
+            }
+        }
+
+        // Phase 10 Plan 01 (SAVE-03): free the arbiter once EVERY tracked
+        // client has independently reached a terminal state.
+        // Phase 10 review WR-01: symmetric ownership guard - a settling
+        // (possibly superseded) load only frees an arbiter still owned by
+        // the LOAD plane. A newer host load preempting an older one reuses
+        // kind==COORD_LOAD, and the newer loadBegin re-seeds g_loadCoord
+        // outright, so the guard never strands the newer transition.
+        if (g_loadCoord.active && coop::loadSettled(g_loadCoord)) {
+            if (g_coordArbiter.busy && g_coordArbiter.kind == coop::COORD_LOAD)
+                coop::coordComplete(g_coordArbiter);
+            else
+                coopLog("[coord] load settled but arbiter is owned by another "
+                        "transition - not freed (preempted)");
+            g_loadCoord.active = false;
+        }
     } else {
         // Test-only (KENSHICOOP_FORCE_STREAM=1, join): force the missing/diverged
         // NACK branch even when our on-disk fingerprint MATCHES the host's, so a
@@ -683,8 +1690,20 @@ void driveLoadSync(GameWorld* gw) {
                 warnIfNoPortraits(name);
                 g_loadAfterCommit.clear();
                 coop::engine::setLoadBypassOnce();
-                if (!coop::engine::loadSave(name))
+                // Phase 10 Plan 01 (SAVE-02): the positive LOAD_ACK fires
+                // once this load truly goes LIVE (sessionResetForWorldReload,
+                // the WORLD-RELOAD gameplay-live edge) - loadSave() only
+                // ISSUES the deferred engine call. A false return here is
+                // the early-fail signal (Open Q3): the load never even
+                // started, so ACK ok=0 immediately instead of waiting on a
+                // reload edge that will never come.
+                if (coop::engine::loadSave(name)) {
+                    g_loadAckPendingId   = it->pkt.loadId;
+                    g_loadAckPendingName = name; // WR-04: verified at the ACK edge
+                } else {
                     coopErr("[load] coordinated load FAILED to issue");
+                    sendLoadAck(it->pkt.loadId, false);
+                }
             } else {
                 _snprintf(b, sizeof(b) - 1,
                           "[load] GO id=%u name='%s' hostFp=%08x localFp=%08x %s -> NACK (transfer)",
@@ -699,8 +1718,9 @@ void driveLoadSync(GameWorld* gw) {
                 nk.fingerprint = fp;
                 strncpy(nk.name, name, sizeof(nk.name) - 1);
                 g_net.queueLoadNack(nk);
-                g_loadAfterCommit = name;
-                g_loadCommitBase  = coop::savexfer::commitSeq();
+                g_loadAfterCommit      = name;
+                g_loadAfterCommitLoadId = it->pkt.loadId;
+                g_loadCommitBase       = coop::savexfer::commitSeq();
             }
         }
 
@@ -723,11 +1743,33 @@ void driveLoadSync(GameWorld* gw) {
                 b[sizeof(b) - 1] = '\0'; coopLog(b);
                 warnIfNoPortraits(g_loadAfterCommit);
                 coop::engine::setLoadBypassOnce();
-                if (!coop::engine::loadSave(g_loadAfterCommit))
+                // Phase 10 Plan 01 (SAVE-02): same latch-through-WORLD-
+                // RELOAD contract as the MATCH arm above.
+                if (coop::engine::loadSave(g_loadAfterCommit)) {
+                    g_loadAckPendingId   = g_loadAfterCommitLoadId;
+                    g_loadAckPendingName = g_loadAfterCommit; // WR-04: verified at the ACK edge
+                } else {
                     coopErr("[load] post-transfer load FAILED to issue");
+                    sendLoadAck(g_loadAfterCommitLoadId, false);
+                }
+                g_loadAfterCommit.clear();
+            } else if (coop::savexfer::lastCommitResult() == 0 &&
+                       _stricmp(coop::savexfer::lastCommitName().c_str(),
+                                g_loadAfterCommit.c_str()) == 0) {
+                // Phase 10 Plan 01 (SAVE-02): a genuine failure for OUR
+                // pending load (the transfer for OUR save FAILED its CRC/
+                // commit verify) - the join used to "re-base and keep
+                // waiting" FOREVER here (the wait-forever bug this task
+                // closes). Emit the terminal ok=0 now and stop waiting on
+                // this attempt; the host's LoadCoord retry (bounded) drives
+                // a fresh GO if the host still wants us in the group.
+                coopErr("[load] transfer FAILED for our pending load - "
+                        "acking ok=0, not waiting further");
+                sendLoadAck(g_loadAfterCommitLoadId, false);
                 g_loadAfterCommit.clear();
             } else {
-                // Some other/failed commit landed; re-base and keep waiting.
+                // Some UNRELATED commit landed (a different save's name) -
+                // re-base and keep waiting; not a failure for OUR request.
                 g_loadCommitBase = coop::savexfer::commitSeq();
             }
         }
@@ -749,12 +1791,12 @@ void coopPanelDrive() {
     ps.selfSteamId  = (unsigned long long)coop::steamp2p::selfId();
     ps.peerSteamId  = g_cfg.steamPeer;
     ps.running      = g_net.isRunning();
-    ps.peerPresent  = g_peerPresent;
+    ps.peerPresent  = !g_connectedPeers.empty();
     ps.isHost       = g_cfg.isHost;
     ps.transportSel = (g_cfg.transport == "steam") ? 0 : 1;
     std::string detail;
     int ostate;
-    if (g_peerPresent) {
+    if (!g_connectedPeers.empty()) {
         detail = g_cfg.isHost ? "Connected - peer joined" : "Connected to host";
         ostate = 2;
     } else if (g_net.isRunning()) {
@@ -1094,15 +2136,19 @@ void tickReplicatePublish(GameWorld* gw, bool worldLive) {
         // no inventory traffic; the peer reconciles via applyInventories (skips own).
         if (g_cfg.invSync)
             g_repl.publishInventories(gw, g_net, g_net.localId());
-        // Protocol 37: BOTH clients diff every tracked container (own + received)
-        // against its baseline to catch a completed cross-owner UI drag - the one
-        // inventory write the single-writer snapshots cannot represent - and author
-        // a reliable PKT_INV_XFER so the peer relocates its own copy (conservation).
-        // RETIRED by the trade veto (blockXfer): a refused drag can never complete,
-        // so there is nothing to detect/replicate - Config forces xferSync off when
-        // blockXfer is on, making this (and applyTransfers below) a no-op. The
-        // xferLatch_/xferDefer_ reconcile-race machinery then stays dormant (never
-        // populated). KENSHICOOP_BLOCK_XFER=0 restores this replicate-the-trade path.
+        // Protocol 37/58 (Phase 7 INV-02): BOTH clients diff every tracked
+        // container (own + received) against its baseline to catch a
+        // completed cross-owner UI drag - the one inventory write the
+        // single-writer snapshots cannot represent - and author a reliable
+        // PKT_INV_XFER (now host-terminated: the host arbitrates via
+        // XferCommit.h and broadcasts the single PKT_XFER_COMMIT verdict
+        // every client applies below, tickReplicateApply). RETIRED by the
+        // trade veto (blockXfer): a refused drag can never complete, so
+        // there is nothing to detect/replicate - Config forces xferSync off
+        // when blockXfer is on, making this (and processXferIntents/
+        // applyXferCommit below) a no-op. The xferLatch_/xferDefer_
+        // reconcile-race machinery then stays dormant (never populated).
+        // KENSHICOOP_BLOCK_XFER=0 restores this replicate-the-trade path.
         if (g_cfg.xferSync)
             g_repl.detectAndPublishTransfers(gw, g_net, g_net.localId());
         // Phase W1 (bidirectional): BOTH clients stream the free ground items they
@@ -1263,6 +2309,8 @@ void tickScenarioStart(GameWorld* gw) {
             pctx.elapsedMs = waitedMs; pctx.tick = g_scenarioTick;
             pctx.peerReady = peerReady;
             pctx.pickMintedProxy = &coopScenarioPickMintedProxy;
+            pctx.connectedPeers = &coopScenarioConnectedPeers;
+            pctx.cellOwnerAt = &coopScenarioCellOwnerAt;
             g_scenario->onGameplay(pctx);
         }
         if (peerReady || fallback) {
@@ -1273,6 +2321,8 @@ void tickScenarioStart(GameWorld* gw) {
             ctx.elapsedMs = 0; ctx.tick = g_scenarioTick;
             ctx.peerReady = peerReady;
             ctx.pickMintedProxy = &coopScenarioPickMintedProxy;
+            ctx.connectedPeers = &coopScenarioConnectedPeers;
+            ctx.cellOwnerAt = &coopScenarioCellOwnerAt;
             char m[200];
             _snprintf(m, sizeof(m) - 1, "SCENARIO arm trigger=%s waitedMs=%lu",
                       peerReady ? "peer-ready" : "timeout", (unsigned long)waitedMs);
@@ -1307,18 +2357,21 @@ void tickReplicateApply(GameWorld* gw, bool worldLive) {
             // before the inventory reconcile (which can't refabricate a weapon into the proxy).
             g_repl.applyWeaponPickups(gw, g_inbound);
         }
-        // Protocol 37: relocate our copy of any cross-owner TRADED item between the
-        // two containers BEFORE the inventory reconcile, so the conservation move
+        // Protocol 58 (Phase 7 INV-02/INV-04): host-committed two-phase
+        // transfer, BEFORE the inventory reconcile so the conservation move
         // beats the stale-snapshot dupe/wipe (and traded gear survives - no
-        // fabrication on this path).
+        // fabrication outside the commit's own outcome). HOST ONLY arbitrates
+        // received intents (processXferIntents); ALL clients (host included -
+        // its own queue is always empty, see NetLink's !isHost_ receive
+        // guard) apply the resulting commit via applyXferCommit. This
+        // REPLACES applyTransfers/applyXferAcks (protocol 37/50, now dormant
+        // stubs) as the settle path.
         if (g_cfg.xferSync) {
-            g_repl.applyTransfers(gw, g_inbound, g_net, g_net.localId());
-            // Protocol 50: settle our own outstanding intents on the receiver's
-            // verdict. Before the reconcile, because a rejected transfer works
-            // by DROPPING our latch and letting applyInventories restore the
-            // owner's version - one tick later and the reconcile would run once
-            // more while still defending a move that was refused.
-            g_repl.applyXferAcks(gw, g_inbound, g_net.localId());
+            if (g_cfg.isHost)
+                g_repl.processXferIntents(gw, g_inbound, g_net, g_net.localId());
+            g_repl.applyXferCommit(gw, g_inbound, g_net, g_net.localId());
+            if (g_cfg.isHost)
+                g_repl.applyXferCommitAck(g_inbound, g_net.localId());
         }
         // Phase 4a: reconcile any peer-owned container we received a fresh snapshot
         // for (the join applies the host's container; the host skips its own).
@@ -1328,11 +2381,33 @@ void tickReplicateApply(GameWorld* gw, bool worldLive) {
         // netId spaces never collide.
         if (g_cfg.worldSync) {
             g_repl.applyWorldItems(gw, g_inbound);
-            // Protocol 47: a peer consumed a proxy it held for one of OUR ground items,
-            // so destroy our real copy. Runs AFTER applyWorldItems so a snapshot and the
-            // claim that retires it in the same batch resolve in authored order.
-            g_repl.applyWorldClaims(gw, g_inbound, g_net.localId());
+            // Protocol 58 (Phase 7 Plan 02, INV-03): host-committed claim
+            // contention, runs AFTER applyWorldItems so a snapshot and the
+            // claim verdict that retires it in the same batch resolve in
+            // authored order. HOST ONLY arbitrates received claim intents
+            // (applyClaimIntents, which also applies the host's own verdict
+            // locally - it never receives its own broadcast back); ALL
+            // clients (host included) apply the resulting verdict via
+            // applyClaimVerdict. This REPLACES applyWorldClaims (protocol 47,
+            // now a dormant stub) as the settle path.
+            if (g_cfg.isHost)
+                g_repl.applyClaimIntents(gw, g_inbound, g_net, g_net.localId());
+            g_repl.applyClaimVerdict(gw, g_inbound, g_net.localId());
         }
+        // Presence authority (protocol 49 -> Phase 8 Plan 02, WORLD-03):
+        // drain+publish this tick's cell claims, then (host) reduce+
+        // broadcast the authoritative map, then (every client, host
+        // included - the host's own queue is always empty) adopt any
+        // host-authored map that arrived - ALL before applyNpcCensus/
+        // enforceHostAuthority below consult authorityFor, so this tick's
+        // authority decisions read the freshest map rather than lagging a
+        // full tick behind receipt (the old rebuildClaimedCells ran AFTER
+        // this point in the tick, so its result was always one tick stale).
+        g_repl.syncCellClaims(gw, g_inbound, g_net, g_net.localId());
+        if (g_cfg.isHost)
+            g_repl.computeAndBroadcastCellMap(gw, g_net, g_net.localId());
+        g_repl.applyCellMap(gw, g_inbound, g_net.localId());
+
         // Host-authoritative world: only the JOIN hides/freezes any local NPC the
         // host isn't streaming (so the join can't run a divergent copy). The host IS
         // the world authority, so it never suppresses.
@@ -1357,7 +2432,6 @@ void tickReplicateApply(GameWorld* gw, bool worldLive) {
         // interestCenters ignore the anchors) so an A/B toggle needs no
         // session restart logic.
         g_repl.syncCamHint(gw, g_inbound, g_net, g_net.localId());
-        g_repl.syncCellClaims(gw, g_inbound, g_net, g_net.localId());
         trackMove(gw);
     }
 }
@@ -1460,6 +2534,8 @@ void tickScenarioTick(GameWorld* gw) {
         ctx.tick = ++g_scenarioTick;
         ctx.peerReady = g_inbound.sawRemoteEntity();
         ctx.pickMintedProxy = &coopScenarioPickMintedProxy;
+        ctx.connectedPeers = &coopScenarioConnectedPeers;
+        ctx.cellOwnerAt = &coopScenarioCellOwnerAt;
         if (g_scenario->onTick(ctx)) {
             // Stage 2: the receiver emits its interpolation smoothness summary
             // alongside the verdict so the runner can assert per-frame gliding.
@@ -1525,6 +2601,54 @@ void mainLoop_hook(GameWorld* gw, float dt) {
                 b[sizeof(b) - 1] = '\0'; coopLog(b);
             }
         }
+        // Phase 11 (11-03 live-matrix root cause; SAVE-02 completeness gap):
+        // a TITLE-SCREEN coordinated load - the connect-push bootstrap GO a
+        // join answers while still at the title - never reaches
+        // sessionResetForWorldReload (no world was live before it, so there
+        // is no WORLD-RELOAD swap edge to latch through), and the join's
+        // positive LOAD_ACK stayed owed forever. The host's LoadCoord then
+        // waited out its full loadAckTimeoutMs (120 s since CR-03; the old
+        // 30 s save-plane floor masked this as a short blip) and retried the
+        // SAME GO, forcing a redundant SECOND world reload just to collect
+        // the retry's ACK - and the serialized bootstrap queue turns that
+        // 120 s per-joiner stall into a pile-up that starves the 3rd/4th
+        // joiner past a gate's whole host window at N>=3. Gameplay going
+        // live IS this load's "truly LIVE" completion: emit the owed ACK
+        // here, through the SAME pending latch sessionResetForWorldReload
+        // clears on the mid-session path (idempotent - whichever edge fires
+        // first clears g_loadAckPendingId; the other is a no-op).
+        // Phase 11 review WR-04: this edge is "any first gameplay of the
+        // process", NOT "the coordinated load completed" - verify WHICH world
+        // went live before reporting success. The GO's loadSave() recorded
+        // its name as the last unsuppressed LOCAL-LOAD; if the user loaded a
+        // DIFFERENT save in between (the issued load never completed and a
+        // manual title-screen load superseded it), the names diverge and a
+        // positive ACK here would silently mask host/join world divergence -
+        // the corner that self-healed via host retry before 96aefe2. On
+        // mismatch: no ACK (clear the latch, log loudly) and let the host's
+        // existing loadAckTimeoutMs deadline/retry machinery re-drive the GO.
+        // Residual (documented) gap: the name is recorded at load-ISSUE time,
+        // so an issued-but-never-completed load followed by New Game (which
+        // fires no load detour) still matches - closing that needs a load-
+        // COMPLETION signal the engine does not expose today.
+        if (!g_cfg.isHost && g_loadAckPendingId != 0) {
+            const char* lastLoad = coop::engine::lastLocalLoadName();
+            if (!g_loadAckPendingName.empty() &&
+                _stricmp(lastLoad, g_loadAckPendingName.c_str()) != 0) {
+                char vb[192];
+                _snprintf(vb, sizeof(vb) - 1,
+                          "[load] gameplay-live world is NOT the coordinated save "
+                          "(expected='%s' lastLoad='%s') - LOAD_ACK withheld, "
+                          "host retry/deadline machinery will re-drive loadId=%u",
+                          g_loadAckPendingName.c_str(), lastLoad,
+                          (unsigned)g_loadAckPendingId);
+                vb[sizeof(vb) - 1] = '\0'; coopErr(vb);
+            } else {
+                sendLoadAck(g_loadAckPendingId, true);
+            }
+            g_loadAckPendingId = 0;
+            g_loadAckPendingName.clear();
+        }
         // Speed-intent capture (vote/effective decoupling): detour the engine's
         // speed setters so every USER action (button, keyboard pause, simulated
         // click) registers as a vote, while our own quiet applies stay invisible.
@@ -1542,7 +2666,7 @@ void mainLoop_hook(GameWorld* gw, float dt) {
         // the owner-authoritative stats channel (protocol 17). Solo at gameplay
         // start the write is purely local, and the join receives it as part of the
         // host's world through the connect-push below.
-        if (!g_peerPresent &&
+        if (g_connectedPeers.empty() &&
             coop::engine::playerSquadHasTemplate(gw, WPX2_MARKER_SID)) {
             unsigned int nb = coop::engine::buffAllPlayerStats(gw, WPX2_STAT_LEVEL);
             char b[128];
@@ -1555,8 +2679,15 @@ void mainLoop_hook(GameWorld* gw, float dt) {
         // at the menu / loading, its connect edge could not bake a save (no live
         // world yet). Now that gameplay is live, arm the connect-push so the
         // waiting join gets pulled into this world.
-        if (g_cfg.isHost && g_cfg.saveSync && g_peerPresent)
-            armConnectPush();
+        // Phase 10 Plan 02 (SAVE-04): one pending-bootstrap entry PER
+        // connected joiner - the old single armConnectPush() call baked
+        // exactly one save for "the join"; at N>=3 every peer already
+        // connected before gameplay started needs its OWN targeted push.
+        if (g_cfg.isHost && g_cfg.saveSync && !g_connectedPeers.empty()) {
+            for (std::set<coop::u32>::const_iterator pit = g_connectedPeers.begin();
+                 pit != g_connectedPeers.end(); ++pit)
+                armConnectPush(*pit);
+        }
     }
 
     // Manual-validation helper (host only): KENSHICOOP_AUTORECRUIT=N seconds -
@@ -1611,7 +2742,7 @@ void mainLoop_hook(GameWorld* gw, float dt) {
     // connect edge) so the title-screen auto-load - which precedes gameplay -
     // is never swallowed.
     {
-        bool want = !g_cfg.isHost && g_cfg.loadSync && g_peerPresent && g_gameStarted;
+        bool want = !g_cfg.isHost && g_cfg.loadSync && !g_connectedPeers.empty() && g_gameStarted;
         if (want != g_loadSuppressOn) {
             g_loadSuppressOn = want;
             coop::engine::setLoadSuppress(want);
@@ -2000,6 +3131,10 @@ void configureReplicator() {
         // the two sides' enumerated sets, hand by hand, with the authority class
         // each side assigned. The aggregate counters cannot: a creature visible
         // on one client and absent on the other leaves every bucket balanced.
+        // milestone_a_gate (Phase 4 plan 04, POC-03) joins the list too: its DoD
+        // NPC-visibility step needs the same "SCENARIO WNPC" rows so
+        // analyze_wnpc_diff4.ps1's 3-pairwise N=4 census diff has something to
+        // read on all four processes.
         g_repl.setAuditRows(g_cfg.scenario == "travel_parity" ||
                             g_cfg.scenario == "split_far" ||
                             g_cfg.scenario == "run_apart" ||
@@ -2008,6 +3143,7 @@ void configureReplicator() {
                             g_cfg.scenario == "escape_cohesion" ||
                             g_cfg.scenario == "jail_probe" ||
                             g_cfg.scenario == "jail_soak" ||
+                            g_cfg.scenario == "milestone_a_gate" ||
                             g_cfg.jailProbe);  // manual -JailProbe: no scenario name
         char b[260];
         _snprintf(b, sizeof(b) - 1,

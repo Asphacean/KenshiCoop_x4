@@ -1,9 +1,11 @@
-﻿KenshiCoop - co-op mod
-======================
+KenshiCoop x4 - 3-4 player co-op mod
+====================================
 
-This zip contains ONE folder: "KenshiCoop". That folder IS the mod.
+This zip contains the "KenshiCoop" folder (that folder IS the mod), plus this
+README and PROVENANCE.json. Supports 2, 3, or 4 players over direct UDP / LAN.
+Everyone must run this same build.
 
-INSTALL (both players)
+INSTALL (every player)
 ----------------------
   1. Right-click the downloaded zip > Properties > Unblock (if shown), then
      extract it.
@@ -15,42 +17,60 @@ INSTALL (both players)
        C:\Program Files (x86)\Steam\steamapps\common\Kenshi\mods\
   3. Launch Kenshi and enable "KenshiCoop" in the Mods menu.
 
-PREREQUISITES (both players)
+PREREQUISITES (every player)
 ----------------------------
   1. Kenshi 1.0.65 (Steam).
   2. RE_Kenshi 0.3.1+ (free mod that loads the plugin):
      https://www.nexusmods.com/kenshi/mods/847
-  3. For the Steam transport (recommended): Steam RUNNING and ONLINE on both
-     machines. No port forwarding, no IPs, no config editing - you swap Steam
-     IDs in-game (see PLAY below).
+  3. The host must be reachable over UDP by every joiner: same LAN, or the
+     host's port forwarded / a VPN for internet play.
 
-PLAY (Steam - recommended)
---------------------------
-  1. Press F2 to open the Co-op panel. It works at the MAIN MENU (before loading
-     a game) as well as in-game.
-  2. Swap Steam IDs: each player clicks "Copy my Steam ID" and sends it to the
-     other (Steam chat, Discord, etc.). When you receive your friend's ID, copy
-     it, then click "Paste friend's Steam ID" in your panel. The panel shows the
-     ID it captured. (This is per-session - re-paste it if you relaunch Kenshi.)
-  3. HOST: load the save you want to play (or start a new game), set Role: HOST,
-     leave Transport on STEAM, and toggle Connection to ONLINE.
-  4. JOIN: straight from the MAIN MENU - no save needed - set Role: JOIN, leave
-     Transport on STEAM, and toggle Connection to ONLINE. The host sends its
-     world to you on connect and you load right into it. (You do NOT need the
-     host's save beforehand. If you already have an identical copy on disk it is
-     used as-is instead of transferring.)
-  5. The white status line shows live state, and a status banner in the TOP-LEFT
-     corner shows it too - at the main menu as well as in-game, so a joining
-     player can watch the transfer before the world loads. Toggle Connection to
-     OFFLINE to leave.
+PLAY (LAN / direct UDP)
+-----------------------
+  1. Each JOINER edits <Kenshi>\mods\KenshiCoop\coop_config.json (Notepad):
+       "transport": "udp"
+       "ip":   the HOST's address   (e.g. "192.168.1.10")
+       "port": the HOST's port      (default 27800)
+     ip/port are re-read whenever you go ONLINE, so no restart after an edit.
+     The host only needs "transport": "udp".
+  2. HOST: load a save, or start a new game and pick a co-op start from the list
+     that matches your player count (see GAME STARTS below). Press F2, set
+     Transport: UDP and Role: HOST, then toggle Connection to ONLINE.
+  3. EACH JOINER: press F2 (works at the MAIN MENU - no save needed), set
+     Transport: UDP and Role: JOIN, then toggle Connection to ONLINE. The host
+     streams its world to you on connect and you load right into it. Joiners
+     connect to the host only, never to each other. (If you already have an
+     identical copy of the host's save on disk it is used as-is instead of
+     transferring.)
+  4. The white status line and the TOP-LEFT banner show live connection/transfer
+     state, at the main menu as well as in-game. Toggle Connection to OFFLINE to
+     leave.
 
-PLAY (LAN / direct UDP - advanced)
-----------------------------------
-  Skip the Steam ID swap. Open <Kenshi>\mods\KenshiCoop\coop_config.json in
-  Notepad, set "transport": "udp", and put the host's address in "ip" (and
-  "port" if you changed it). In the panel set Transport: UDP, pick Host/Join,
-  and go ONLINE. ip/port are re-read whenever you go ONLINE, so no restart is
-  needed after an edit.
+GAME STARTS (one squad tab per player)
+--------------------------------------
+  The host runs squad 1; joiners take squads 2, 3, 4. Everyone's squad is
+  visible and synced on every screen but answers only to its owner. New Game ->
+  pick the bundled start that matches your player count, each pre-splits
+  wanderers into separate squads so nobody has to split tabs by hand:
+    * "Multiplayer (Wanderer x4)"  - four squads, for 3-4 players.
+    * "Multiplayer (Wanderer x2)"  - two squads, for two players.
+    * "Multiplayer+ (Wanderer x2)" - the x2 start with 500,000 cats (shared
+                                      wallet) and both characters at 50 in every
+                                      stat, to skip the early grind.
+  With fewer players than squads, the unused squads just sit idle. You can also
+  load any existing save and split units into extra squad tabs in-game.
+
+STEAM (two players only)
+------------------------
+  The original two-player Steam P2P path still works but is NOT extended to 3-4
+  players. For two players you may instead leave Transport on STEAM and swap
+  Steam IDs in-game (F2 -> "Copy my Steam ID" / "Paste friend's Steam ID").
+
+SAVING
+------
+  Any save any player makes during a session becomes one shared save on every
+  machine, streamed automatically. To resume, the host loads it and goes online;
+  the others reconnect from the main menu.
 
 UNINSTALL
 ---------
@@ -61,10 +81,8 @@ TROUBLESHOOTING
   * "The co-op plugin has not started": RE_Kenshi didn't load it. Check
     <Kenshi>\RE_Kenshi_log.txt for 'KenshiCoop'; reinstalling RE_Kenshi
     usually fixes it.
-  * No connection (Steam): both Steams must be RUNNING and ONLINE, and each side
-    must have Pasted the OTHER player's ID (the panel shows the captured ID -
-    confirm it matches). If "Paste friend's Steam ID" says the clipboard wasn't
-    a Steam ID, have your friend re-copy theirs with "Copy my Steam ID". Look for
-    '[steam] session ... active=1' in <Kenshi>\KenshiCoop_*.log.
-  * "protocol mismatch": one player has an older/newer build; both should use
-    the same release.
+  * No connection (UDP): the joiners' ip/port must match the host, and the host
+    must be reachable over UDP (LAN, or port forwarded / VPN for internet play).
+    Look for connection lines in <Kenshi>\KenshiCoop_*.log.
+  * "protocol mismatch": someone has a different build; everyone should use the
+    same release.

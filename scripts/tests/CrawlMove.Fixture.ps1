@@ -87,8 +87,12 @@ function New-CrawlSample {
         default { $x = 100.0 + ($Ms / 500.0) + $Dx }
     }
     $bs = 8 + ($Prone -shl 9)   # BODY_CRAWL | prone field
+    # LOCALE-SAFETY: this machine's culture (uk-UA) renders {0:F2}/-f as
+    # comma-decimal ("109,00"), which never matches Get-CrawlSeries' dot-
+    # decimal regex. InvariantCulture keeps the emitted line locale-stable.
+    $xStr = $x.ToString('F2', [System.Globalization.CultureInfo]::InvariantCulture)
     return ("[$stamp] SCENARIO CRAWL hand=7,3 t=$Ms prone=$Prone crip=$Crip " +
-            ("pos={0:F2},5.00,50.00 bs=$bs mv=$Mv spd=1.20" -f $x))
+            "pos=$xStr,5.00,50.00 bs=$bs mv=$Mv spd=1.20")
 }
 
 # The physics witness beside each sample. $Hk=0 = the body lost its physics
@@ -98,8 +102,12 @@ function New-CrawlProbe {
     param([int]$Ms, [double]$X, [int]$Hk)
     $sec = [int][Math]::Floor($Ms / 1000)
     $stamp = "10:00:{0:00}.{1:000}" -f $sec, ($Ms % 1000)
+    # LOCALE-SAFETY: same InvariantCulture requirement as New-CrawlSample above.
+    $ic = [System.Globalization.CultureInfo]::InvariantCulture
+    $xStr = $X.ToString('F2', $ic)
+    $x10Str = ($X / 10.0).ToString('F2', $ic)
     return ("[$stamp] SCENARIO CRAWLPROBE hand=7,3 t=$Ms " +
-            ("mv={0:F2},5.00,50.00 hk=${Hk}:{1:F2},0.50,5.00 " -f $X, ($X / 10.0)) +
+            "mv=$xStr,5.00,50.00 hk=${Hk}:$x10Str,0.50,5.00 " +
             "mode=0 ao=0 tav=0.00,0.00,0.00 mot=1.00,0.00,1.00")
 }
 
@@ -118,7 +126,7 @@ try {
     $st = Test-CrawlMove -HostFile $hOk -JoinFile $jOk
     Check "fixed shape PASSes" ($st -eq 'PASS')
     $g = Get-GateResults | Where-Object { $_.gate -eq 'crawl_move' } | Select-Object -First 1
-    Check "records the owner posture" ($null -ne $g -and $g.metrics.AOwnerProne -eq 2)
+    Check "records the owner posture" ($null -ne $g -and $g.metrics['AOwnerProne'] -eq 2)
     Check "records a crawl gap" ($null -ne $g -and $g.metrics.ContainsKey('AGapMed'))
 
     # ---- 2. PRE-FIX shape: same positions, copy upright and not crippled. ----

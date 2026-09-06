@@ -34,6 +34,7 @@ $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path      # scripts\test
 $scriptsRoot = Split-Path -Parent $scriptDir                       # scripts
 $repoRoot  = Split-Path -Parent $scriptsRoot                       # repo root
 
+Import-Module (Join-Path $scriptsRoot "CoopOraclesN.psm1") -Force
 Import-Module (Join-Path $scriptsRoot "CoopOracles.psm1") -Force
 Import-Module (Join-Path $scriptsRoot "CoopHarness.psm1") -Force
 
@@ -82,7 +83,10 @@ function Get-CppScenarioNames {
 # entry (pure diagnostics driven outside the tiered matrix). Documented here so
 # the drift check stays a hard gate for everything else. (xfer_block moved INTO
 # the manifest in Phase 2 so it can carry its own DiagEnv instead of a Config
-# name-check, so it is no longer allowlisted.)
+# name-check, so it is no longer allowlisted. milestone_a_gate got its own
+# Tier='none' manifest entry in Phase 4 plan 05 once the N=4 oracle set existed
+# to judge it, so it is no longer allowlisted here either - see the entry's own
+# comment in scenarios.psd1 for why Tier='none' rather than smoke|full.)
 $manifestlessCpp = @('world_item_drop')
 
 # The reverse allowlist: manifest scenarios that are RUNNER-ONLY - judged by a
@@ -135,6 +139,18 @@ Check "schema checker flags an invalid Tier" ((Get-SchemaProblems -Name 'bad' -E
 # ---- 2. oracle registry -------------------------------------------------------
 Write-Host "== oracle registry =="
 $registry = Get-OracleRegistry
+# milestone_a_gate's Gating/PrimaryGate ids (census_convergence, disconnect_isolation,
+# driven_only_movement, desync_convergence, clean_exit) dispatch through
+# CoopOraclesN.psm1's Invoke-OneOracleN (plan 05, N=4 gate set), not through
+# CoopOracles.psm1's Invoke-OneOracle switch this registry is otherwise built
+# from - union in Get-OracleRegistryN's ids so a real, dispatchable N=4 gate id
+# is not flagged as "unknown" here, mirroring how Get-PreRunGates ids are
+# unioned in above them for the same "resolvable somewhere other than the
+# switch" reason. Get-OracleRegistry's own return value enumerates through the
+# pipeline into a fixed-size array (not the live HashSet), so this unions via
+# concatenation rather than an in-place .Add() (which throws on a fixed-size
+# collection) - .Contains()/.Count both still work on the combined array.
+$registry = @($registry) + @(Get-OracleRegistryN)
 Check "oracle registry is non-empty" ($registry.Count -gt 0)
 Check "registry contains a known oracle (crosscheck)" ($registry.Contains('crosscheck'))
 

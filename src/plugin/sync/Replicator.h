@@ -28,12 +28,26 @@
 #include "../net/NetLink.h"
 #include "SyncContext.h" // Phase 6: per-tick channel call environment
 #include "SyncTuning.h"  // Phase 6d: owned per-channel send-cadence tunables
+#include "PinOwner.h"    // 06-01 (GAP-3/PLAY-03): pinPeer_ author bookkeeping
+#include "XferCommit.h"  // Phase 7 (INV-02/INV-04): host-committed transfer state machine
+#include "ClaimArbiter.h" // Phase 7 Plan 02 (INV-03): claim-contention arbiter
+#include "CellMap.h"      // Phase 8 Plan 02 (WORLD-03): host-side cell-claim-map reduce
+#include "MoneyFold.h"    // Phase 9 Plan 01 (CONS-01): shared-money-pool arbiter
+#include "SpeedVote.h"    // Phase 9 Plan 02 (CONS-02): N-player speed min-vote reduce
 
 class GameWorld;
 class Character;
 class RootObject;
 
 namespace coop {
+
+// Phase 3 (OWN-01/OWN-02) PlayerId sentinel: "not a tracked squad member" -
+// returned by ownerOfHand() when a hand is not currently in the squad
+// roster (world NPC/container/vendor never match). Namespace-scope (not a
+// Replicator member) so Replicator::Driven's constructor member-init list
+// can reference it directly - a C++03 build must not rely on the C++11 rule
+// that a nested class is implicitly a friend of its enclosing class.
+const coop::u32 OWNER_NONE = (coop::u32)-1;
 
 class Replicator {
 public:
@@ -83,17 +97,105 @@ public:
     // prior one-directional behaviour is preserved.
     void setOwnRanks(const std::set<unsigned int>& r) { ownRanks_ = r; }
 
-    // Cross-owner trade veto classifier (engine InvOwnerClassFn). Given a
-    // save-stable owner hand (readObjectHand layout [type,container,
-    // containerSerial,index,serial]) returns 0 = not a player-squad member,
-    // 1 = a squad member owned by THIS client, 2 = a squad member owned by the
-    // PEER. Consults the sets publishOwned refreshes each tick (allSquad_ +
-    // ownHands_). Const + set-lookup only, so it is safe to call from the engine
-    // tick (the UI-drag detour runs on the same main thread).
-    int ownerClassForHand(const unsigned int h[5]) const {
+    // Phase 3 Plan 03 (OWN-01/OWN-03): apply the host-announced authoritative
+    // map<PlayerId,set<rank>> (decoded from PKT_OWN_RANKS). Replaces the whole
+    // map - the host always broadcasts the FULL roster, never a delta.
+    // resolveRankOwner()/handOwner_ consult it, falling back to the
+    // deterministic rank=playerId default (ownerForRank) when empty. Body in
+    // ReplicatorCore.cpp (session lifecycle TU, alongside resolveRankOwner()).
+    void setAllOwnRanks(const std::map<u32, std::set<unsigned int> >& m);
+
+    // Phase 3 Plan 03: track the connected non-host roster (called from
+    // Plugin.cpp's processNetEvents connect/leave drain) so the HOST can build
+    // the authoritative ownership announcement in announceOwnRanks() below.
+    // Harmless bookkeeping on a join (announceOwnRanks is host-gated).
+    // Phase 8 review IN-02: zeroing claimMapMs_ forces assertDue on the
+    // host's next computeAndBroadcastCellMap, so a fresh join adopts the
+    // cell map immediately instead of failing every cell open to host for
+    // up to CELL_ASSERT_MS (5 s) - a window in which OTHER joins' census
+    // rows for cells they genuinely own were culled on the newcomer
+    // (briefly ghosting bodies in that region). Mirrors announceOwnRanks'
+    // connect-edge re-announce; harmless no-op on a join (the broadcast is
+    // host-gated).
+    void notePeerConnected(u32 id) { knownPeers_.insert(id); claimMapMs_ = 0; }
+    void notePeerLeft(u32 id) { knownPeers_.erase(id); }
+
+    // Protocol 58 (Phase 7 review CR-01): purge every conservation-plane
+    // record keyed to `authorId`'s PREVIOUS connection the moment its
+    // PlayerId slot is (re)assigned - called from Plugin.cpp's
+    // processNetEvents CONNECT loop, which runs BEFORE tickReplicateApply
+    // drains any intent/verdict from the new connection, so the new
+    // connection's restarted per-sender counters (transferId/netId/dropId/
+    // pickupId all restart at 1 in a fresh client process) can never collide
+    // with stale "commit is final" / dedup memory from the dead connection.
+    // Purging at the CONNECT edge - not at disconnect - is deliberate: it
+    // preserves host-final-else-rollback for the ORIGINAL transfers (late
+    // duplicates still in flight right after a leave are still answered
+    // "commit is final"), lets claim windows the departed author's items had
+    // open finalize normally among the surviving claimants, and still sweeps
+    // the final records those post-departure finalizations minted. A no-op
+    // on a first-ever connect (nothing recorded for that id). Phase 8 review
+    // WR-01: the CHANNEL seq guards are in scope too - the rejoining
+    // author's per-sender seqSeen entry is erased from every doorRows_/
+    // bdoorRows_/facRows_/deedRows_ row (same seq-restart rationale), and
+    // the prodRows_ scalar is reset when the restarted author is the host
+    // (the only author that channel ever has). Body in ReplicatorCore.cpp
+    // (session lifecycle TU).
+    void purgeAuthorConservationState(u32 authorId);
+
+    // WR-02 fix: a UI-driven disconnect (coopUiDisconnect/sessionResetForUi)
+    // stops the net thread BEFORE any ENET_EVENT_TYPE_DISCONNECT is drained
+    // through processNetEvents()'s leave loop, so notePeerLeft() never runs
+    // for whichever peers were connected at disconnect time - knownPeers_ and
+    // allOwnRanks_ (neither cleared by resetSession(), which deliberately
+    // preserves them across a WORLD-RELOAD) would otherwise leak stale
+    // PlayerIds into the next hosted session in the same process. A full
+    // disconnect is a session BOUNDARY, not a reload, so this state must not
+    // survive it. Safe to call on either role (harmless no-op on a join,
+    // exactly like notePeerConnected/notePeerLeft above).
+    void clearKnownPeers() { knownPeers_.clear(); allOwnRanks_.clear(); }
+
+    // Phase 3 Plan 03 (OWN-01/OWN-03, T-03-06): HOST ONLY - build & broadcast
+    // the authoritative map<PlayerId,set<rank>> via NetLink::broadcastOwnRanks().
+    // No-op if this instance is not currently the host (isHostRole()). Called
+    // from Plugin.cpp on a roster edge (connect/leave) and from publishOwned
+    // (ReplicatorPublish.cpp) whenever the tab set changes (tabsChanged_).
+    void announceOwnRanks(NetLink& net, u32 ownerId);
+
+    // Phase 3 (OWN-01/OWN-02): who owns hand h? Returns the owning PlayerId,
+    // or OWNER_NONE if h is not a currently-tracked squad member (world
+    // NPC/container/vendor). Backed by handOwner_, which publishOwned()
+    // refreshes every tick from the tab-rank scan (deterministic default:
+    // ownerForRank(rank) == rank; a host-authoritative announcement may
+    // override that mapping in a later plan without changing this API).
+    // Const + map-lookup only, so it is safe to call from the engine tick
+    // (the UI-drag detour runs on the same main thread).
+    u32 ownerOfHand(const unsigned int h[5]) const {
         Key k; k.t = h[0]; k.c = h[1]; k.cs = h[2]; k.i = h[3]; k.s = h[4];
-        if (allSquad_.find(k) == allSquad_.end()) return 0;
-        return (ownHands_.find(k) != ownHands_.end()) ? 1 : 2;
+        std::map<Key, u32>::const_iterator it = handOwner_.find(k);
+        return it == handOwner_.end() ? OWNER_NONE : it->second;
+    }
+
+    // Phase 3 (OWN-02): is hand h one of THIS client's own squad members
+    // (locally owned, streamed by publishOwned, never driven by remote
+    // replication)? Const + set-lookup only, so it is safe to call from the
+    // engine tick.
+    bool isMine(const unsigned int h[5]) const {
+        Key k; k.t = h[0]; k.c = h[1]; k.cs = h[2]; k.i = h[3]; k.s = h[4];
+        return isMineKey(k);
+    }
+
+    // Cross-owner trade veto classifier (engine InvOwnerClassFn) - now a thin
+    // ADAPTER over ownerOfHand()/isMine() that preserves the exact 0/1/2
+    // return the engine's InvOwnerClassFn contract relies on (Engine.h:733-
+    // 735: "A move is cross-owner iff one end is 1 and the other is 2.").
+    // Given a save-stable owner hand (readObjectHand layout [type,container,
+    // containerSerial,index,serial]) returns 0 = not a player-squad member,
+    // 1 = a squad member owned by THIS client, 2 = a squad member owned by
+    // someone else (formerly "the PEER"; now any other tracked owner).
+    int ownerClassForHand(const unsigned int h[5]) const {
+        if (ownerOfHand(h) == OWNER_NONE) return 0;
+        return isMine(h) ? 1 : 2;
     }
 
     // Scenario support (assault_mint): the hand of the MINTED proxy nearest the
@@ -235,11 +337,44 @@ public:
     // changed, destroy it on cull. netId spaces are per-sender, culls owner-scoped.
     void applyWorldItems(GameWorld* gw, Inbound& in);
 
-    // AFTER engine (protocol 47, BOTH clients): drain received world-item CLAIMS - a peer
-    // consumed the proxy it held for one of OUR netIds, so destroy our real ground object
-    // and drop its track. Erasing the track makes the ordinary cull path announce the
-    // removal to any third peer, so everyone converges on the single surviving copy.
+    // AFTER engine (protocol 47, SUPERSEDED by protocol 58's applyClaimVerdict
+    // below, Phase 7 Plan 02): dormant since Plan 02 - no longer called from
+    // Plugin.cpp. The old body destroyed our real ground object unconditionally
+    // on ANY notice - the "no track; already gone" silent no-op this left when
+    // a SECOND simultaneous claimant's notice arrived after the first already
+    // destroyed the object is exactly the 2-player dup this plan fixes (two
+    // claimants each kept a copy). Kept only as a drain-and-discard stub so a
+    // stray claim received from a mismatched build (impossible - PROTOCOL_VERSION
+    // gates the handshake) cannot grow InboundWorldClaim's queue unbounded.
     void applyWorldClaims(GameWorld* gw, Inbound& in, u32 localId);
+
+    // AFTER engine, HOST ONLY (protocol 58, Phase 7 Plan 02 INV-03): drain
+    // received claim INTENTS (PKT_WORLD_ITEM_CLAIM) and feed ClaimArbiter.h's
+    // bounded contention window, keyed (authorId, netId). Each claim's
+    // authorClaimMs is mapped into the host's local clock via the existing
+    // per-owner peerClock_ offset (mappable=false when the claimant has no
+    // peerClock_ entry yet - treated as an automatic tie-band member, never
+    // unusable). Every tick, finalizes any window whose contention length has
+    // elapsed (coop::claimWindowExpired) and broadcasts exactly one
+    // ClaimVerdictPacket via net.queueClaimVerdict naming the deterministic
+    // winner (coop::finalizeClaim). A claim for an already-committed identity
+    // (coop::claimCommitted) is answered with the SAME prior verdict re-sent
+    // (commit is final - never re-arbitrated, never re-broadcast).
+    void applyClaimIntents(GameWorld* gw, Inbound& in, NetLink& net, u32 localId);
+
+    // AFTER applyClaimIntents (protocol 58, Phase 7 Plan 02 INV-03, ALL
+    // clients): drain PKT_CLAIM_VERDICT - by construction every entry here is
+    // host-authored (NetLink's receive branch only pushes PKT_CLAIM_VERDICT on
+    // a client, `!isHost_`, and REJECTS + logs one a client tries to author,
+    // the PKT_XFER_COMMIT/PKT_OWN_RANKS precedent). If I am the item's AUTHOR
+    // (authorId==localId): destroy my real ground object for netId (the verdict-
+    // gated replacement for applyWorldClaims' old unconditional destroy) and
+    // leave the track so the ordinary cull converges third peers. If I am a
+    // LOSING claimant (I claimed this identity but winnerPlayerId != me): roll
+    // back my optimistic local pickup - the ONE allowed reverse mutation
+    // (research Pitfall 1) - by removing the exact claimed instance from my
+    // claiming character's bag. If I am the WINNER: no-op (I already keep it).
+    void applyClaimVerdict(GameWorld* gw, Inbound& in, u32 localId);
 
     // BEFORE engine (Phase W2/W3, runs on EVERY client): diff each OWNED character's WEAPON
     // census. A sustained count DECREASE is a DROP (the weapon left the bag; we never mutate
@@ -287,21 +422,57 @@ public:
     // them; a lone loss is a drop/consume, not a trade).
     void detectAndPublishTransfers(GameWorld* gw, NetLink& net, u32 ownerId);
 
-    // AFTER engine (protocol 37): drain received transfer intents and relocate the
-    // REAL Item* between our own copies of the two containers (conservation - no
-    // fabrication, no destruction, so gear survives; non-gear falls back to
-    // fabricate-into-dst if our src copy is missing). Idempotent by
-    // (ownerId, xferId); skips intents we authored. Runs BEFORE applyInventories
-    // so the relocation beats the reconcile.
+    // AFTER engine (protocol 37, SUPERSEDED by protocol 58's applyXferCommit
+    // below, Phase 7): dormant since Plan 01 Task 2 - no longer called from
+    // Plugin.cpp. Kept only as a drain-and-discard stub so a stray intent
+    // received from a mismatched build (impossible - PROTOCOL_VERSION gates
+    // the handshake) cannot grow InboundInvXfer's queue unbounded.
     void applyTransfers(GameWorld* gw, Inbound& in, NetLink& net, u32 localId);
 
-    // AFTER applyTransfers (protocol 50): drain verdicts for intents WE authored
-    // and settle them on the receiver's word instead of on a deadline. Accept
-    // clears our latches now; reject clears them too, which is what lets the
-    // owner's next snapshot reconcile our optimistic local move away. Unanswered
-    // intents are swept on the old wall clock, so a peer that never replies
-    // behaves exactly as before.
+    // AFTER applyTransfers (protocol 50, SUPERSEDED by protocol 58's
+    // applyXferCommit below, Phase 7): dormant since Plan 01 Task 2 - no
+    // longer called from Plugin.cpp. Kept only as a drain-and-discard stub.
     void applyXferAcks(GameWorld* gw, Inbound& in, u32 localId);
+
+    // AFTER engine, HOST ONLY (protocol 58, Phase 7 INV-02): drain received
+    // transfer intents (PKT_INV_XFER) and arbitrate them via XferCommit.h's
+    // pendingXfer_ state machine, keyed (authorId, transferId). Validates the
+    // author actually owns the source OR destination domain
+    // (ownerOfHand(src)==author or ownerOfHand(dst)==author), decides the
+    // outcome ONCE (relocate the real item / fabricate a shortfall under the
+    // same backpack-never-fabricate + KENSHICOOP_WEAPON_FAB gate applyTransfers
+    // used / reject) and broadcasts exactly one XferCommitPacket per fresh
+    // commit via net.queueXferCommit. Host-as-participant: applies its own
+    // relocation in the SAME pass (so the host's own containers are correct
+    // immediately) but still broadcasts the identical commit, so every
+    // client's log evidence is the same regardless of who the host is.
+    void processXferIntents(GameWorld* gw, Inbound& in, NetLink& net, u32 localId);
+
+    // AFTER processXferIntents (protocol 58, Phase 7 INV-02/INV-04, ALL
+    // clients): drain PKT_XFER_COMMIT - by construction every entry here is
+    // host-authored (NetLink's receive branch only pushes PKT_XFER_COMMIT on
+    // a client, `!isHost_`, and REJECTS + logs one a client tries to author,
+    // the PKT_OWN_RANKS T-03-06 precedent; a client's single ENet connection
+    // to the host is also its own topological guarantee - there is no other
+    // peer it could have come from). Dedup on
+    // (authorId, transferId) via appliedXfers_ (rekeyed to the commit's
+    // authorId so N authors' transferId=1 never collide - the Phase 5 rule).
+    // For RELOCATE/FABRICATE: reuses the relocate+fabricate body verbatim
+    // (driven by the commit's outcome/applied, never an independent
+    // per-receiver fabricate decision), creates/adjusts xferLatch_ on both
+    // peer ends and RELEASES it on this commit (not on a peer ACK), calls
+    // xferRebase on both keys and registers wdSuppress_ for gear. For REJECT:
+    // releases every latch for (author,transferId) and does NOTHING else -
+    // the next authoritative snapshot reconciles the optimistic local move
+    // away through applyInventories (the existing rollback path, no second
+    // mutation). A participant additionally authors a XferCommitAckPacket
+    // (bookkeeping/audit only). This REPLACES applyTransfers/applyXferAcks as
+    // the settle path.
+    void applyXferCommit(GameWorld* gw, Inbound& in, NetLink& net, u32 localId);
+
+    // AFTER applyXferCommit, HOST ONLY (protocol 58): drain transfer-commit
+    // bookkeeping acks and log for audit/correlation. No state change.
+    void applyXferCommitAck(Inbound& in, u32 localId);
 
     // BEFORE engine, after publishOwned (phase 2 vitals sync): stream each OWNED
     // player-squad member's medical model (blood, bleed, limb flesh/bandaging,
@@ -332,6 +503,14 @@ public:
     // them AUTHORITATIVELY to the world NPC the host owns (blood loss + a frontal
     // flesh wound via woundSubjectLimbs). Ignores reports for bodies the host is
     // not the combat authority for (partition safety, like applyTreatments).
+    // Phase 4 Plan 03 Task 2 (T-04-08, dormant N>2 fail-safe): also refuses a
+    // report whose target hand is ANY tracked squad member (allSquad_) other
+    // than the host's own - at N>=3 this could otherwise be another player's
+    // squad body (join2 vs join3 PvP), which the host is never authoritative
+    // for. Currently unreachable (ReplicatorDrive.cpp's join-side capture
+    // already filters isSquad out before pendingHits_ is ever populated), but
+    // the host-side apply had no equivalent backstop of its own - this closes
+    // that asymmetry defense-in-depth, log-and-drop, never silently applied.
     void applyCombatHits(GameWorld* gw, Inbound& in);
 
     // Enable join-dealt damage reporting (join only; see publishCombatHits).
@@ -595,7 +774,31 @@ public:
     // its next sample). Rows never sent stay silent - the shared-save
     // baseline is not traffic. Edge-only caches (weaponCensus_, hostBody_)
     // are deliberately untouched: re-seeding would author phantom edges.
+    // A thin wrapper over resyncPeer() below (kept as its own name/call site
+    // since it fires on the generic connect edge, not the joiner-unicast
+    // bootstrap's post-load edge).
     void onPeerConnected(NetLink& net, u32 ownerId);
+
+    // Phase 10 Plan 02 (SAVE-04): the SAME resend pass as onPeerConnected
+    // above, exposed as its own entry point so Plugin.cpp can re-run it a
+    // SECOND time for a bootstrap-pushed joiner, once that joiner's
+    // coordinated load truly completes (the positive PKT_LOAD_ACK's
+    // LC_LOADED edge, Plan 01) - closing the two catch-up windows
+    // 10-RESEARCH.md's channel table named: one-shot PLACE/EVT broadcasts
+    // that queued at the joiner's title screen through a multi-minute wait
+    // (risking BACKLOG OVERFLOW loss) and rows (research) committed between
+    // the bake and the load. A second pass for the SAME peer is idempotent
+    // by construction - PLACE/REMOVE replays dedupe receiver-side, and aging
+    // lastSendMs to 1 just re-fires each channel's own safety resend a
+    // little early; calling it twice in a row is never wrong, only
+    // (harmlessly) redundant on every channel except the one that actually
+    // had something new to converge. `ownerId` is the CALLER's own local id
+    // (the packets' authorship tag), exactly like onPeerConnected - this is
+    // NOT a per-target-peer filter (the caches hold no per-peer state to
+    // scope by), so calling it broadcasts a resend to every connected peer,
+    // survivors included; that is expected and harmless (the same broadcast
+    // every existing connect edge already triggers).
+    void resyncPeer(NetLink& net, u32 ownerId);
 
     // AFTER publishOwned (protocol 20, HOST only - the world-detection
     // authority): for every DRIVEN copy currently in stealth mode, read its
@@ -659,16 +862,22 @@ public:
     // counter would make every new row look stale to it.
     void resetSession();
 
-    // Peer-leave cleanup (Phase 2 crash hardening): called from the transport
-    // leave edge when the OTHER player disconnects mid-session (distinct from a
-    // world-reload). resetSession() clears proxyByKey_ but never DESTROYS the
-    // minted bodies, and the leave handler previously did neither - so after a
-    // peer drop the survivor kept its minted proxies standing AND kept driving
-    // them off stale maps (the "join crash -> host follow-on crash" chain). This
-    // despawns every minted proxy body FIRST (SEH-guarded), then resetSession()
-    // to clear the maps that referenced them. Safe if reconnect follows: the new
-    // session re-censuses and re-mints from scratch.
-    void clearPeerReplicationState(GameWorld* gw);
+    // Peer-leave cleanup (Phase 2 crash hardening; Phase 3 Plan 04 owner-scoped
+    // rewrite, PEER-02/03): called ONCE PER DEPARTING id from the leave-loop
+    // when a peer disconnects mid-session (distinct from a world-reload).
+    // OWNER-SCOPED: destroys only `departing`'s minted proxy bodies (SEH-
+    // guarded via destroyIfMinted; ADOPTED bodies are released, not
+    // destroyed) and world-item proxies (worldProxies_ is keyed by
+    // (ownerId, netId), so ownership needs no lookup), then erases only
+    // `departing`'s targets_ entries (identified by the Driven.owner tag
+    // Plan 02 set from ingest()'s ownerId). Every OTHER connected peer's and
+    // the local player's replicated state is left untouched. Unlike the old
+    // single-parameter version, this does NOT call resetSession() - that
+    // global wipe stays reserved for the session-end / world-reload path
+    // (sessionResetForUi's full-disconnect loop, sessionResetForWorldReload).
+    // Safe if reconnect follows: the departing id's hands re-census and
+    // re-mint from scratch on the next tick.
+    void clearPeerReplicationState(GameWorld* gw, u32 departing);
 
     // AFTER engine: sample + apply the interpolated pose for every tracked entity.
     void applyTargets(GameWorld* gw);
@@ -695,11 +904,21 @@ public:
     // positional stream bubble. No-op unless streamNpcs_ and censusRadius_ > 0.
     void publishNpcCensus(GameWorld* gw, NetLink& net, u32 ownerId);
 
-    // JOIN: drain received censuses into the latest-wins existence set
-    // (censusHands_) consumed by enforceHostAuthority's wide-radius pass.
-    // gw is for the per-row ownership check (see the definition): a census row
-    // only speaks for a cell the SENDER owns, judged against OUR map.
+    // JOIN (Task 3, WORLD-03: EVERY client now - PKT_NPC_CENSUS is relayed
+    // join->join): drain received censuses into the per-owner census_ map
+    // (map<ownerId, CensusSet>) consumed by enforceHostAuthority's
+    // wide-radius pass. gw is for the per-row ownership check (see the
+    // definition): a census row only speaks for a cell the SENDER owns,
+    // judged against OUR map. A single drain can legitimately hold DISTINCT
+    // owners' packets (N-1 publishers @ 1 Hz) - every owner's LATEST entry
+    // this drain is applied, never just the deque's back().
     void applyNpcCensus(GameWorld* gw, Inbound& in);
+    // Shared per-owner apply primitive applyNpcCensus calls once per
+    // distinct owner in a drain. (InboundNpcCensus forward-declared via
+    // Inbound.h; Key/CensusPos/CensusSet-typed helpers - censusHasAny/
+    // censusPosFor/censusTotalCount - are declared further down, after
+    // Key/CensusSet themselves are defined.)
+    void applyOneNpcCensus(GameWorld* gw, const InboundNpcCensus& nc);
 
     // Camera hint channel (protocol 43, camera-anchored interest). SYMMETRIC:
     // each side reads its local camera center (engine::cameraCenter), publishes
@@ -803,6 +1022,12 @@ private:
         k.i = e.hIndex; k.s = e.hSerial; return k;
     }
 
+    // Same predicate as the public isMine(), for call sites (applyTargets'
+    // drive loop, keyed on targets_) that already hold a Key - avoids
+    // marshaling back through the unsigned int[5] hand array only to
+    // immediately reconstruct the Key isMine() would build from it.
+    bool isMineKey(const Key& k) const { return ownHands_.find(k) != ownHands_.end(); }
+
     struct Driven {
         EntityInterp interp;
         bool         fresh;          // host streamed a non-stale sample this tick
@@ -816,6 +1041,11 @@ private:
         unsigned int walkStallF;     // consecutive frames the ordered body advanced ~nothing
         bool         suppressed;     // NPC pulled off the local AI update list
         unsigned long lastSeenMs;    // last ingest for this hand (stale-entry pruning)
+        u32          owner;          // Phase 3 (OWN-02): PlayerId whose stream last
+                                     //   drove this entry (OWNER_NONE until the first
+                                     //   ingest). Lets a client tell distinct remote
+                                     //   squads apart while interpolating multiple
+                                     //   owners simultaneously (POC-01).
         // Stage 5 rest-pose reproduction.
         u16          issuedTask;     // task we last committed (TASK_NONE = none)
         bool         taskApplied;    // a fixture-resolved pose is currently held
@@ -944,7 +1174,7 @@ private:
         unsigned long midSeenMs;
         Driven() : fresh(false), haveActual(false), lx(0), ly(0), lz(0), parked(false),
                    haveDest(false), dx(0), dy(0), dz(0), walkHalted(false), walkStallF(0),
-                   suppressed(false), lastSeenMs(0),
+                   suppressed(false), lastSeenMs(0), owner(OWNER_NONE),
                    issuedTask(TASK_NONE), taskApplied(false), taskBad(false),
                    taskTick(0), taskRetries(0), fixtureXlateLogged(false),
                    taskNoneTick(0), detached(false), downApplied(false),
@@ -1028,6 +1258,15 @@ private:
     // Same throttle for the "[build] POSE-CAP xlate" line, keyed by wire site key.
     std::map<Key, unsigned long> buildPoseCapMs_;
     u32                   nextEventId_;
+    // Phase 5 (ID-02): (ownerId, eventId) dedup guard applied at the top of
+    // applyEvents, ahead of the koLatched/deathLatched per-subject-hand latch
+    // switch. Bounded, additive defense-in-depth implementing the CONTEXT
+    // "receivers dedup on (ownerId, eventId)" decision - mirrors the
+    // appliedDrops_/appliedPickups_/appliedXfers_ composite-key idiom
+    // (foldOnce, FoldDedup.h) so a reliable resend/replay of the same
+    // sender's eventId is skipped before any latch mutation, while three
+    // different owners' eventId=1 still fold as three distinct events.
+    std::set<std::pair<u32, u32> > appliedEvents_;
     // Stage 6: world NPCs we've hidden+frozen on the join because the host isn't
     // streaming them. Keyed by hand so we restore the exact body when it re-enters
     // the host's streamed set.
@@ -1088,18 +1327,18 @@ private:
     // wide culling rather than mass-suppressing on a silent host).
     float                     censusRadius_;  // 0 = census disabled
     unsigned long             censusSendMs_;  // host: last census publish
-    unsigned long             censusRecvMs_;  // join: last census arrival
+    // AGGREGATE arrival tracker: the last time we received ANY owner's
+    // census (any sender). Drives the "is any census fresh enough to
+    // trust" gates (censusFresh, the wide-radius pass enable, staleness
+    // diagnostics) - unchanged shape from before the Task 3 per-owner
+    // refactor. PER-OWNER freshness lives in each CensusSet.recvMs below.
+    unsigned long             censusRecvMs_;  // join: last census arrival (any owner)
     // Camera hint channel (protocol 43): join sends its camera center at
     // ~1 Hz; the host keeps the latest hint + arrival stamp (stale hints are
     // dropped from the anchor set rather than pinning interest forever).
     unsigned long             camHintSendMs_; // join: last hint send
     float                     peerCam_[3];    // host: latest peer camera center
     unsigned long             peerCamMs_;     // host: its arrival time (0 = none)
-    std::set<Key>             censusHands_;   // join: latest existence set
-    // Whose claim censusHands_ is. Under presence authority a census only
-    // speaks for the cells its sender owns, so enforcement has to know who
-    // sent it. Defaults to the host, which is who it always was.
-    u32                       censusOwner_;
     unsigned long             censusCulls_;   // join: wide-radius suppress count
     // Rows dropped because OUR map does not put the sender's cell in the
     // sender's hands. A steady nonzero here is the two maps disagreeing, which
@@ -1167,19 +1406,57 @@ private:
     // enforceHostAuthority parks a local copy that diverged past
     // censusParkDist_ back onto the host's spot (0 disables).
     struct CensusPos { float x, y, z; };
-    std::map<Key, CensusPos>  censusPos_;     // join: host pos per census row
+    // Per-owner census (Task 3, WORLD-03): PKT_NPC_CENSUS moves from Class B
+    // (host-only) to Class A (relayed join->join), so the intake must
+    // represent MULTIPLE simultaneous authors - the single censusHands_/
+    // censusOwner_/censusPos_/censusPrev_/censusPrevMs_ set this replaces
+    // WIPED every other author's existence claims the instant a second
+    // owner's 1 Hz census arrived (ReplicatorAuthority.cpp's old
+    // applyNpcCensus, :84-92 pre-Task-3). Keyed by ownerId; each owner's
+    // slice is a drop-in replacement for the old bare members (hands/pos/
+    // prev/prevMs fields keep the exact same per-row shape and semantics -
+    // only the outer map adds the owner dimension).
+    struct CensusSet {
+        std::set<Key>            hands;  // that owner's latest existence set
+        std::map<Key, CensusPos> pos;    // that owner: host pos per census row
+        std::map<Key, CensusPos> prev;   // that owner's PREVIOUS packet's rows
+        unsigned long             recvMs;  // that owner: last census arrival
+        unsigned long             prevMs;  // that owner: previous arrival stamp
+        CensusSet() : recvMs(0), prevMs(0) {}
+    };
+    std::map<u32, CensusSet>  census_;
+    // Phase 8 review WR-02: the per-owner staleness horizon the union
+    // helpers below apply per CensusSet. Pre-Task-3 the single set was
+    // WIPED by whichever packet arrived next, so a stale row lived ~1 s;
+    // post-refactor each owner's slice persists until that owner's next
+    // packet or its disconnect - so a connected-but-silent owner (mid
+    // coordinated load, long pause) would keep vouching existence and
+    // positions for bodies it no longer speaks for, indefinitely, while the
+    // AGGREGATE censusRecvMs_ stayed fresh off everyone else's arrivals.
+    // Value matches the aggregate censusFresh threshold (5000 ms) exactly:
+    // with a single publishing peer (the 2-player case) the per-owner stamp
+    // IS the aggregate stamp, so behavior there is bit-identical.
+    enum { CENSUS_OWNER_STALE_MS = 5000 };
+    // Existence-membership union across every owner's CensusSet.hands - the
+    // per-owner replacement for the old bare censusHands_.find(k)!=end()
+    // test. A key can legitimately appear in more than one owner's set only
+    // transiently (a body mid-handover); any owner vouching for it is enough
+    // to say it exists. WR-02: an owner whose recvMs is older than
+    // CENSUS_OWNER_STALE_MS no longer vouches (its slice is skipped).
+    bool censusHasAny(const Key& k) const;
+    // First matching owner's CensusPos for `k` (existence rows normally
+    // belong to exactly one owner's cell) - the per-owner replacement for
+    // censusPos_.find(k). Returns false if no owner's census carries `k`.
+    // WR-02: a stale owner's slice is skipped, same as censusHasAny.
+    bool censusPosFor(const Key& k, CensusPos* out) const;
+    // Sum of every owner's CensusSet.hands size - the per-owner replacement
+    // for the old bare censusHands_.size() in diagnostic log lines only.
+    unsigned int censusTotalCount() const;
     std::map<Key, CensusPos>  proxyDriftPrev_; // join: census pos at the last [proxy]
                                               //   drift sweep (owner-motion estimate)
     float                     censusParkDist_;
     unsigned long             censusParks_;   // join: divergence-park count
     std::map<Key, unsigned long> parkMs_;     // join: per-key park cooldown
-    // The census rows from the PREVIOUS packet, and when they arrived. Two
-    // consecutive rows are the only measure of the host copy's pace the join
-    // has for a body outside the stream bubble - the census carries position
-    // and nothing else - and the walk-converge band needs it to pick a speed
-    // that out-paces what it is chasing.
-    std::map<Key, CensusPos>  censusPrev_;
-    unsigned long             censusPrevMs_;
     // Per-key state for the two ways a census row can correct its local body:
     // the walk that converges it, and the teleport of last resort.
     //
@@ -1239,14 +1516,21 @@ private:
     // independently on each side. A discrete label has no such window, and a
     // published claim needs a small enumerable token to key a map on anyway.
     bool cellAuth_;   // off => authorityFor is always the host (fail-open)
-    // Co-location collapse: while the squads stand together, hand every cell to
-    // the host. See claimsCoLocated() for why the split stops paying when both
-    // clients already have the same bodies loaded.
+    // Co-location collapse KNOB (KENSHICOOP_CELL_COLLAPSE). Task 2 (protocol
+    // 59, WORLD-03) retires the independent claimsCoLocated() authority path
+    // this used to gate - the per-cell reduce (CellMap.h) already resolves a
+    // co-located cell to host via its host-if-party fresh-contest rule, so
+    // collapse is structural now, not a second boolean that could disagree
+    // with the map. cellCollapse_ is READ but no longer consumed by any
+    // authority decision; kept only so the env knob still parses (Plan 03's
+    // gate pins KENSHICOOP_CELL_COLLAPSE=0, which is now a no-op either way).
     bool cellCollapse_;
-    // The resolved verdict, recomputed by rebuildClaimedCells whenever a claim
-    // moves. Stored rather than derived per query because authorityFor is on the
-    // hot path and, more importantly, because every reader must see the SAME
-    // verdict within a tick.
+    // DERIVED diagnostic only (Task 2): true when every claimedCells_ entry
+    // resolved to CELL_OWNER_HOST, recomputed by computeAndBroadcastCellMap
+    // (host) / applyCellMap (client) alongside the map itself - never a
+    // separately-evaluated verdict that could disagree with it. Feeds only
+    // the [cell] MAP dump's collapse= field and the [census] auth dump's
+    // AUTHSRC_COLLAPSE bucket (now permanently 0 - see authoritySrc).
     bool collapsed_;
     struct CellClaim {
         int          cx, cz;
@@ -1299,7 +1583,13 @@ private:
     std::map<u32, u32>       claimSeqOut_;  // our tabRank -> last seq sent
     unsigned long            claimSendMs_;  // 1 Hz sample throttle
     unsigned long            claimAssertMs_; // periodic re-assert
-    unsigned long            claimMapMs_;    // [cell] MAP dump cadence
+    unsigned long            claimMapMs_;    // [cell] MAP dump / PKT_CELL_MAP broadcast cadence
+    // HOST ONLY (protocol 59, WORLD-03): CellMapPacket::seq, the host's own
+    // monotonic publish counter (log correlation only - clients adopt the
+    // map wholesale regardless of seq, the PKT_XFER_COMMIT/PKT_CLAIM_VERDICT
+    // precedent of not needing a per-packet dedup key for a host-single-
+    // sender broadcast).
+    u32                      cellMapSeqOut_;
     enum {
         CELL_OWNER_HOST   = 0,    // NetLink gives the host id 0
         CELL_DWELL_N      = 3,    // samples at 1 Hz
@@ -1382,6 +1672,23 @@ private:
     // the pre-ownership-filter roster. Lets the trade veto tell a squad character
     // apart from a world NPC / container (which are never blocked).
     std::set<Key>          allSquad_;
+    // Phase 3 (OWN-01): the PlayerId owner of every player-squad member key
+    // (own + peer), refreshed alongside allSquad_/ownHands_ each publishOwned
+    // tick from the tab-rank scan (deterministic default: ownerForRank(rank)
+    // == rank, OVERRIDDEN by allOwnRanks_ below when non-empty via
+    // resolveRankOwner()). Backs ownerOfHand(); ownHands_ still answers
+    // isMine() alone - this map generalizes "is it mine" into "who owns it".
+    std::map<Key, u32>     handOwner_;
+    // Phase 3 Plan 03 (OWN-01/OWN-03): the host-announced authoritative
+    // map<PlayerId,set<rank>> (PKT_OWN_RANKS), applied via setAllOwnRanks().
+    // Empty until the first announcement is received (client) or built (host);
+    // resolveRankOwner() falls back to the rank=playerId default while empty,
+    // so a session before the first announcement behaves exactly as Plan 02.
+    std::map<u32, std::set<unsigned int> > allOwnRanks_;
+    // Phase 3 Plan 03: rank -> owner resolution, consulting allOwnRanks_ first
+    // (when non-empty) and falling back to ownerForRank(rank). Backs
+    // handOwner_ population in publishOwned (ReplicatorPublish.cpp).
+    u32 resolveRankOwner(unsigned int rank) const;
 
     // Phase 4a inventory state. ownedContainers_ = containers we author (publish, never
     // reconcile back onto us). invPub_ = last published content fingerprint + send time
@@ -1467,6 +1774,32 @@ private:
     // so netId spaces are per-sender and culls are scoped to their owner.
     std::map<std::pair<u32, u32>, WorldProxy> worldProxies_;
     u32                        nextWorldNetId_;
+    // Protocol 58 (Phase 7 Plan 02, INV-03): the item identity of a claim WE
+    // authored, keyed (authorId, netId) - captured (engine::readItemIdentity)
+    // at the SAME moment the claim's proxy tracking is erased (publishWorldItems'
+    // claim pass), because that is the only tick the object is still resolvable.
+    // applyClaimVerdict consumes this to perform the loser rollback (remove-by-
+    // sid from one of OUR OWNED hands) without needing to re-derive the identity
+    // from an object that may no longer even exist by verdict time. Erased once
+    // the verdict for that key lands (win or lose - the outcome is decided).
+    struct PendingClaimIdentity { char stringID[48]; u32 itemType; u16 quantity; };
+    std::map<std::pair<u32, u32>, PendingClaimIdentity> myClaims_;
+    // Phase 7 review WR-03: ALL-clients dedup of RECEIVED claim verdicts,
+    // keyed (authorId, netId) - the appliedXfers_ idiom applied to
+    // PKT_CLAIM_VERDICT. The host's CLAIM-LATE path re-BROADCASTS the prior
+    // verdict to every client (a genuinely new packet, not an ENet resend),
+    // and without dedup a duplicate verdict drained before the author's next
+    // publish/cull pass found no resolvable object (`ro == 0`), took the
+    // "could not destroy" branch, and erased the author's track WITHOUT any
+    // cull ever being sent - a permanent ghost proxy on every third client.
+    // Verdicts are commit-final one-shots per (authorId, netId), so a seen
+    // key is always a duplicate. Reuses ClaimFinal (winner + insertion seq)
+    // so cap eviction is insertion-ordered (WR-05). Cleared in resetSession()
+    // and author-purged on a peer's (re)connect (CR-01) exactly like
+    // claimFinals_ - a stale entry would otherwise SWALLOW the verdict for a
+    // rejoined author's recycled netId.
+    std::map<std::pair<u32, u32>, coop::ClaimFinal> appliedClaimVerdicts_;
+    u32                                             appliedClaimVerdictSeq_;
     // First-scan-baseline latch (Phase 3): false after launch/reload; the first
     // publishWorldItems pass seeds every in-range save-native as a baseline track
     // (never-emit) and sets this true. resetSession() clears it so the reloaded
@@ -1620,10 +1953,14 @@ private:
     std::map<Key, unsigned long>              xferDefer_;
     u32                                       nextXferId_;
     std::set<std::pair<u32, u32> >            appliedXfers_;
-    // Protocol 50: intents we authored and are still waiting on a verdict for,
-    // keyed by our own xferId. Holds exactly what the verdict has to undo - the
-    // two peer ends and the item key - because by the time the answer arrives
-    // the detector has long since rebased and cannot reconstruct it.
+    // SUPERSEDED (protocol 50 -> 58, Phase 7 Plan 01 Task 2): dormant, no
+    // longer written or read anywhere - the AUTHOR's own release now reads
+    // the release magnitude straight off the host's PKT_XFER_COMMIT
+    // (applyXferCommit/processXferIntents' isAuthor branch), keyed
+    // (authorId,transferId), so nothing needs to be remembered locally
+    // between the intent and its verdict anymore. Kept declared (not
+    // deleted) purely to minimize this plan's diff footprint; safe to
+    // remove in a later cleanup pass.
     struct XferOut {
         Key           src;
         Key           dst;
@@ -1637,6 +1974,63 @@ private:
     // Undo one intent's contribution to a peer end's reconcile-suppression
     // latch (protocol 50). See the definition for why every verdict does this.
     void releaseXferLatch(const Key& k, const XKey& key, int delta);
+    // Protocol 58 (Phase 7 INV-02/INV-04): HOST-ONLY pending-transfer table
+    // (XferCommit.h's state machine), keyed (authorId, transferId). Written
+    // only by processXferIntents (xferBegin/xferCommitOnce) and erased
+    // owner-scoped on disconnect by clearPeerReplicationState
+    // (ReplicatorCore.cpp, via xferEraseOwner) - the transfer-table carve-out
+    // out of the otherwise-untouched xfer state, mirroring pinnedOwner_'s
+    // Phase 6 precedent. Never read or written by a client's apply path.
+    // pendingXferSeq_ is the monotonic insertion counter cap-eviction orders
+    // by (Phase 7 review WR-05 - see XferCommit.h::XferPendingEntry).
+    std::map<std::pair<u32, u32>, coop::XferPendingEntry> pendingXfer_;
+    u32                                       pendingXferSeq_;
+    // Protocol 58 (Phase 7 Plan 02, INV-03): HOST-ONLY claim-contention state
+    // (ClaimArbiter.h), keyed (authorId, netId) - the item's shared identity
+    // (the SAME key W1 claims already use). claimWindows_ holds every OPEN
+    // contention window; claimFinals_ records every FINALIZED (authorId,netId)
+    // WITH its winner in one record (Phase 7 review WR-05: the old separate
+    // claimCommitted_ set + claimWinners_ map were capped independently and
+    // could diverge - "committed but winner evicted" answered winner=0) so a
+    // later-arriving claim for an already-decided identity is answered with
+    // the SAME prior winner, never re-arbitrated ("commit is final" -
+    // INV-03). Written only by applyClaimIntents; claimWindows_ entries are
+    // additionally owner-scoped on disconnect by clearPeerReplicationState
+    // (via coop::claimEraseClaimant), mirroring pendingXfer_'s Phase 7
+    // Plan 01 precedent. Never read or written by a client's apply path.
+    // claimFinalSeq_ is claimFinals_'s monotonic insertion counter (WR-05).
+    std::map<std::pair<u32, u32>, coop::ClaimWindow> claimWindows_;
+    std::map<std::pair<u32, u32>, coop::ClaimFinal>  claimFinals_;
+    u32                                              claimFinalSeq_;
+    // Protocol 58 shared apply primitive: attempts to relocate the REAL item
+    // from sHand to dHand (up to `quantity` units) and - ONLY when
+    // `permission` is XFER_COMMIT_FABRICATE - fills any remaining shortfall
+    // via the same backpack-never-fabricate + KENSHICOOP_WEAPON_FAB-gated
+    // mint the old applyTransfers used (never called at all for a REJECT
+    // outcome - the caller skips it entirely). Used by BOTH the HOST
+    // deciding the outcome (processXferIntents, called with permission =
+    // XFER_COMMIT_FABRICATE - full authority; the actual RELOCATE/FABRICATE/
+    // REJECT split is read back from *outMoved/*outFab afterward) and every
+    // OTHER client executing the host's already-decided outcome
+    // (applyXferCommit, called with permission == the commit's own outcome
+    // field - RELOCATE never attempts fabrication, matching research
+    // Pitfall 2: fabrication is a host decision, never an independent
+    // per-receiver one). Returns moved+fab.
+    int relocateOrFabricate(GameWorld* gw, const unsigned int sHand[5],
+                            const unsigned int dHand[5], const char* sid,
+                            u32 itemType, int quantity, u16 quality, u8 level,
+                            const char* manufacturer, const char* material,
+                            u8 permission, int* outMoved, int* outFab);
+    // Protocol 58 (Phase 7 Plan 02, INV-03) shared apply primitive: applies
+    // ONE finalized claim verdict from `localId`'s own point of view - author
+    // destroys its real ground object (verdict-gated); a losing claimant rolls
+    // back its optimistic pickup; the winner (or a non-participant) no-ops.
+    // Called by applyClaimIntents for the HOST's OWN perspective (the host
+    // never receives its own PKT_CLAIM_VERDICT broadcast back over the wire,
+    // exactly like PKT_XFER_COMMIT - processXferIntents's own precedent) and
+    // by applyClaimVerdict for every OTHER client's received verdict.
+    void applyClaimOutcome(GameWorld* gw, u32 authorId, u32 netId,
+                           u32 winnerPlayerId, u32 localId);
     std::map<std::pair<Key, std::string>, unsigned long> wdSuppress_;
     unsigned long                             xferScanMs_; // last detector scan
     // Recapture `k`'s container and overwrite its baseline (clears its pends): call
@@ -1844,6 +2238,42 @@ private:
     unsigned long        detachUses_;     // detachFromTownAI calls from applyRest (sitter path)
     bool                 noDetach_;       // KENSHICOOP_NO_DETACH=1: skip sitter detach (A/B experiment)
 
+    // Phase 4 Plan 03 Task 1 audit (POC-02, N=4 combat/medical state-keying
+    // review): every combat/medical replication field below this point
+    // (pendingHits_, attackerOf_, combatCapMs_, medPub_/medRecv_, statsPub_,
+    // targets_'s Driven::combat*/koLatched/deathLatched/carriedDown fields,
+    // hostBody_) is keyed by Key (the body's own hand) or by (peer's hand ->
+    // {attacker hand, ms}), never by a bare per-peer scalar. This is already
+    // N-safe by construction: two joins' combat/medical state can never
+    // collide because their squad members and any world NPC they touch are
+    // always DISTINCT hands, regardless of how many peers are connected - the
+    // established std::map<Key,...>/map<PlayerId,...> idiom this project
+    // already uses for allOwnRanks_/epochSeen_/proxyByKey_ generalizes here
+    // with no code change required. PKT_TREATMENT's one genuine N>2 gap (a
+    // join-authored treatment intent that the host neither applied - the
+    // authority guard below skips a body we don't own - nor relayed, so it
+    // was silently lost at N>2) was CLOSED in Phase 6 (06-01, GAP-1):
+    // NetLink::routingClassOf(PKT_TREATMENT) is now RELAY_BROADCAST_EXCEPT
+    // (Class A), correct precisely because this file's own applyTreatments
+    // authority guard already ignores a relayed delta for a body it doesn't
+    // own - see docs/TWO_PLAYER_ASSUMPTIONS.md's Phase 6 per-channel audit
+    // section for the full verdict table.
+    // The one confirmed singular-per-peer field found during this audit was
+    // speedPeerReq_/speedPeerCombat_ below (a HOST-only scalar tracking "the
+    // join's" request/combat flag - genuinely last-writer-wins across 3
+    // joins at N=4): CONTEXT.md scoped "speed cap CONS-02" to a later
+    // Milestone B phase at the time (deferred: N-player voting), documented
+    // here and in 04-03-SUMMARY.md rather than converted. RESOLVED by Phase 9
+    // Plan 02 (09-02, CONS-02): speedPeerReq_/speedPeerCombat_ are replaced
+    // by the per-owner speedVotes_ map (SpeedVote.h) - see
+    // docs/TWO_PLAYER_ASSUMPTIONS.md's "Phase 9 (09-02, CONS-02)" section.
+    // See Task 2 (applyCombatHits below) for the one real N>2-only gap this
+    // audit found and fixed: a defense-in-depth fail-safe for a combat-hit
+    // report whose target hand resolves to a DIFFERENT player's squad member
+    // (not the host's own, not a world NPC) - unreachable today because the
+    // JOIN-side capture already filters isSquad out (ReplicatorDrive.cpp),
+    // but the HOST-side apply had no equivalent backstop of its own.
+
     // Damage-guard state (join side): suppress local melee damage on driven bodies.
     bool                 dmgGuard_;
 
@@ -1876,6 +2306,21 @@ private:
         StealthPub() : hash(0), lastSendMs(0), active(false) {}
     };
     std::map<Key, StealthPub> stealthPub_;
+    // Receive-side per-OWNED-sneaker detection state (Phase 6 review WR-01):
+    // with the PKT_STEALTH Class A relay, SEVERAL authorities (the host's
+    // world + every other join's locally-simulated world) can publish
+    // detection maps for the SAME owned sneaker. An empty falling-edge
+    // snapshot from author A must not clearStealthSeers() away the entries
+    // author B replayed moments ago (latest-wins across authors would read
+    // "clear" while genuinely detected in B's world). Track the last author
+    // whose ACTIVE (n>0) snapshot we replayed and when: an n==0 clear is
+    // honored only from that same author, or once every author has gone
+    // quiet past the STEALTH_RESEND_MS safety-resend horizon.
+    struct StealthRecv {
+        u32 lastAuthor; unsigned long lastActiveMs;
+        StealthRecv() : lastAuthor(0), lastActiveMs(0) {}
+    };
+    std::map<Key, StealthRecv> stealthRecv_;
 
     // Phase-2 medical channel state.
     // medPub_: per OWNED member, the last SENT quantized fingerprint + send time
@@ -1920,17 +2365,54 @@ private:
     // RESEND_MS names to these fields, so behavior is unchanged - this is the one
     // place their cadence now lives. See SyncTuning.h.
     SyncTuning tuning_;
-    // Protocol 52 shared money pool.
+    // Protocol 52 shared money pool; protocol 60 (Phase 9 Plan 01, CONS-01)
+    // generalizes it to N>=3 - see MoneyFold.h for the arbitration contract.
     // poolSeen_   = the wallet value we last observed/wrote, i.e. the baseline a
     //               local engine move is detected against. -1 = not yet seeded
     //               (fresh session or post-reload), which suppresses the first
     //               sample so a seed is never mistaken for a purchase.
     // poolSent_/poolSentMs_ = host change gate + safety resend for the total.
     // poolSeq_    = join's monotonic delta sequence (last used).
-    // poolAcked_  = highest seq the host has confirmed folding in.
+    // poolAcked_  = JOIN-ONLY (protocol 60): this join's own adopted ack,
+    //               read from the MoneyPacket::acks[] Entry whose ownerId ==
+    //               ctx.localId - NEVER a foreign owner's entry (the at-N
+    //               bounce/double-count MoneyFold.h::moneyShouldPop's own doc
+    //               comment names). A join has exactly one host, so this
+    //               stays a legitimate singular scalar; the HOST no longer
+    //               writes it (the host broadcasts the full ack vector from
+    //               moneyFold_.processed instead).
+    // poolFoldSeen_ = Phase 5 (ID-01) fold-dedup high-water, VESTIGIAL as of
+    //               protocol 60: moneyFold_.processed below is now the
+    //               single source of truth for the host's per-owner ack
+    //               vector (it also covers REJECTED seqs, which
+    //               poolFoldSeen_ never tracked). Kept declared (unused by
+    //               applyMoneyPool's new logic) rather than deleted, so its
+    //               connect-edge purge stays a defensive no-op instead of a
+    //               dangling reference - see purgeAuthorConservationState.
+    // moneyFold_  = Phase 9 Plan 01 (CONS-01): the HOST's MoneyFoldState
+    //               (MoneyFold.h) - the per-owner processed high-water
+    //               (folded OR rejected, the ack vector's source), the
+    //               overdraft window, and its queued candidates. Absent on a
+    //               join (host-only state, harmless default-constructed).
     // poolPending_ = join's unacked deltas, re-applied on top of the host's
     //               total so a just-made purchase does not visibly bounce.
     // poolTotal_  = host's authoritative pool.
+    // moneyDeferred_ = HOST-only (Phase 9 review WR-03): deltas drained from
+    //               Inbound on a tick where the unseeded pool's wallet read
+    //               SEH-failed, retained here for the next tick instead of
+    //               being dropped mid-drain (the reliable channel never
+    //               redelivers a drained packet; a dropped delta would later
+    //               be popped-and-forgotten once the same owner's NEXT delta
+    //               advanced moneyFold_.processed past the lost seq -
+    //               silently reverting the join's spend while the purchased
+    //               goods remain). A Replicator-side member rather than an
+    //               Inbound re-push deliberately: re-pushing would append the
+    //               OLD deltas behind any NEWER ones the net thread pushed
+    //               since the drain, breaking per-owner seq order (the newer
+    //               seq would fold first and the older would then read as
+    //               MONEY_DUP - the exact loss shape this fixes). Game-thread
+    //               only; prepended to the next drain so per-owner order is
+    //               preserved.
     struct PoolDelta {
         u32 seq; int delta;
         PoolDelta() : seq(0), delta(0) {}
@@ -1942,19 +2424,37 @@ private:
     int  poolTotal_;
     u32  poolSeq_;
     u32  poolAcked_;
+    std::map<u32, u32> poolFoldSeen_;
+    coop::MoneyFoldState moneyFold_;
     std::deque<PoolDelta> poolPending_;
+    std::deque<InboundMoneyDelta> moneyDeferred_;
     bool moneySync_;
+    // Fills pkt's ack vector (ackCount + acks[]) from moneyFold_.processed,
+    // bounded MAX_PLAYERS - the host's single source of truth for "highest
+    // seq PROCESSED (folded OR rejected)" per connected owner. Shared by
+    // publishMoneyPool's periodic/change-gated send and applyMoneyPool's
+    // immediate post-fold republish so both sites build the vector
+    // identically (ReplicatorChannels.cpp).
+    void fillMoneyAcks(MoneyPacket& pkt) const;
     // Protocol 24 faction-relation sync state, per faction sid.
     // known      = our current baseline (seeded on first sight, updated on every
     //              local change we sent and every received row we applied - the
     //              echo guard: an applied row is never re-detected as local).
     // lastSendVal/lastSendMs = change gate + safety resend (rows never sent
     //              never resend, so a settled diplomacy is silent).
-    // seqSeen    = newest per-sender seq applied (stale-row guard).
+    // seqSeen    = newest per-sender seq applied (stale-row guard). Phase 8
+    //              review CR-01: keyed PER SENDER (ownerId -> last-accepted
+    //              seq), the DoorRow shape - PKT_FACTION is a host-terminated
+    //              intent (WORLD-02), so the HOST intake hears up to N-1
+    //              joins, each with an independent facSeqOut_ counter; a bare
+    //              scalar compared join B's genuinely-newer intent against
+    //              join A's higher counter and silently dropped it at N>=3.
+    //              On a join this degenerates to one entry (the host's), so
+    //              2-player parity is unchanged.
     struct FacRow {
         float known; float lastSendVal; unsigned long lastSendMs;
-        u32 seqSeen; bool seeded;
-        FacRow() : known(0), lastSendVal(0), lastSendMs(0), seqSeen(0), seeded(false) {}
+        std::map<u32, u32> seqSeen; bool seeded;
+        FacRow() : known(0), lastSendVal(0), lastSendMs(0), seeded(false) {}
     };
     std::map<std::string, FacRow> facRows_;
     u32           facSeqOut_;
@@ -1963,12 +2463,16 @@ private:
     // Protocol 26 door-state sync, per door hand (the faction shape: known =
     // baseline, updated on every local change sent AND every received row
     // applied - the echo guard; lastSendMs = change gate + safety resend;
-    // seqSeen = stale-row guard).
+    // seqSeen = stale-row guard). Phase 8 (WORLD-01): seqSeen is keyed PER
+    // SENDER (ownerId -> last-accepted seq), not a bare scalar - doors are a
+    // SYMMETRIC channel (any client may author the same hand), so a shared
+    // counter would silently drop a second author's genuinely-newer row at
+    // N>=3 (gateSeqAcceptPerSender, ChangeGate.h).
     struct DoorRow {
         int knownOpen; int knownLocked; unsigned long lastSendMs;
-        u32 seqSeen; bool seeded;
+        std::map<u32, u32> seqSeen; bool seeded;
         DoorRow() : knownOpen(-1), knownLocked(-1), lastSendMs(0),
-                    seqSeen(0), seeded(false) {}
+                    seeded(false) {}
     };
     std::map<Key, DoorRow> doorRows_;
     u32           doorSeqOut_;
@@ -2029,11 +2533,14 @@ private:
     bool          buildSync_;
     // Protocol 28 placed-door rows, keyed by (placer building key, door
     // index) - the protocol-26 DoorRow shape on the translated identity.
+    // Phase 8 (WORLD-01): seqSeen is per-sender (ownerId -> last-accepted
+    // seq), the same fix as DoorRow above - build-doors stay Class A
+    // symmetric, so a bare shared counter has the identical N>=3 collision.
     struct BdoorRow {
         int knownOpen; int knownLocked; unsigned long lastSendMs;
-        u32 seqSeen; bool seeded;
+        std::map<u32, u32> seqSeen; bool seeded;
         BdoorRow() : knownOpen(-1), knownLocked(-1), lastSendMs(0),
-                     seqSeen(0), seeded(false) {}
+                     seeded(false) {}
     };
     std::map<std::pair<Key, int>, BdoorRow> bdoorRows_;
     u32           bdoorSeqOut_;
@@ -2062,9 +2569,16 @@ private:
     bool          prodSync_;
     // Protocol 38 known-research rows, keyed by the RESEARCH stringID (the
     // cross-client-stable wire identity, spike 401). HOST: sent/lastSendMs =
-    // first-sight send + safety resend. JOIN: seqSeen = stale-row guard,
-    // applied = the local startResearch landed (isKnown flipped) so resends
-    // stop re-applying.
+    // first-sight send + safety resend (the authoritative broadcast every
+    // join converges against). JOIN: seqSeen = stale-row guard, applied = the
+    // local startResearch landed (isKnown flipped) so resends stop
+    // re-applying. Phase 8 (WORLD-02): a JOIN also reuses `sent` on the SAME
+    // row for its own one-shot outbound intent bookkeeping (own-local-unlock
+    // -> host) - `sent`=true means "already accounted for" from EITHER the
+    // silent baseline seed OR a genuinely-sent post-baseline intent; a join
+    // never resends its own intent (CH_RELIABLE delivery + the host's own
+    // resendUnsent=true broadcast is the convergence safety net once
+    // committed - see publishResearch).
     struct ResearchRow {
         unsigned long lastSendMs;
         u32  seqSeen;
@@ -2076,6 +2590,14 @@ private:
     u32           researchSeqOut_;
     unsigned long researchSampleMs_;
     bool          researchSync_;
+    // Phase 8 (WORLD-02): one-time gate for a JOIN's silent known-set
+    // baseline seed (the facRows_ `seeded` idiom, but a SINGLE flag rather
+    // than per-row: research's first publishResearch pass as a join marks
+    // EVERY currently-known sid `sent` in one bulk pass WITHOUT queueing
+    // anything, so a join never dumps its ~384-sid baseline at connect; only
+    // a sid discovered AFTER this one-time seed is a genuine post-baseline
+    // unlock worth sending as an intent. Unused on the host (always false).
+    bool          researchIntentSeeded_;
     // Protocol 54 property-deed rows, keyed by the building's save-stable hand
     // (both clients loaded the same save, so the key resolves on both - the
     // door/furniture precedent, not the protocol-27 runtime-mint one).
@@ -2087,13 +2609,20 @@ private:
     // EXPLICIT ctor, not value-init: the protocol-47 narrative records that
     // under this toolchain a struct reached through std::map is not reliably
     // zero-initialized, and a garbage latch flag cost a debugging session.
+    // Phase 8 review CR-01: seqSeen is keyed PER SENDER (ownerId ->
+    // last-accepted seq), the DoorRow/FacRow shape - PKT_DEED is a
+    // host-terminated intent (WORLD-02), so the HOST intake hears up to N-1
+    // joins with independent deedSeqOut_ counters; a bare scalar dropped a
+    // second join's purchase intent for a hand a first join had authored at
+    // a higher seq - money debited, deed never recorded (the item/money-loss
+    // class). One entry on a join (the host's): 2-player parity unchanged.
     struct DeedRow {
         unsigned long lastSendMs;
-        u32  seqSeen;
+        std::map<u32, u32> seqSeen;
         bool sent;
         bool applied;
         int  knownOwned;
-        DeedRow() : lastSendMs(0), seqSeen(0), sent(false), applied(false),
+        DeedRow() : lastSendMs(0), sent(false), applied(false),
                     knownOwned(-1) {}
     };
     std::map<Key, DeedRow> deedRows_;
@@ -2159,6 +2688,16 @@ private:
     // (mid-session) tab inherits its authoring side's ownership.
     std::set<Key> pinOwned_;
     std::set<Key> pinPeer_;
+    // 06-01 (GAP-3/PLAY-03): ADDITIVE author record for pinPeer_ - written
+    // alongside every pinPeer_ insert/erase via PinOwner.h's pinRecord/
+    // pinForget, read ONLY by clearPeerReplicationState's owner-scoped pin
+    // erase. pinPeer_ itself remains the sole authoritative membership/veto
+    // set (ReplicatorPublish.cpp:94 and friends are completely unchanged) -
+    // this map never influences a publish/apply decision, only which pins a
+    // departing peer's disconnect is allowed to release. pinOwned_ (hands WE
+    // authored) deliberately has no equivalent map: it is always "me", so an
+    // author field would be redundant (06-RESEARCH open question 4).
+    std::map<Key, u32> pinnedOwner_;
     // Roster edges WE caused. insertPeerMember re-containers a peer's body into
     // our squad so we can drive it, and the engine cannot tell that apart from
     // the user dragging a member between tabs - so publishSquadMoves echoed the
@@ -2205,6 +2744,17 @@ private:
     // container 237, join rank 2 = container 443), so rank-keyed WIRE channels
     // must stay inside the prefix even though ownership no longer needs it.
     unsigned int  tabsSeeded_;
+    // Phase 3 Plan 03: set true whenever decideTabs() assigns a NEW tab
+    // ownership verdict (session-start seeding or a later dynamic tab) - the
+    // per-tick signal publishOwned (ReplicatorPublish.cpp) checks to trigger
+    // announceOwnRanks() on the host, without re-announcing every tick when
+    // nothing changed. Consumed (reset false) the same tick it fires.
+    bool          tabsChanged_;
+    // Phase 3 Plan 03: the connected non-host roster (Plugin.cpp's
+    // notePeerConnected/notePeerLeft), used by announceOwnRanks() to build the
+    // authoritative map's base rank=playerId entries. Host-only in practice
+    // (unused on a join, since announceOwnRanks no-ops there).
+    std::set<u32> knownPeers_;
     // Fold this tick's distinct sorted containers into the latch (append-only;
     // no-op when squadSync_ is off) and rank one container: latched rank when
     // the gate is on, the legacy per-tick sorted rank otherwise.
@@ -2232,9 +2782,12 @@ private:
     // Shared EVT_RECRUIT / EVT_SQUAD_MOVE receive half: pin the new hand as
     // peer-authored and re-key our local copy of the old hand onto it in
     // proxyByKey_ (restoring it first if host-authority had suppressed it).
-    // tag selects the log prefix ("recruit" / "squad").
+    // tag selects the log prefix ("recruit" / "squad"). ownerId (06-01
+    // GAP-3): the authenticated event author (already forgery-checked by
+    // rejectIfForgedOwner on the relay) - recorded into pinnedOwner_
+    // alongside every pinPeer_ insert this function performs.
     void rekeyPeerBody(GameWorld* gw, const Key& oldK, const Key& newK,
-                       const char* tag);
+                       const char* tag, u32 ownerId);
     // Phase 1b (cross-game recruit membership): insert the re-keyed body 'c'
     // into THIS client's player squad at the tab named by newK's container, so a
     // recruit/transfer shows in the panel on the PEER too. ownIt selects the
@@ -2243,9 +2796,11 @@ private:
     // peer's tab); true pins it OWNED so THIS client controls + streams it (a
     // transfer INTO a tab we own - the control hand-off). Idempotent + tab-aware
     // (a squad-move re-containers an existing member). Shared by the recruit ok=1
-    // path, the ok=0 post-mint drain, and the control-flip transfer.
+    // path, the ok=0 post-mint drain, and the control-flip transfer. ownerId
+    // (06-01 GAP-3): the pin's author, recorded into pinnedOwner_ alongside
+    // any pinPeer_ insert performed here.
     void insertPeerMember(GameWorld* gw, Character* c, const Key& newK,
-                          const char* tag, bool ownIt = false);
+                          const char* tag, bool ownIt, u32 ownerId);
     // Hard-snap attribution diagnostics (rubber-banding investigation): one
     // throttled [snap] line per applyRaw teleport with everything needed to
     // classify the cause (gap, source speed+velocity, game speed, slew,
@@ -2424,6 +2979,22 @@ public:
     // channel. No-op with cellAuth_ off, so nothing is on the wire until the
     // feature is armed.
     void syncCellClaims(GameWorld* gw, Inbound& in, NetLink& net, u32 ownerId);
+    // HOST ONLY (protocol 59, WORLD-03): run CellMap.h's engine-free
+    // reduceCellMap over claimSlots_/the connected-owner set, write the
+    // verdict into claimedCells_/cellLastOwner_ directly (the host never
+    // receives its own broadcast back - the queueClaimVerdict/
+    // processXferIntents precedent), and broadcast ONE CellMapPacket on
+    // change or a slow re-assert cadence. No-op (and clears state) with
+    // cellAuth_ off or on a join - mirrors syncCellClaims' own early-return
+    // shape. localId is passed so the host can tell it IS the host without
+    // an isHostRole() call that depends on ownRanks_ having been set yet.
+    void computeAndBroadcastCellMap(GameWorld* gw, NetLink& net, u32 localId);
+    // ALL clients (host included, where the queue is always empty): drain
+    // any received PKT_CELL_MAP and adopt it WHOLESALE into claimedCells_/
+    // cellLastOwner_ - a join's own claimSlots_-derived reduce is never run;
+    // the host's map is the SOLE verdict (a cell absent from it fail-opens
+    // to host, never to the local sender's own optimistic claim).
+    void applyCellMap(GameWorld* gw, Inbound& in, u32 localId);
     void setCellAuth(bool on) { cellAuth_ = on; }
     void setCellCollapse(bool on) { cellCollapse_ = on; }
     // Defeat the 1x-during-combat leg of speed arbitration. See Config::
@@ -2446,7 +3017,12 @@ public:
         AUTHSRC_CLAIM  = 1,   // a tab is standing there now
         AUTHSRC_VACATE = 2,   // cellLastOwner_: claimed once, since left
         AUTHSRC_OPEN   = 3,   // never claimed by anyone - fail-open to host
-        AUTHSRC_COLLAPSE = 4, // squads share a cell - the host authors everything
+        AUTHSRC_COLLAPSE = 4, // RETIRED (Task 2, WORLD-03): authoritySrc never
+                              // sets this anymore - a co-located cell now
+                              // resolves to host via the ordinary AUTHSRC_CLAIM
+                              // path (CellMap.h's host-if-party rule). Kept as
+                              // a dead enum value only so AUTHSRC_N and the
+                              // [census] auth dump's bySrc[] array stay stable.
         AUTHSRC_N      = 5
     };
     u32 authoritySrc(GameWorld* gw, float x, float z,
@@ -2466,26 +3042,16 @@ public:
         return (now - it->second.lastSeenMs) <= (unsigned long)PEER_STREAM_FRESH_MS;
     }
 private:
-    // Recompute claimedCells_ from claimSlots_. Host wins a contested cell.
-    void rebuildClaimedCells();
-    // Are the squads standing together? True when the host holds at least one
-    // claim, the peer holds at least one, and every peer claim names a cell
-    // some host claim also names.
-    //
-    // Reads claimSlots_ rather than claimedCells_ on purpose: the latter has
-    // already resolved a shared cell to the host, which would erase the very
-    // fact being measured. Slots are one per tab, so the nested scan is over a
-    // handful of entries.
-    //
-    // PURE FUNCTION of claimSlots_, and it has to stay one. Both clients
-    // converge on the same slot set, so both derive the same verdict and the
-    // same map - the property that already makes host-wins-ties safe. That is
-    // also why there is no hysteresis: a remembered "currently collapsed" bit
-    // is path-dependent, and two clients reaching one slot set by different
-    // routes would disagree about authorship indefinitely. Flapping is damped
-    // upstream instead, by the CELL_DWELL_N sample dwell a claim must clear
-    // before it moves at all.
-    bool claimsCoLocated() const;
+    // rebuildClaimedCells + claimsCoLocated (the per-instance std::map-
+    // iteration-order reduce + co-location collapse heuristic) are RETIRED
+    // as of Task 2 (protocol 59, WORLD-03) - superseded by CellMap.h's
+    // host-side reduceCellMap, computeAndBroadcastCellMap, and applyCellMap.
+    // Shared [cell] MAP log-dump helper (protocol 49, extended protocol 59
+    // WORLD-03 with a src= provenance token): src is "local" (the host's own
+    // compute) or "host" (a client's adopted map) - appended AFTER the
+    // existing tokens so Get-CellMap's tail parser (which takes the line's
+    // tail and scans it for 'x,z=owner' triples) is unaffected.
+    void logCellMapDump(const char* src) const;
     // Should enforcement leave this body alone? True when we author its cell,
     // or when its author has sent us no census to judge against. Restores the
     // body first if a previous author's verdict had it hidden. Always false
@@ -2516,13 +3082,25 @@ private:
     // can pause, both must raise"). -1 = not yet known.
     float         speedLastApplied_;   // what WE last wrote (own-write vs user-click detector)
     float         speedMyReq_;         // this client's current request
-    float         speedPeerReq_;       // host only: the join's latest request (-1 = none yet)
+    // Phase 9 Plan 02 (CONS-02): the OLD speedPeerReq_/speedPeerCombat_ bare
+    // scalars (last-writer-wins across every join at N>=3, the documented
+    // Phase 4 deferral) are replaced by a per-owner vote map (SpeedVote.h) -
+    // HOST-only, empty on a join. speedReduce() is the pure min-vote reduce
+    // over this map; a disconnect's speedVotes_.erase(departing)
+    // (ReplicatorCore.cpp clearPeerReplicationState) plus the next
+    // arbitration tick's reduce() IS the "instant vote drop" - no separate
+    // disconnect-branch logic needed here.
+    std::map<u32, coop::SpeedVoteRec> speedVotes_;
     bool          speedCombatCap_;     // false = do NOT pin to 1x while fighting
     bool          speedMyCombat_;      // own-squad in-combat flag (~1 Hz sample)
-    bool          speedPeerCombat_;    // host only: the join's reported combat bit
     float         speedLastSet_;       // host: last broadcast effective; join: last received
     u32           speedSeqOut_;        // per-sender monotonic seq for REQ/SET we send
-    u32           speedSeqSeen_;       // newest seq accepted from the peer (stale guard)
+    // JOIN-only now (Phase 9 Plan 02, CONS-02): a join hears only the host's
+    // single SET stream, so the pre-split scalar stale guard stays exactly
+    // as it was. The HOST's per-sender guard lives inside each
+    // SpeedVoteRec.seqSeen (speedVotes_) instead - see the drain loop in
+    // syncSpeed.
+    u32           speedSeqSeen_;
     unsigned long speedLastSendMs_;    // last REQ (join) / SET (host) send, safety resend
     unsigned long speedCombatSampleMs_;// last own-combat sample time
     unsigned long speedCombatHoldMs_;  // last time own-squad combat read TRUE (cap hysteresis)
@@ -2535,7 +3113,30 @@ private:
     float         timeSlew_;          // local slew: join >= 1 (catch up),
                                       //   host <= 1 (be caught)
     u32           timeSeqOut_;        // monotonic seq for the PKT_TIME we send
-    u32           timeSeqSeen_;       // newest peer sample seq applied
+    // JOIN-only now (Phase 9 Plan 02, CONS-03): a join hears only the host's
+    // single broadcast stream, so the pre-split scalar stays exactly as it
+    // was. The HOST's per-owner guard lives inside each TimeReport.seqSeen
+    // (timeReports_) instead - see the drain loop in syncTime.
+    u32           timeSeqSeen_;
+    // Phase 9 Plan 02 (CONS-03): the OLD single timeSeqSeen_ scalar (used for
+    // BOTH the host's incoming-report guard and the join's incoming-broadcast
+    // guard) collided across join reports at N>=3 - whichever join's counter
+    // was highest silently censored the others', and the brake (below) then
+    // saw only the LAST accepted report (`jn`) instead of the MOST-BEHIND
+    // connected join. This per-owner map replaces the host's use of that
+    // scalar: each reporting join gets its own {gameHours, recvMs, seqSeen}
+    // record, and the brake computes lag against the WORST (min-gameHours)
+    // entry. HOST-only; empty on a join. A disconnect's
+    // timeReports_.erase(departing) (ReplicatorCore.cpp
+    // clearPeerReplicationState) stops a departed laggard from braking the
+    // host forever - the same fix shape as speedVotes_.
+    struct TimeReport {
+        double        gameHours;
+        unsigned long recvMs;
+        u32           seqSeen;
+        TimeReport() : gameHours(-1.0), recvMs(0), seqSeen(0) {}
+    };
+    std::map<u32, TimeReport> timeReports_;
     unsigned long timeLastSendMs_;    // last clock broadcast/report
     unsigned long timeLastLogMs_;     // offset/brake log throttle
     // The engine speed the slewed value was derived from; lets the enforcement

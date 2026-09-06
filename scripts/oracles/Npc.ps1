@@ -1966,9 +1966,15 @@ function Test-SpeedSync {
         return (Add-GateResult -Name "speed_sync" -Status FAIL -Metrics @{ hostSamples = $H.Count; joinSamples = $J.Count } -Detail "insufficient SPEED series")
     }
     # Host arbitration markers (change-only): time + effective + combat bit.
+    # Phase 9 Plan 02 (CONS-02, ReplicatorChannels.cpp) replaced the old
+    # two-scalar "(my=... peer=...)" tail with the "cap=%d VOTES host=..."
+    # per-voter dump (named-owner ground truth for N-player min-vote) -
+    # this regex still required the retired "(my=" tail and so matched
+    # ZERO "[speed] SET" lines even though the host was arbitrating and
+    # transitioning correctly every run since Phase 9.
     $sets = New-Object System.Collections.ArrayList
     $hoff = Get-LogClockOffsetMs -File $HostFile
-    $sp = '\[(\d\d):(\d\d):(\d\d)\.(\d\d\d)\].*\[speed\] SET mult=([\d\.]+) paused=(\d) combat=(\d) \(my='
+    $sp = '\[(\d\d):(\d\d):(\d\d)\.(\d\d\d)\].*\[speed\] SET mult=([\d\.]+) paused=(\d) combat=(\d) cap=\d+ VOTES'
     foreach ($mi in (Select-String -Path $HostFile -Pattern $sp -ErrorAction SilentlyContinue)) {
         $gg = $mi.Matches[0].Groups
         $mu = [double]$gg[5].Value
@@ -2492,8 +2498,16 @@ function Test-NpcCensus {
     }
 
     # 1. CHANNEL evidence on both ends.
+    # Phase 11 log identity-tuple audit (37bfbea, TEST-03) appended an
+    # owner=%u field between "recv" and "n=" (append-only, matching the
+    # sibling [wi]/[census] SPAWN/CULL convention) - this regex used to
+    # require "recv n=" immediately and always read recv=false against a
+    # channel that was actually delivering (join.log shows "[census] recv
+    # owner=0 n=44 kept=44 ..." every cadence tick). Updated to tolerate the
+    # owner= field without weakening the assertion (still requires the
+    # numeric n= count to be present).
     $sent = (Test-Path $HostFile) -and (Select-String -Path $HostFile -Pattern '\[census\] sent n=(\d+)' -Quiet)
-    $recv = (Test-Path $JoinFile) -and (Select-String -Path $JoinFile -Pattern '\[census\] recv n=(\d+)' -Quiet)
+    $recv = (Test-Path $JoinFile) -and (Select-String -Path $JoinFile -Pattern '\[census\] recv (owner=\d+ )?n=(\d+)' -Quiet)
     $chanOk = $sent -and $recv
     Write-Host ("  NPC-CENSUS channel " + $(if ($chanOk) { "PASS" } else { "FAIL" }) +
                 " - host sent=$sent join recv=$recv")

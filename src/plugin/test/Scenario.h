@@ -37,6 +37,26 @@ struct ScenarioContext {
     bool        (*pickMintedProxy)(const unsigned int refHand[5],
                                    unsigned int outLocal[5],
                                    unsigned int outCanon[5], float* outDist);
+    // milestone_a_gate (Phase 4 plan 04, PEER-02/03 reuse): snapshot of the
+    // OTHER PlayerIds this client currently sees as connected (Plugin.cpp's
+    // g_connectedPeers - the roster every client, host or join, maintains via
+    // the connect/leave broadcast). Fills outIds (capacity outCap) and returns
+    // the count written. A scenario must not reach into Plugin.cpp/NetLink
+    // directly, so Plugin.cpp supplies this adapter (0 when unavailable -
+    // always check before calling, same discipline as pickMintedProxy).
+    unsigned int (*connectedPeers)(unsigned int* outIds, unsigned int outCap);
+    // world_state_gate's contested-claim leg (Phase 8 plan 03, WORLD-03):
+    // exposes Replicator::authoritySrc's verdict for world position (x,z) -
+    // the SAME host-authoritative cell-claim map every real consumer
+    // (authorityFor/census/enforceHostAuthority) reads - without the
+    // scenario layer reaching into the Replicator directly (the
+    // pickMintedProxy/connectedPeers adapter precedent above). Writes the
+    // resolved cell (outCx,outCz) and returns the owning ownerId (host id 0
+    // when unclaimed/unmapped/cellAuth off - authoritySrc's own fail-open).
+    // The FUNCTION POINTER itself is 0 when Plugin.cpp has not supplied it
+    // (same discipline as pickMintedProxy/connectedPeers) - always check
+    // before calling.
+    unsigned int (*cellOwnerAt)(float x, float z, int* outCx, int* outCz);
 };
 
 class Scenario {

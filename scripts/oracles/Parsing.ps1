@@ -118,3 +118,30 @@ function Get-MarkerTimeMs {
     return (Convert-StampToMs -Groups $om.Matches[0].Groups -OffsetMs $off)
 }
 
+# 05-03 gap-closure (desync_convergence false FAIL, run 20260902_150136_N4): the
+# LAST timestamped line in $File, in the HOST clock frame - i.e. "how long did
+# this process keep logging ANYTHING at all", independent of any one marker
+# tag. Exists so a caller can tell "the owner's last SCENARIO MEMBER sample is
+# old" apart from "the owner process ITSELF stopped around then" - the same
+# distinction root-cause-2 (04-07, JOIN_DURATION_MS vs HOST_DURATION_MS) drew
+# for the census/wnpc oracles. A join's `MilestoneAScenario::onTick` returns
+# true (ending its own per-tick TABMAP/MEMBER/VITALS dump) the instant its
+# LOCAL elapsed time crosses JOIN_DURATION_MS (140s), while the underlying
+# Kenshi session - and this coop mod's non-scenario logging ([combat]/[stats]/
+# [med]/etc, which the replicator emits regardless of whether any *Scenario
+# object is still ticking) - keeps running until the harness actually tears
+# the process down. A "last MEMBER sample" frozen at 32.9s into a process that
+# goes on logging combat/stats lines for another 10+ seconds is not a report
+# of the owner's true final position; it is a report of when its OWN
+# diagnostic loop happened to stop. Comparing that stale sample against a
+# later, live observer-side sample manufactures a "desync" out of an
+# unrelated, already-diagnosed observability gap - see Test-MagateDesyncConvergence's ownerLastActivityT guard.
+function Get-LogLastActivityMs {
+    param([string]$File)
+    if (-not (Test-Path $File)) { return $null }
+    $off = Get-LogClockOffsetMs -File $File
+    $last = Select-String -Path $File -Pattern '^\[(\d\d):(\d\d):(\d\d)\.(\d\d\d)\]' -ErrorAction SilentlyContinue | Select-Object -Last 1
+    if ($null -eq $last) { return $null }
+    return (Convert-StampToMs -Groups $last.Matches[0].Groups -OffsetMs $off)
+}
+

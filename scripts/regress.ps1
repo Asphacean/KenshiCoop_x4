@@ -52,7 +52,16 @@ param(
     # Two-machine LAN mode: run the matrix through run_lan_test.ps1 (machine 2
     # hosts via SSH-triggered scheduled task; this machine joins). Variants are
     # recorded as lan/lanwan/lanwanskew in history so LAN trends stay separate.
-    [switch]$Lan
+    [switch]$Lan,
+    # Phase 11 (11-03): install-dir passthrough to run_test.ps1's existing
+    # -HostDir/-JoinDir params. Empty = run_test.ps1's own defaults (the
+    # historical two-install layout), so nothing changes for machines that
+    # have it; the 4-clone dev rig (no C:\...\Kenshi or %USERPROFILE%\
+    # Kenshi-Join install) passes two clones instead. run_test.ps1 itself is
+    # untouched - the whole 2-player pipeline stays byte-unchanged
+    # (COMPAT-01's "same generalized code, no special configuration" proof).
+    [string]$HostDir = "",
+    [string]$JoinDir = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -129,6 +138,10 @@ if (-not $SkipBuild) {
     & cmd.exe /c "`"$scriptDir\build_prototest.cmd`""
     if ($LASTEXITCODE -ne 0) { Write-Host "RESULT: FAIL (prototest build failed, exit $LASTEXITCODE)"; exit 1 }
 
+    Write-Host "=== build nettest (unit layer) ==="
+    & cmd.exe /c "`"$scriptDir\build_nettest.cmd`""
+    if ($LASTEXITCODE -ne 0) { Write-Host "RESULT: FAIL (nettest build failed, exit $LASTEXITCODE)"; exit 1 }
+
     $needWan = @($runsPlanned | Where-Object { $_.variant -eq "wan" -or $_.variant -eq "wanskew" }).Count -gt 0
     if ($needWan) {
         Write-Host "=== build netsim (WAN relay) ==="
@@ -141,19 +154,37 @@ if (-not $SkipBuild) {
 
 # ---- 3. Unit layer (step 0: fails in milliseconds, before any game launch) -----
 $prototest = Join-Path $repoRoot "dist\prototest.exe"
-$unitOk = $true
+$prototestOk = $true
 Write-Host ""
 Write-Host "############################################################"
 Write-Host "# UNIT LAYER: prototest (protocol round-trip / fuzz / hash)"
 Write-Host "############################################################"
 if (Test-Path $prototest) {
     & $prototest
-    $unitOk = ($LASTEXITCODE -eq 0)
-    Write-Host ("UNIT LAYER: " + $(if ($unitOk) { "PASS" } else { "FAIL (exit $LASTEXITCODE)" }))
-    if (-not $unitOk -and $FailFast) { Write-Host "OVERALL: FAIL (unit layer)"; exit 1 }
+    $prototestOk = ($LASTEXITCODE -eq 0)
+    Write-Host ("UNIT LAYER: " + $(if ($prototestOk) { "PASS" } else { "FAIL (exit $LASTEXITCODE)" }))
+    if (-not $prototestOk -and $FailFast) { Write-Host "OVERALL: FAIL (unit layer)"; exit 1 }
 } else {
     Write-Host "UNIT LAYER: SKIP - dist\prototest.exe not built (cmd /c scripts\build_prototest.cmd)"
 }
+
+$nettest = Join-Path $repoRoot "dist\nettest.exe"
+$nettestOk = $true
+Write-Host ""
+Write-Host "############################################################"
+Write-Host "# UNIT LAYER: nettest (multi-peer registry: 3 unique ids, 4th rejected)"
+Write-Host "############################################################"
+if (Test-Path $nettest) {
+    & $nettest
+    $nettestOk = ($LASTEXITCODE -eq 0)
+    Write-Host ("UNIT LAYER: " + $(if ($nettestOk) { "PASS" } else { "FAIL (exit $LASTEXITCODE)" }))
+    if (-not $nettestOk -and $FailFast) { Write-Host "OVERALL: FAIL (unit layer)"; exit 1 }
+} else {
+    Write-Host "UNIT LAYER: SKIP - dist\nettest.exe not built (cmd /c scripts\build_nettest.cmd)"
+}
+
+# Combined unit-layer gate consumed by the summary + $allPass below.
+$unitOk = $prototestOk -and $nettestOk
 
 # ---- 4. Run the matrix ----------------------------------------------------------
 $historyFile = Join-Path $repoRoot "tools\test-runs\history.jsonl"
@@ -166,6 +197,8 @@ function Invoke-OneRun {
               "-File", (Join-Path $scriptDir $runner),
               "-Scenario", $Scenario, "-Port", "$Port")
     if ($Lan) { $args += "-SkipBuild" }   # regress already built+deployed; the DLL push still happens per run
+    if (-not $Lan -and $HostDir -ne "") { $args += @("-HostDir", $HostDir) }
+    if (-not $Lan -and $JoinDir -ne "") { $args += @("-JoinDir", $JoinDir) }
     if ($Variant -eq "wan"     -or $Variant -eq "wanskew") { $args += @("-Wan", $WanProfile) }
     if ($Variant -eq "skew"    -or $Variant -eq "wanskew") { $args += @("-FakeClockSkewMs", "$SkewMs") }
     # Resilience: a child run_test.ps1 can emit to stderr (e.g. a transient
@@ -250,8 +283,9 @@ foreach ($r in $runsPlanned) {
 # ---- 5. Single summary -----------------------------------------------------------
 Write-Host ""
 Write-Host "================= REGRESSION SUMMARY (tier=$Tier) ================="
-if (-not $unitOk) { Write-Host "  [FAIL] prototest (unit layer)"; $allPass = $false }
-elseif (Test-Path $prototest) { Write-Host "  [PASS] prototest (unit layer)" }
+if (-not $unitOk) { $allPass = $false }
+if (Test-Path $prototest) { Write-Host ("  [{0}] prototest (unit layer)" -f $(if ($prototestOk) { "PASS" } else { "FAIL" })) }
+if (Test-Path $nettest)   { Write-Host ("  [{0}] nettest (unit layer)"   -f $(if ($nettestOk)   { "PASS" } else { "FAIL" })) }
 foreach ($r in $results) {
     $v = if ($r.pass -and $r.flaky) { "FLAKY" } elseif ($r.pass) { "PASS" } else { "FAIL" }
     Write-Host ""

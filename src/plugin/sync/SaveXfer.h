@@ -83,7 +83,13 @@ int tickWatch(unsigned int* outFiles, unsigned __int64* outBytes,
 // Snapshot save 'name' and queue the BEGIN. Returns false when the folder is
 // missing/empty (nothing is queued). One transfer at a time; a re-begin
 // abandons the previous one (the join drops stale xferIds).
-bool beginSend(NetLink& net, u32 localId, const std::string& name);
+// destId (Phase 10 Plan 01, SAVE-01/SAVE-04): OWNER_ID_ALL (default) keeps the
+// existing coordinated-save broadcast to every connected client; a specific
+// PlayerId streams the SAME transfer to only that one client - a retry-to-
+// one-failed-client (SaveCoord.h's per-client drive) or a late-join targeted
+// push (Plan 02). The sender stays ONE serialized machine either way; tickSend
+// remembers the destination beginSend set until the transfer completes.
+bool beginSend(NetLink& net, u32 localId, const std::string& name, u32 destId = OWNER_ID_ALL);
 bool sending();
 // Pump the active transfer (call every main-loop tick; internally throttled).
 // Logs "[save] XFER-SENT ..." and returns true on the tick the DONE goes out.
@@ -107,6 +113,16 @@ int onSaveDone(const SaveDoneHeader& d, const u32* crcs,
 // ---- Scenario gate accessors -------------------------------------------------
 // HOST: xferId of the last transfer whose DONE went out (0 = none yet).
 u32 lastSentXferId();
+// HOST (Phase 10 Plan 01, SAVE-01): xferId of the CURRENT/most-recent
+// beginSend, valid immediately after beginSend returns true - unlike
+// lastSentXferId() (which only updates once the DONE goes out), this is what
+// SaveCoord.h::saveBegin needs to seed the per-client map against the
+// transfer that is only just starting to stream.
+u32 sendXferId();
+// HOST (Phase 10 Plan 01, SAVE-01): total bytes of the CURRENT/most-recent
+// beginSend - the size-scaled ACK-deadline input (deadline = max(the
+// configured floor, totalBytes / 2.5MBps * 3)).
+unsigned __int64 sendTotalBytes();
 // JOIN: outcome of the last DONE verify+commit (-1 = none yet, 1 = committed,
 // 0 = failed).
 int lastCommitResult();

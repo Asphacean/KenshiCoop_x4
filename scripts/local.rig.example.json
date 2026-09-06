@@ -1,0 +1,49 @@
+{
+  "_comment": "Per-machine N-instance rig config for run_test4.ps1 (Milestone A gate, 4-process loopback). Copy to local.rig.json and fill in with this machine's real install paths - local.rig.json is gitignored and never committed. Element 0 of 'instances' MUST be the host; elements 1..N-1 are joins, launched in array order after the host reaches gameplay. run_test4.ps1 THROWS if fewer instances are configured than requested, or if any installDir is missing kenshi_x64.exe - it never silently degrades to fewer instances.",
+  "save": "squad1",
+  "port": 27800,
+  "ip": "127.0.0.1",
+  "seconds": 90,
+  "instances": [
+    {
+      "_comment": "index 0 = HOST. Must be a real, loader-equipped Kenshi install (the primary Steam install or an equivalent clone).",
+      "role": "host",
+      "installDir": "C:\\Program Files (x86)\\Steam\\steamapps\\common\\Kenshi",
+      "port": 27800,
+      "logName": "host.log",
+      "env": {},
+      "disconnectAtSec": null,
+      "reconnectAtSec": null
+    },
+    {
+      "_comment": "index 1 = join1, launched after the host reaches 'gameplay started'.",
+      "role": "join",
+      "installDir": "C:\\KenshiCoop-Clone1",
+      "port": 27800,
+      "logName": "join1.log",
+      "env": {},
+      "disconnectAtSec": null,
+      "reconnectAtSec": null
+    },
+    {
+      "_comment": "index 2 = join2. disconnectAtSec/reconnectAtSec (both optional, seconds since this instance's own launch) drive the DoD's live disconnect/rejoin step: an instance with disconnectAtSec exits early while the others keep running; an instance with reconnectAtSec is (re)launched at that offset as the replacement/rejoin join. Leave both null for a plain 4-way connect with no lifecycle scripting.",
+      "role": "join",
+      "installDir": "C:\\KenshiCoop-Clone2",
+      "port": 27800,
+      "logName": "join2.log",
+      "env": {},
+      "disconnectAtSec": null,
+      "reconnectAtSec": null
+    },
+    {
+      "_comment": "index 3 = join3.",
+      "role": "join",
+      "installDir": "C:\\KenshiCoop-Clone3",
+      "port": 27800,
+      "logName": "join3.log",
+      "env": {},
+      "disconnectAtSec": null,
+      "reconnectAtSec": null
+    }
+  ]
+}

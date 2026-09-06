@@ -4,12 +4,14 @@
 // canonical-hand translation) and publishNpcCensus (protocol 36 existence
 // broadcast).
 //
-// Shared hubs: writes ownHands_/tabRank_ (per-tick owned set), midCursor_;
-// reads canonicalOf_ (stamped by the drive TU), censusHands_.
+// Shared hubs: writes ownHands_/tabRank_/handOwner_ (per-tick owned set +
+// per-tick owner tag), midCursor_; reads canonicalOf_ (stamped by the drive
+// TU), census_ (per-owner, Task 3 WORLD-03).
 // Must NOT: change any log string - log phrasing is the API consumed by the
 // PowerShell oracles (see resources/CODE_MAP.md, log-tag index).
 
 #include "ReplicatorUtil.h"
+#include "../core/OwnRanks.h" // Phase 3: ownerForRank() rank->PlayerId default
 
 namespace coop {
 
@@ -47,15 +49,35 @@ void Replicator::publishOwned(GameWorld* gw, NetLink& net, u32 ownerId) {
     // appended tab's rank is outside ownRanks_ on both clients, so it belonged
     // to neither of them until this ran.
     decideTabs(raw, nSquad, ctnrs);
+    // Phase 3 Plan 03 (OWN-01/OWN-03): the tab set just changed (decideTabs
+    // set tabsChanged_) - HOST re-announces the authoritative ownership map.
+    // No-op on a join (announceOwnRanks is gated to isHostRole()).
+    if (tabsChanged_) {
+        tabsChanged_ = false;
+        announceOwnRanks(net, ownerId);
+    }
     ownHands_.clear();
     // Full squad roster (own + peer) for the trade veto's owner classifier: every
     // captured member, before the ownership partition below decides which we own.
     allSquad_.clear();
     for (unsigned int i = 0; i < nSquad; ++i) allSquad_.insert(keyOf(raw[i]));
+    // Phase 3 (OWN-01): the PlayerId owner of every squad member (own + peer),
+    // refreshed every tick alongside allSquad_. Cleared here too - a hand that
+    // drops out of the squad this tick must not answer a stale ownerOfHand().
+    handOwner_.clear();
     unsigned int n = 0;
     for (unsigned int i = 0; i < nSquad && n < MAX_PUBLISH; ++i) {
         std::pair<u32, u32> key(raw[i].hContainer, raw[i].hContainerSerial);
         unsigned int rank = tabRankFor(key, ctnrs);
+        // Phase 3 (OWN-01): tag this squad member with its deterministic
+        // rank-based owner PlayerId - independent of the ownership verdict
+        // below. ownerOfHand()/isMine() let a caller ask "who owns this
+        // hand" and "is it mine" as two separate questions, generalizing the
+        // old ownerClassForHand() 0/1/2 verdict to N owners (POC-01).
+        // resolveRankOwner() (Plan 03) layers the host-authoritative
+        // announcement (allOwnRanks_) over the rank=playerId default
+        // (ownerForRank) without changing this call site's shape.
+        handOwner_[keyOf(raw[i])] = resolveRankOwner(rank);
         // The per-tab verdict (decideTabs). For the save's own tabs this is the
         // historical rank rule; for a tab created mid-session it is the side that
         // authored it, or the host. Empty ownRanks_ (never configured) still falls
@@ -237,6 +259,7 @@ void Replicator::publishOwned(GameWorld* gw, NetLink& net, u32 ownerId) {
             unsigned int nPeerAnch = peerAnchors(gw, peerAnch);
             unsigned long cNow = nowMs();
             unsigned int kept = 0;
+            unsigned int held = 0; // 04-07 gap-closure: census-hold diagnostics
             for (unsigned int i = 0; i < got; ++i) {
                 if (!weAuthor(gw, ownerId, buf[n + i].x, buf[n + i].z)) continue;
                 // The peer's census is the other half of incumbent-holds. weAuthor
@@ -254,8 +277,10 @@ void Replicator::publishOwned(GameWorld* gw, NetLink& net, u32 ownerId) {
                 // what now, and reading its silence as "they gave this up" would
                 // have us start writing bodies they are still driving.
                 if (censusRecvMs_ != 0 && (cNow - censusRecvMs_) <= 5000 &&
-                    censusHands_.find(keyOf(buf[n + i])) != censusHands_.end())
+                    censusHasAny(keyOf(buf[n + i]))) {
+                    ++held;
                     continue;
+                }
                 // Echo guard (2026-08-08, the dual-drive fix). captureNpcs
                 // returns every local NPC in the bubble, and a MINTED PROXY is
                 // one - so a body that exists only because the host streams it
@@ -298,6 +323,21 @@ void Replicator::publishOwned(GameWorld* gw, NetLink& net, u32 ownerId) {
                 ++kept;
             }
             got = kept;
+            // 04-07 gap-closure diagnostics (SCENARIO MAGATE ADOPTDBG): throttled
+            // to ~1 Hz (this loop runs at publish cadence, ~20 Hz) - reports how
+            // many candidate bodies THIS tick's census-hold branch above just held
+            // back, plus the census-adoption knobs (adoptRadius_, the cumulative
+            // censusAdopts_ from ReplicatorSpawn.cpp's adoption path), so a
+            // still-N=2-shaped census-hold/adoption asymmetry (hypothesis b) is
+            // directly observable per client, oracle-greppable.
+            static unsigned long s_lastAdoptDbgMs = 0;
+            if (s_lastAdoptDbgMs == 0 || (cNow - s_lastAdoptDbgMs) >= 1000) {
+                s_lastAdoptDbgMs = cNow;
+                char ab[144]; _snprintf(ab, sizeof(ab) - 1,
+                    "SCENARIO MAGATE ADOPTDBG held=%u adoptRadius=%.0f adopted=%lu",
+                    held, adoptRadius_, censusAdopts_);
+                ab[sizeof(ab) - 1] = '\0'; coop::logLine(ab);
+            }
         }
         n += got;
     }
@@ -806,6 +846,121 @@ void Replicator::publishOwned(GameWorld* gw, NetLink& net, u32 ownerId) {
         if (nowPub - hit->second.seenMs > HOSTBODY_STALE_MS) hostBody_.erase(hit++);
         else ++hit;
     }
+}
+
+// Phase 3 Plan 03 (OWN-01/OWN-03, T-03-06): HOST ONLY - build the
+// authoritative map<PlayerId,set<rank>> and broadcast it as PKT_OWN_RANKS.
+// Called whenever roster membership (Plugin.cpp) or the tab set (this file's
+// publishOwned, tabsChanged_) changes.
+//
+// Base assignment is the deterministic rank=playerId default (ownerForRank)
+// for every connected player (self + knownPeers_). Any DYNAMICALLY created
+// tab (rank >= tabsSeeded_, i.e. outside the session-start-seeded prefix) is
+// then arbitrated via the existing tab-ownership decision (tabOwned_): true
+// means THIS (host) authored it, false means a connected peer did.
+//
+// KNOWN LIMITATION (documented, not silently dropped - see 03-03-SUMMARY):
+// at N<=2 (host + one join) the peer is unambiguous. tabOwned_/pinOwned_/
+// pinPeer_ are still a binary own-vs-peer partition (not a per-specific-
+// PlayerId author), so at N>2 a peer-owned dynamic tab is attributed to the
+// LOWEST connected peer id rather than its true creator. The base
+// rank=playerId assignment (every static squad tab) is unaffected and always
+// correct; only a THIRD+ player's dynamically created tab can be
+// misattributed. All machines still converge on the SAME (host-decided)
+// answer either way - the single-owner-per-rank invariant (OWN-01) never
+// breaks - only "whose action created it" (OWN-03) may be imprecise beyond
+// two players until per-hand author tracking is generalized (deferred).
+void Replicator::announceOwnRanks(NetLink& net, u32 ownerId) {
+    if (!isHostRole()) return;
+
+    std::map<u32, std::set<unsigned int> > m;
+    m[ownerId].insert(ownerForRank(0u)); // host's own base rank (0)
+    for (std::set<u32>::const_iterator pit = knownPeers_.begin();
+         pit != knownPeers_.end(); ++pit) {
+        m[*pit].insert(ownerForRank(*pit));
+    }
+    for (std::map<std::pair<u32, u32>, unsigned int>::const_iterator it = tabRank_.begin();
+         it != tabRank_.end(); ++it) {
+        unsigned int rank = it->second;
+        std::map<std::pair<u32, u32>, bool>::const_iterator ot = tabOwned_.find(it->first);
+        if (tabsSeeded_ != 0 && rank < tabsSeeded_) {
+            // WR-01 fix: a seeded tab's owner is NOT always the assumed
+            // ownerForRank(rank)=rank default the base assignment above just
+            // inserted - decideTabs()'s seeding branch actually decides via
+            // ownRanks_.count(rank), which supports an explicit
+            // KENSHICOOP_OWN_SQUAD/OWN_RANK override (OwnRanks.h), e.g. a
+            // host configured to own ranks {0,1}. Consult tabOwned_ (the
+            // ground truth ownsTab() consults) and, only when it disagrees
+            // with the default, move the rank from its assumed owner's set
+            // to its actual one - so publishOwned's real partition and this
+            // wire announcement never diverge.
+            //
+            // WR-02 fix: the original `actualOwner = ownedByHost ? ownerId :
+            // defaultOwner` short-circuit was asymmetric. ownerForRank() is
+            // the identity function, so for rank==0, defaultOwner is ALWAYS
+            // the host's own id (0) - meaning when ownedByHost==false (a
+            // peer owns the host's own default rank 0, via the OWN_RANK
+            // override), actualOwner collapsed right back to defaultOwner
+            // and the correction never fired, misreporting rank 0 as
+            // host-owned. Attribute the not-owned-by-host case to the peer
+            // the same way the dynamic-tab branch below already does
+            // (lowest known peer), and always erase-then-insert unconditionally
+            // instead of short-circuiting on actualOwner != defaultOwner -
+            // that short circuit is exactly what hid the rank-0 case.
+            bool ownedByHost = (ot == tabOwned_.end()) ? (rank == 0u) : ot->second;
+            u32 defaultOwner = ownerForRank(rank);
+            // Not host-owned: tabOwned_ is a binary host-vs-peer partition,
+            // so when the rank's DEFAULT owner is already a peer the default
+            // IS the answer - rank=playerId stays correct for every ordinary
+            // session including N>2. Only when the default owner is the HOST
+            // itself (rank 0 given away via the OWN_RANK override) is the
+            // true peer ambiguous - fall back to the lowest known peer, the
+            // same documented N>2 limitation as the dynamic-tab branch below.
+            u32 actualOwner;
+            if (ownedByHost) {
+                actualOwner = ownerId;
+            } else if (defaultOwner != ownerId) {
+                actualOwner = defaultOwner;
+            } else {
+                actualOwner = knownPeers_.empty() ? defaultOwner
+                                                  : *knownPeers_.begin();
+            }
+            std::map<u32, std::set<unsigned int> >::iterator dit = m.find(defaultOwner);
+            if (dit != m.end()) dit->second.erase(rank);
+            m[actualOwner].insert(rank);
+            continue;
+        }
+        // Dynamic tab (rank >= tabsSeeded_): unchanged - attribute to the
+        // lowest known peer id (documented N>2 limitation, see the function
+        // header comment above).
+        bool ownedByHost = (ot == tabOwned_.end()) || ot->second;
+        u32 owner = ownedByHost ? ownerId
+                                : (knownPeers_.empty() ? ownerId : *knownPeers_.begin());
+        m[owner].insert(rank);
+    }
+    setAllOwnRanks(m);
+
+    OwnRanksPacket pkt;
+    std::memset(&pkt, 0, sizeof(pkt));
+    pkt.type = (u8)PKT_OWN_RANKS;
+    unsigned int n = 0;
+    for (std::map<u32, std::set<unsigned int> >::const_iterator mit = m.begin();
+         mit != m.end() && n < MAX_PLAYERS; ++mit, ++n) {
+        pkt.entries[n].playerId = mit->first;
+        pkt.entries[n].rankMask = ranksToMask(mit->second);
+        // Single-owner log-oracle (Phase 4's 4-process harness greps this
+        // exact grammar across all instances' logs): one line per assignment.
+        for (std::set<unsigned int>::const_iterator rit = mit->second.begin();
+             rit != mit->second.end(); ++rit) {
+            char b[64];
+            _snprintf(b, sizeof(b) - 1, "player=%u rank=%u",
+                      (unsigned)mit->first, (unsigned)*rit);
+            b[sizeof(b) - 1] = '\0';
+            coop::logLine(b);
+        }
+    }
+    pkt.count = (u8)n;
+    net.broadcastOwnRanks(pkt);
 }
 
 // world_parity roster row: legacy WNPC schema (hand/pos/cls/name - the

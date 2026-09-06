@@ -2230,11 +2230,12 @@ bool vetoLocalDeath(Character* c) {
 
 bool pickCombatVictim(GameWorld* gw, const unsigned int refHand[5],
                       const unsigned int excludeHand[5], unsigned int outHand[5],
-                      const unsigned int excludeHand2[5]) {
+                      const unsigned int excludeHand2[5], float radius) {
     if (!g_getCharsFn || !gw) return false;
     Character* ref = resolveCharByHand(refHand[3], refHand[4], refHand[0],
                                        refHand[1], refHand[2]);
     if (!ref) return false;
+    if (radius <= 0.0f) radius = 30.0f;
     // Gather nearby non-squad candidates by distance inside one SEH frame, then
     // apply the upright filter (readBodyState has its own SEH) on the shortlist.
     const unsigned int MAXC = 16;
@@ -2242,7 +2243,7 @@ bool pickCombatVictim(GameWorld* gw, const unsigned int refHand[5],
     __try {
         Ogre::Vector3 center = ref->getPosition();
         g_npcQuery.clear();
-        g_getCharsFn(gw, &g_npcQuery, &center, 30.0f, 30.0f, 30.0f, 64, 64, 0);
+        g_getCharsFn(gw, &g_npcQuery, &center, radius, radius, radius, 64, 64, 0);
         for (unsigned int i = 0; i < g_npcQuery.size() && nc < MAXC; ++i) {
             RootObject* o = g_npcQuery[i];
             if (!o || isPlayerSquad(gw, o)) continue;

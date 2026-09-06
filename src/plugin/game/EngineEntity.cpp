@@ -498,6 +498,41 @@ bool park(Character* c, float x, float y, float z, float heading) {
     }
 }
 
+// Squad-scope teleport via the engine's own ActivePlatoon::teleport (the
+// player-squad relocation path - see Engine.h's contract). Resolved through
+// Character::getPlatoon, the wallet channel's own proven body->platoon path.
+bool teleportSquad(Character* c, float x, float y, float z) {
+    if (!c || !g_getPlatoonFn || !g_platoonTeleportFn) return false;
+    __try {
+        ActivePlatoon* ap = g_getPlatoonFn(c);
+        if (!ap) return false;
+        Ogre::Vector3 pos(x, y, z);
+        g_platoonTeleportFn(ap, &pos);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+// Character-level teleport to an absolute position (see Engine.h's contract:
+// the walkTo Character-vs-CharMovement split, applied to teleports).
+// MEASURED SEMANTICS (run 20260903_145920_N4): Character::teleport's Vector3
+// is an ABSOLUTE DESTINATION, not the relative displacement KenshiLib's
+// 'moveBy' arg name suggests - passing a delta of (8000,dy,0) from spawn
+// landed the body at exactly world (8000,0), 50963u away, in ONE frame,
+// including into an UNLOADED zone (zone=0 at the landing point). This is the
+// lever that actually moves a locally player-controlled body.
+bool teleportCharTo(Character* c, float x, float y, float z) {
+    if (!c || !g_charTeleportFn) return false;
+    __try {
+        Ogre::Vector3 pos(x, y, z);
+        g_charTeleportFn(c, &pos);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
 // Census-freeze support: stop an in-flight movement goal WITHOUT teleporting.
 // The AI-suspend hook only blocks new periodic decisions - a destination the
 // slave AI committed before the freeze keeps the body running (run 014948: a
@@ -685,6 +720,24 @@ bool cameraFocusOn(GameWorld* gw, Character* c) {
     return true;
 }
 
+// Move the LOCAL camera to an absolute world position (see Engine.h's
+// contract: zone pre-streaming for far body teleports). Same guarded
+// gw->player->camera access as cameraFocusOn above.
+bool cameraTeleport(GameWorld* gw, float x, float y, float z) {
+    if (!gw || !g_camTeleportFn || !g_camIsInitFn) return false;
+    __try {
+        PlayerInterface* pl = gw->player;
+        if (!pl) return false;
+        CameraClass* cam = pl->camera;
+        if (!cam || !g_camIsInitFn(cam)) return false;
+        Ogre::Vector3 pos(x, y, z);
+        g_camTeleportFn(cam, &pos);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
 // Camera anchor stores (protocol 43, camera-anchored interest). Main-thread
 // only: the sync layer publishes these each tick (syncCamHint), and
 // interestCenters reads them in the same tick.
@@ -712,27 +765,51 @@ bool peerCamAnchor(float out[3]) {
     return true;
 }
 
-// DUAL-INTEREST centers (step 5): one interest sphere per squad TAB leader, up
-// to two. Both clients load the same save, so the shared playerCharacters list
-// (and its tab/container partition) is identical on each machine - the first
-// member of each distinct hand-container IS the other player's leader as seen
-// locally. A single host-leader-centered sphere meant the shared world degraded
-// the moment the players split up (spike 16); with one sphere per tab leader,
-// NPCs around EACH player stay streamed (spike 19's validated design).
+// 04-07 gap-closure diagnostics: last interestCenters() call's raw
+// playerCharacters count (tabsSeen) vs. the distinct squad-tab-leader centers
+// it actually resolved (centersResolved). Main-thread only (interestCenters
+// itself is main-thread-only, SEH-guarded by its caller).
+static unsigned int s_lastTabsSeen = 0;
+static unsigned int s_lastCentersResolved = 0;
+
+void lastInterestDebug(unsigned int& tabsSeen, unsigned int& centersResolved) {
+    tabsSeen = s_lastTabsSeen;
+    centersResolved = s_lastCentersResolved;
+}
+
+// N-WAY INTEREST centers (step 5, generalized Phase 4 plan 06): one interest
+// sphere per distinct squad TAB leader, up to FOUR (Milestone A gate's baked
+// 4-squad start seeds all four ranks - the original "up to two" cap here
+// predates N>2 and silently truncated captureNpcs()/listNpcs()/listNpcsWide()
+// to only the FIRST two tabs this client's own playerCharacters happened to
+// enumerate, which differs per client and is exactly what produced the live
+// N=4 census divergence this plan's gate exists to catch: two clients whose
+// first-two-tabs draw differed streamed two genuinely different NPC subsets
+// near the OTHER two (uncovered) tab leaders. All connected clients load the
+// same save, so the shared playerCharacters list (and its tab/container
+// partition) is identical on each machine - the first member of each
+// distinct hand-container IS that player's leader as seen locally. A single
+// host-leader-centered sphere meant the shared world degraded the moment the
+// players split up (spike 16); one sphere per tab leader keeps NPCs around
+// EACH player streamed (spike 19's validated design, now covering all four
+// ranks instead of just the first two).
 //
-// Protocol 43 grows the set to up to FOUR anchors: the two tab-leader spheres
-// plus the LOCAL camera center and the peer's fresh CAMERA HINT - so NPCs
-// where a player is LOOKING (but no PC is standing) stay streamed/listed.
-// Camera anchors within ~100u of an existing anchor are dropped (the common
-// camera-follows-leader case adds no reach, only query cost). Writes up to
-// four centers; returns the count. Caller holds the SEH frame.
+// Protocol 43 also folds in a LOCAL camera center + the peer's fresh CAMERA
+// HINT (so NPCs where a player is LOOKING but no PC is standing stay
+// streamed/listed) when slots remain after the tab-leader spheres - at N=4
+// with all four tab slots filled, camera anchors have no room left (the tab
+// spheres take priority; camera-anchored interest is a 2-player supplement,
+// not needed for census correctness). Camera anchors within ~100u of an
+// existing anchor are dropped (the common camera-follows-leader case adds no
+// reach, only query cost). Writes up to four centers; returns the count.
+// Caller holds the SEH frame.
 unsigned int interestCenters(GameWorld* gw, Ogre::Vector3 outC[4]) {
     PlayerInterface* pl = gw->player;
     if (!pl || pl->playerCharacters.size() == 0) return 0;
-    unsigned int pairs[2][2];
+    unsigned int pairs[4][2];
     unsigned int nc = 0;
     unsigned int total = pl->playerCharacters.size();
-    for (unsigned int i = 0; i < total && nc < 2; ++i) {
+    for (unsigned int i = 0; i < total && nc < 4; ++i) {
         Character* m = pl->playerCharacters[i];
         if (!m) continue;
         unsigned int h[5];
@@ -745,6 +822,15 @@ unsigned int interestCenters(GameWorld* gw, Ogre::Vector3 outC[4]) {
         outC[nc] = m->getPosition();
         ++nc;
     }
+    // 04-07 gap-closure diagnostics: latch this call's raw playerCharacters
+    // count against the distinct tab-leader centers actually resolved (BEFORE
+    // the camera-anchor fold-in below, which is a bandwidth supplement, not
+    // part of the roster-resolution question). Read back via
+    // lastInterestDebug() by the scenario layer so CENSUSDBG can tell "this
+    // client's playerCharacters roster was still incomplete" (tabsSeen<4 /
+    // centersResolved<4) apart from a different-mechanism divergence.
+    s_lastTabsSeen = total;
+    s_lastCentersResolved = nc;
     if (nc == 0 || !s_camInterest) return nc;
     // Fold in the camera anchors (local first, then the peer hint), deduped
     // against everything already in the set. nc==0 stays 0: no players in
@@ -913,6 +999,30 @@ bool captureNpcByHand(GameWorld* gw, unsigned int hIndex, unsigned int hSerial,
     if (!c) return false;
     __try {
         if (isPlayerSquad(gw, static_cast<RootObject*>(c))) return false;
+        return captureOne(c, out);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+// 04-09 gap-closure: capture a KNOWN-live Character* directly, bypassing hand
+// resolution entirely. A minted proxy's WIRE key (the host's hand, what
+// proxyByKey_/targets_ are keyed on) never equals the proxy's own LOCAL
+// engine hand - createChar hands the new object a fresh local identity, and
+// the [rekey] log at mint time records that wire-to-local mapping explicitly.
+// captureNpcByHand(wire hand) therefore can never resolve a proxy: it calls
+// resolveCharByHand on a hand no local object actually carries. Every caller
+// that already holds the proxy's Character* (proxyByKey_'s own bound
+// pointer) should capture through THAT pointer instead of re-deriving it
+// from a hand doomed to miss. Measured 2026-09-02 (run 20260902_105146_N4):
+// this gap silently starved the ReplicatorAuthority audit-dump's
+// targets_/censusHands_ fallback passes (built for exactly this "driven but
+// not spatially enumerated" case) of every proxy for as long as the near/
+// wide GetCharsInSphere passes also failed to enumerate it - a live, driven,
+// combat-correct proxy invisible to the WNPC diagnostic dump for ~66s.
+bool captureNpcByPointer(Character* c, EntityState* out) {
+    if (!c || !out) return false;
+    __try {
         return captureOne(c, out);
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         return false;

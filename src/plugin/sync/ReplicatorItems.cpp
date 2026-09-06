@@ -445,10 +445,14 @@ void Replicator::publishWorldItems(GameWorld* gw, NetLink& net, u32 ownerId) {
                 b[sizeof(b) - 1] = '\0'; coop::logLine(b);
                 continue;
             }
-            // A drop from a PEER-owned squad copy is the peer's to author (it streams
-            // its own drop); authoring it here too would duplicate the proxy. World
-            // NPC (class 0) and our own squad (class 1) drops still stream.
-            if (ownerClassForHand(de[i].ownerHand) == 2) continue;
+            // A drop from a squad copy owned by someone OTHER than us is that
+            // owner's to author (it streams its own drop); authoring it here too
+            // would duplicate the proxy. World NPC (untracked) and our own squad
+            // drops still stream. Phase 3 owner-aware form of the old
+            // ownerClassForHand(...) == 2 check (formerly "the one PEER"; now any
+            // other tracked owner, POC-01).
+            if (ownerOfHand(de[i].ownerHand) != OWNER_NONE &&
+                !isMine(de[i].ownerHand)) continue;
             Key k; k.t = de[i].itemHand[0]; k.c = de[i].itemHand[1]; k.cs = de[i].itemHand[2];
             k.i = de[i].itemHand[3]; k.s = de[i].itemHand[4];
             if (worldTrack_.find(k) != worldTrack_.end()) continue; // already tracked
@@ -554,9 +558,13 @@ void Replicator::publishWorldItems(GameWorld* gw, NetLink& net, u32 ownerId) {
                 tr.hash = h; tr.lastSendMs = now;
                 tr.x = pos[0]; tr.y = pos[1]; tr.z = pos[2];
                 if (changed && dumpWi) {
-                    char b[200]; _snprintf(b, sizeof(b) - 1,
-                        "[wi] SEND netId=%u sid='%s' qty=%u pos=%.2f,%.2f,%.2f hash=%u",
-                        tr.netId, tr.stringID, tr.quantity, pos[0], pos[1], pos[2], h);
+                    // Phase 11 plan 02 (TEST-01) log identity audit: append
+                    // owner=%u (this publisher's own id, matching the
+                    // [wi] SPAWN/CULL owner= convention already used on the
+                    // apply side below) - append-only, end-of-line.
+                    char b[224]; _snprintf(b, sizeof(b) - 1,
+                        "[wi] SEND netId=%u sid='%s' qty=%u pos=%.2f,%.2f,%.2f hash=%u owner=%u",
+                        tr.netId, tr.stringID, tr.quantity, pos[0], pos[1], pos[2], h, ownerId);
                     b[sizeof(b) - 1] = '\0'; coop::logLine(b);
                 }
             } else {
@@ -579,15 +587,17 @@ void Replicator::publishWorldItems(GameWorld* gw, NetLink& net, u32 ownerId) {
     if (ns > 0) net.queueWorldItems(ownerId, send, ns);
     if (nr > 0) net.queueWorldRemove(ownerId, removed, nr);
 
-    // ---- CLAIM half (protocol 47): a proxy WE hold just went into a local bag ----
+    // ---- CLAIM half (protocol 47; protocol 58: now the claim INTENT) -------------
     // W1 mirrors a drop but never mirrored the PICKUP: the author's cull tests the liveness
     // of its OWN real item, which is still on its ground, so it never fired. Report each
-    // consumed proxy to its author so it destroys the real copy. Only a proxy that still
-    // reads AND is now inside an inventory counts - a merely destroyed proxy is dropped
-    // silently, because claiming on it would delete the author's item for no reason.
-    // Claims are grouped per author (netIds live in the AUTHOR's id space).
+    // consumed proxy to the host as a claim INTENT - the host arbitrates contention
+    // (ClaimArbiter.h) and broadcasts the single deterministic verdict. Only a proxy that
+    // still reads AND is now inside an inventory counts - a merely destroyed proxy is
+    // dropped silently, because claiming on it would delete the author's item for no
+    // reason. Claims are grouped per author (netIds live in the AUTHOR's id space).
     {
         std::map<u32, std::vector<u32> > claims;
+        u32 stampMs = nowMs(); // protocol 58: same claim-detection frame for the whole batch
         for (std::map<std::pair<u32, u32>, WorldProxy>::iterator pi = worldProxies_.begin();
              pi != worldProxies_.end(); ) {
             bool pickedUp = false;
@@ -599,6 +609,20 @@ void Replicator::publishWorldItems(GameWorld* gw, NetLink& net, u32 ownerId) {
             if (live && engine::groundObjectLiveness(live, 0, &pickedUp)) { ++pi; continue; }
             if (pickedUp) {
                 claims[pi->first.first].push_back(pi->first.second);
+                // Capture the item identity WHILE the object is still readable (it
+                // is inside a bag now, not destroyed) - a losing claim's later
+                // rollback (applyClaimVerdict) needs sid/itemType/quantity to
+                // remove-by-sid from our own bag, and this is the only tick the
+                // object is guaranteed resolvable from this side.
+                PendingClaimIdentity ident; memset(&ident, 0, sizeof(ident));
+                unsigned int identType = 0; unsigned short identQty = 0;
+                if (live && engine::readItemIdentity(live, ident.stringID,
+                                                     sizeof(ident.stringID),
+                                                     &identType, &identQty)) {
+                    ident.itemType = identType; ident.quantity = identQty;
+                    myClaims_[pi->first] = ident;
+                    if (myClaims_.size() > 4096) myClaims_.erase(myClaims_.begin());
+                }
                 if (dumpWi) { char b[160]; _snprintf(b, sizeof(b) - 1,
                     "[wi] CLAIM author=%u netId=%u (proxy consumed locally)",
                     pi->first.first, pi->first.second);
@@ -614,7 +638,7 @@ void Replicator::publishWorldItems(GameWorld* gw, NetLink& net, u32 ownerId) {
         for (std::map<u32, std::vector<u32> >::iterator ci = claims.begin();
              ci != claims.end(); ++ci)
             net.queueWorldClaim(ownerId, ci->first, &ci->second[0],
-                                (unsigned int)ci->second.size());
+                                (unsigned int)ci->second.size(), stampMs);
     }
 }
 
@@ -662,9 +686,13 @@ void Replicator::applyWorldItems(GameWorld* gw, Inbound& in) {
                     RootObject* live = liveWorldProxy(wp);
                     if (live) engine::updateWorldItemProxy(live, e->x, e->y, e->z);
                     wp.x = e->x; wp.y = e->y; wp.z = e->z;
-                    if (dumpWi) { char b2[176]; _snprintf(b2, sizeof(b2) - 1,
-                        "[wi] MOVE netId=%u pos=%.2f,%.2f,%.2f live=%d",
-                        e->netId, e->x, e->y, e->z, live ? 1 : 0);
+                    // Phase 11 plan 02 (TEST-01) log identity audit: append
+                    // owner=%u (b->ownerId, the SAME field the sibling
+                    // [wi] SPAWN/CULL lines already carry for this exact
+                    // proxy) - append-only, end-of-line.
+                    if (dumpWi) { char b2[200]; _snprintf(b2, sizeof(b2) - 1,
+                        "[wi] MOVE netId=%u pos=%.2f,%.2f,%.2f live=%d owner=%u",
+                        e->netId, e->x, e->y, e->z, live ? 1 : 0, b->ownerId);
                         b2[sizeof(b2) - 1] = '\0'; coop::logLine(b2); }
                 }
             }
@@ -712,39 +740,284 @@ void Replicator::applyWorldItems(GameWorld* gw, Inbound& in) {
 }
 
 void Replicator::applyWorldClaims(GameWorld* gw, Inbound& in, u32 localId) {
+    // SUPERSEDED (protocol 47 -> 58, Phase 7 Plan 02): dormant, no longer
+    // called from Plugin.cpp. The old body destroyed the author's real ground
+    // object UNCONDITIONALLY on any claim notice - the "no track; already
+    // gone" silent no-op this left when a SECOND simultaneous claimant's
+    // notice arrived after the first already destroyed the object is exactly
+    // the 2-player dup this plan fixes. Contention is now arbitrated by the
+    // host BEFORE any destroy happens (applyClaimIntents/applyClaimVerdict).
+    // Kept only as a drain-and-discard stub so a stray claim received from a
+    // mismatched build (impossible - PROTOCOL_VERSION gates the handshake)
+    // cannot grow InboundWorldClaim's queue unbounded.
     std::deque<InboundWorldClaim> got;
     in.drainWorldClaim(got);
-    if (got.empty()) return;
+    (void)gw; (void)localId;
+}
+
+// HOST ONLY (protocol 58, Phase 7 Plan 02, INV-03) - see the declaration doc
+// comment in Replicator.h for the full contract. Arbitrates every claim
+// intent via ClaimArbiter.h's bounded contention window and broadcasts the
+// single deterministic verdict.
+void Replicator::applyClaimIntents(GameWorld* gw, Inbound& in, NetLink& net, u32 localId) {
+    std::deque<InboundWorldClaim> got;
+    in.drainWorldClaim(got);
     static int dumpWi = -1;
     if (dumpWi < 0) { const char* e = getenv("KENSHICOOP_INV_DUMP"); dumpWi = (e && e[0] == '1') ? 1 : 0; }
+    unsigned long now = nowMs();
+    // KENSHICOOP_CLAIM_WINDOW_MS (default 250 ms - the KENSHICOOP_INTERP_*
+    // env-parse precedent): the bounded contention window length. Read once,
+    // cached, so a tester can widen it for WAN A/B without a rebuild.
+    static long windowMsCache = -1;
+    if (windowMsCache < 0) {
+        const char* e = getenv("KENSHICOOP_CLAIM_WINDOW_MS");
+        int v = e ? atoi(e) : 0;
+        windowMsCache = (v > 0) ? v : 250;
+    }
+    const unsigned long CLAIM_WINDOW_MS = (unsigned long)windowMsCache;
+    // The determinism tie-band (research Option A): two claims within this
+    // many ms of each other, or any unmappable claim, break to the lowest
+    // playerId rather than to clock luck.
+    const unsigned long CLAIM_EPS_MS = 30;
+
     for (std::deque<InboundWorldClaim>::iterator b = got.begin(); b != got.end(); ++b) {
-        if (b->ownerId == localId) continue;      // our own claim echoed back (relay safety)
-        if (b->authorId != localId) continue;     // addressed to a different author
-        for (std::vector<u32>::iterator id = b->netIds.begin(); id != b->netIds.end(); ++id) {
-            std::map<Key, WorldTrack>::iterator tit = worldTrack_.begin();
-            for (; tit != worldTrack_.end(); ++tit)
-                if (tit->second.netId == *id) break;
-            if (tit == worldTrack_.end()) {
-                if (dumpWi) { char b2[160]; _snprintf(b2, sizeof(b2) - 1,
-                    "[wi] CLAIM-APPLY netId=%u from=%u (no track; already gone)",
-                    *id, b->ownerId); b2[sizeof(b2) - 1] = '\0'; coop::logLine(b2); }
+        for (std::vector<u32>::iterator idIt = b->netIds.begin(); idIt != b->netIds.end(); ++idIt) {
+            u32 authorId   = b->authorId;
+            u32 netId      = *idIt;
+            u32 claimantId = b->ownerId;
+            std::pair<u32, u32> key(authorId, netId);
+
+            u32 priorWinner = 0;
+            if (coop::claimWinnerFor(claimFinals_, authorId, netId, &priorWinner)) {
+                // Commit is final (INV-03): a later-arriving claim for an
+                // already-decided identity is answered with the SAME prior
+                // verdict, never re-arbitrated, never re-broadcast as a fresh
+                // window. claimFinals_ carries flag+winner in ONE record
+                // (WR-05), so a committed hit always names the real winner.
+                u32 winner = priorWinner;
+                ClaimVerdictPacket cv; memset(&cv, 0, sizeof(cv));
+                cv.type = (u8)PKT_CLAIM_VERDICT;
+                cv.authorId = authorId; cv.netId = netId;
+                cv.winnerPlayerId = winner; cv.verdict = (u8)CLAIM_AWARD;
+                net.queueClaimVerdict(cv);
+                char b2[180]; _snprintf(b2, sizeof(b2) - 1,
+                    "[wi] CLAIM-LATE author=%u netId=%u claimant=%u (already committed, winner=%u re-sent)",
+                    authorId, netId, claimantId, winner);
+                b2[sizeof(b2) - 1] = '\0'; coop::logLine(b2);
                 continue;
             }
-            unsigned int ihand[5] = { tit->first.t, tit->first.c, tit->first.cs,
-                                      tit->first.i, tit->first.s };
-            RootObject* ro = engine::resolveObjectByHand(ihand);
-            bool destroyed = (ro != 0) && engine::removeWorldItemProxy(gw, ro);
-            char b2[200]; _snprintf(b2, sizeof(b2) - 1,
-                "[wi] CLAIM-APPLY netId=%u from=%u sid='%s' destroyed=%d",
-                *id, b->ownerId, tit->second.stringID, destroyed ? 1 : 0);
-            b2[sizeof(b2) - 1] = '\0'; coop::logLine(b2);
-            // On success LEAVE the track: the next publish pass finds its liveness gone
-            // and emits the ordinary cull, so a THIRD peer drops its proxy too, then
-            // erases the track itself. Only when the object could NOT be destroyed do we
-            // erase here - otherwise we would keep streaming an item the claimer already
-            // took, and it would re-spawn as a fresh proxy (the duplicate we are fixing).
-            if (!destroyed) worldTrack_.erase(tit);
+
+            // Map the claimant's authorClaimMs into the host's local clock via
+            // the EXISTING per-owner peerClock_ offset (read-only here - the
+            // offset itself is maintained by ingest() from the regular entity
+            // stream). No mapping yet (first packets, sendStamp off) means an
+            // automatic tie-band member, never an unusable claim.
+            bool mappable = false;
+            unsigned long mappedMs = now;
+            if (claimantId == localId) {
+                // WR-01: the host's own claim self-loops through NetLink into
+                // its own Inbound, and peerClock_ is populated only from
+                // RECEIVED entity batches - the host never has an entry for
+                // itself, so its claims read unmappable and land in the tie
+                // band, where playerId 0 (the lowest possible) won EVERY
+                // contested pickup regardless of who actually grabbed first.
+                // The host's stamp is ALREADY in the host clock: identity
+                // mapping (offset 0), clamped never-in-the-future exactly
+                // like the peer path below.
+                long t = (long)b->authorClaimMs;
+                if ((long)now - t < 0) t = (long)now;
+                mappedMs = (unsigned long)t;
+                mappable = true;
+            } else {
+                std::map<u32, PeerClock>::iterator pc = peerClock_.find(claimantId);
+                if (pc != peerClock_.end() && pc->second.have) {
+                    long t = (long)b->authorClaimMs + pc->second.offsetMs;
+                    if ((long)now - t < 0) t = (long)now; // clamp: never in the future
+                    mappedMs = (unsigned long)t;
+                    mappable = true;
+                }
+            }
+            bool opened = coop::openClaim(claimWindows_, authorId, netId, claimantId,
+                                          mappedMs, mappable, now);
+            coop::claimEvictOldest(claimWindows_, 4096);
+            if (dumpWi) { char b2[200]; _snprintf(b2, sizeof(b2) - 1,
+                "[wi] %s author=%u netId=%u claimant=%u mappedMs=%lu mappable=%d",
+                opened ? "CLAIM-OPEN" : "CLAIM-ADD", authorId, netId, claimantId,
+                mappedMs, mappable ? 1 : 0);
+                b2[sizeof(b2) - 1] = '\0'; coop::logLine(b2); }
         }
+    }
+
+    // Finalize every window whose contention length has elapsed - runs every
+    // tick (not just when a fresh claim arrived) so a single-claimant window
+    // still closes on its own after the window length, even with no further
+    // traffic.
+    for (std::map<std::pair<u32, u32>, coop::ClaimWindow>::iterator wit = claimWindows_.begin();
+         wit != claimWindows_.end(); ) {
+        if (!coop::claimWindowExpired(wit->second, now, CLAIM_WINDOW_MS)) { ++wit; continue; }
+        u32 authorId = wit->first.first;
+        u32 netId    = wit->first.second;
+        u32 winner   = 0;
+        coop::finalizeClaim(wit->second, CLAIM_EPS_MS, &winner);
+        unsigned int n = (unsigned int)wit->second.claims.size();
+        // WR-05: flag+winner recorded as ONE claimFinals_ entry (can never be
+        // evicted apart), insertion-seq ordered so cap eviction drops the
+        // genuinely oldest finalized claim, never a younger author's newer one.
+        coop::markClaimCommitted(claimFinals_, authorId, netId, winner,
+                                 claimFinalSeq_, 4096);
+
+        ClaimVerdictPacket cv; memset(&cv, 0, sizeof(cv));
+        cv.type = (u8)PKT_CLAIM_VERDICT;
+        cv.authorId = authorId; cv.netId = netId;
+        cv.winnerPlayerId = winner; cv.verdict = (u8)CLAIM_AWARD;
+        net.queueClaimVerdict(cv);
+        char b2[160]; _snprintf(b2, sizeof(b2) - 1,
+            "[wi] CLAIM-WIN author=%u netId=%u winner=%u n=%u", authorId, netId, winner, n);
+        b2[sizeof(b2) - 1] = '\0'; coop::logLine(b2);
+
+        claimWindows_.erase(wit++);
+
+        // Apply the SAME verdict from the HOST's own point of view right here:
+        // the host never receives its own PKT_CLAIM_VERDICT broadcast back
+        // over the wire (ENet does not loop a broadcast back to its sender),
+        // exactly the processXferIntents precedent for PKT_XFER_COMMIT.
+        applyClaimOutcome(gw, authorId, netId, winner, localId);
+    }
+}
+
+// ALL clients (protocol 58, Phase 7 Plan 02 INV-03) - see the declaration doc
+// comment in Replicator.h for the full contract. Settles claim contention on
+// the host's single broadcast verdict.
+void Replicator::applyClaimVerdict(GameWorld* gw, Inbound& in, u32 localId) {
+    std::deque<InboundClaimVerdict> got;
+    in.drainClaimVerdicts(got);
+    if (got.empty()) return;
+    for (std::deque<InboundClaimVerdict>::iterator it = got.begin(); it != got.end(); ++it) {
+        const ClaimVerdictPacket& cv = it->pkt;
+        // WR-03: dedup received verdicts by (authorId, netId) - the CLAIM-LATE
+        // path re-broadcasts the prior verdict as a genuinely new packet, and
+        // re-applying it on the author could erase the track before the cull
+        // is emitted (permanent ghost proxies on third clients at N>=3).
+        // Verdicts are commit-final one-shots, so a seen key is a duplicate.
+        if (coop::claimCommitted(appliedClaimVerdicts_, cv.authorId, cv.netId)) continue;
+        coop::markClaimCommitted(appliedClaimVerdicts_, cv.authorId, cv.netId,
+                                 cv.winnerPlayerId, appliedClaimVerdictSeq_, 4096);
+        applyClaimOutcome(gw, cv.authorId, cv.netId, cv.winnerPlayerId, localId);
+    }
+}
+
+// Shared apply primitive - see the declaration doc comment in Replicator.h.
+void Replicator::applyClaimOutcome(GameWorld* gw, u32 authorId, u32 netId,
+                                   u32 winnerPlayerId, u32 localId) {
+    static int dumpWi = -1;
+    if (dumpWi < 0) { const char* e = getenv("KENSHICOOP_INV_DUMP"); dumpWi = (e && e[0] == '1') ? 1 : 0; }
+
+    if (authorId == localId) {
+        // I am the item's author: destroy my real ground object for netId,
+        // gated on this verdict - the applyWorldClaims unconditional-destroy
+        // dup path is gone. A claimant may not even exist locally (the
+        // author need not be a claimant at all).
+        std::map<Key, WorldTrack>::iterator tit = worldTrack_.begin();
+        for (; tit != worldTrack_.end(); ++tit)
+            if (tit->second.netId == netId) break;
+        if (tit == worldTrack_.end()) {
+            if (dumpWi) { char b2[160]; _snprintf(b2, sizeof(b2) - 1,
+                "[wi] CLAIM-APPLY netId=%u winner=%u role=author (no track; already gone)",
+                netId, winnerPlayerId); b2[sizeof(b2) - 1] = '\0'; coop::logLine(b2); }
+            return;
+        }
+        unsigned int ihand[5] = { tit->first.t, tit->first.c, tit->first.cs,
+                                  tit->first.i, tit->first.s };
+        RootObject* ro = engine::resolveObjectByHand(ihand);
+        bool destroyed = (ro != 0) && engine::removeWorldItemProxy(gw, ro);
+        char b2[200]; _snprintf(b2, sizeof(b2) - 1,
+            "[wi] CLAIM-APPLY netId=%u winner=%u role=author sid='%s' destroyed=%d",
+            netId, winnerPlayerId, tit->second.stringID, destroyed ? 1 : 0);
+        b2[sizeof(b2) - 1] = '\0'; coop::logLine(b2);
+        // On success LEAVE the track: the next publish pass finds its liveness gone
+        // and emits the ordinary cull, so a THIRD peer drops its proxy too, then
+        // erases the track itself. Only when the object is LIVE but could NOT be
+        // destroyed do we erase here - otherwise we would keep streaming an item
+        // the winner already took, and it would re-spawn as a fresh proxy (the
+        // duplicate this fixes). WR-03: never erase on `ro == 0` - an unresolvable
+        // object means it is ALREADY gone (destroyed by this verdict's first
+        // application, or its block unloaded), and the pending cull path above is
+        // exactly what retires the track; erasing here instead would skip the cull
+        // and leave permanent ghost proxies on non-participant clients.
+        if (!destroyed && ro != 0) worldTrack_.erase(tit);
+        return;
+    }
+
+    // Not the author: was I a claimant of this identity at all?
+    std::map<std::pair<u32, u32>, PendingClaimIdentity>::iterator ci =
+        myClaims_.find(std::make_pair(authorId, netId));
+    if (ci == myClaims_.end()) return; // not our claim - nothing to do
+
+    if (winnerPlayerId == localId) {
+        // I won: keep the item exactly as it landed in my bag. No-op.
+        myClaims_.erase(ci);
+        if (dumpWi) { char b2[160]; _snprintf(b2, sizeof(b2) - 1,
+            "[wi] CLAIM-APPLY netId=%u winner=%u role=winner (kept)",
+            netId, winnerPlayerId); b2[sizeof(b2) - 1] = '\0'; coop::logLine(b2); }
+        return;
+    }
+
+    // I lost: roll back my optimistic local pickup - the ONE allowed reverse
+    // mutation (research Pitfall 1). The item was already inside one of my
+    // OWNED characters' bags for up to (window + RTT); search my owned hands
+    // for the exact identity and remove exactly the claimed stack's UNITS.
+    //
+    // Phase 7 review CR-02: the old path called dropItemFromInventory with
+    // ident.quantity as the drop count and destroyed only the LAST grounded
+    // object - but that qty parameter counts whole-Item drop iterations, not
+    // stack units, so a Q>=2 claimed stack next to a pre-owned same-sid
+    // single dropped multiple Items and destroyed one (duplication: every
+    // other dropped Item re-streamed as a fresh world item), and a pickup the
+    // engine MERGED into a pre-owned stack destroyed the whole merged stack
+    // (loss of the loser's own units). removeItemUnitsFromContainer is
+    // unit-scoped (removeByKey splits stacks in place) and destroys straight
+    // from the bag - no transient ground object exists at any point, so
+    // nothing can ever be captured by a publish pass or left behind.
+    // Shortfall continues across owned hands (the pickup may have landed on
+    // any squad member) until the claimed unit count is fully removed.
+    PendingClaimIdentity ident = ci->second;
+    myClaims_.erase(ci);
+    const unsigned long XFER_GRACE_MS = 10000;
+    unsigned long now = nowMs();
+    int want = (ident.quantity > 0) ? (int)ident.quantity : 1;
+    int removed = 0;
+    for (std::set<Key>::iterator hi = ownHands_.begin();
+         hi != ownHands_.end() && removed < want; ++hi) {
+        unsigned int hand[5] = { hi->t, hi->c, hi->cs, hi->i, hi->s };
+        int n = engine::removeItemUnitsFromContainer(gw, hand, ident.stringID,
+                                                     ident.itemType, want - removed);
+        if (n <= 0) continue;
+        removed += n;
+        // WR-04: every programmatic gear mutation registers wdSuppress_ so
+        // the W2 weapon census does not read this bag decrease as a player
+        // drop and correlate some unrelated same-sid free ground item nearby
+        // into a phantom DROP intent (common near a contested pickup site).
+        if (isGearType(ident.itemType))
+            wdSuppress_[std::make_pair(*hi, std::string(ident.stringID))] =
+                now + XFER_GRACE_MS;
+        // Keep the transfer detector blind to the mutation we just made
+        // (the same rebase every other programmatic bag mutation performs) -
+        // an unrebased loss could pair with an unrelated user gain inside the
+        // settle window and author a bogus cross-owner transfer intent.
+        xferRebase(gw, *hi);
+    }
+    bool rolledBack = (removed >= want);
+    char b2[220]; _snprintf(b2, sizeof(b2) - 1,
+        "[wi] CLAIM-APPLY netId=%u winner=%u role=loser sid='%s' rolledBack=%d",
+        netId, winnerPlayerId, ident.stringID, rolledBack ? 1 : 0);
+    b2[sizeof(b2) - 1] = '\0'; coop::logLine(b2);
+    if (removed > 0 && removed < want) {
+        // Partial rollback (fewer units found than claimed - e.g. some were
+        // already consumed/moved): loud, greppable, conservation-relevant.
+        char b3[200]; _snprintf(b3, sizeof(b3) - 1,
+            "[wi] CLAIM-ROLLBACK-PARTIAL netId=%u sid='%s' removed=%d want=%d",
+            netId, ident.stringID, removed, want);
+        b3[sizeof(b3) - 1] = '\0'; coop::logLine(b3);
     }
 }
 
@@ -1696,6 +1969,16 @@ void Replicator::detectAndPublishTransfers(GameWorld* gw, NetLink& net, u32 owne
                 strncpy(pkt.material,     items[j].material,     sizeof(pkt.material) - 1);
                 break;
             }
+            // Protocol 58 (Phase 7 INV-02): resolve the OWNER PlayerIds of both
+            // ends on THIS (the author's) game thread and put them on the wire -
+            // this is what lets the host arbitrate/route without a game-thread
+            // hand lookup of its own (closes the gap that used to force
+            // RELAY_FAILSAFE_LOG). A non-squad container (e.g. a host-registered
+            // baked chest) resolves to OWNER_NONE, which is fine: the host's own
+            // validation only requires the AUTHOR to own one of the two ends.
+            unsigned int sHand[5] = { f.src.t, f.src.c, f.src.cs, f.src.i, f.src.s };
+            pkt.srcOwnerId = ownerOfHand(sHand);
+            pkt.dstOwnerId = ownerOfHand(dHand);
             net.queueInvXfer(pkt);
             // Latch the pending move on each PEER end so applyInventories cannot
             // reconcile it back while the owner's snapshots are still stale.
@@ -1715,13 +1998,12 @@ void Replicator::detectAndPublishTransfers(GameWorld* gw, NetLink& net, u32 owne
                 wdSuppress_[std::make_pair(f.src, f.key.first)] = now + XFER_GRACE_MS;
                 wdSuppress_[std::make_pair(f.dst, f.key.first)] = now + XFER_GRACE_MS;
             }
-            // Protocol 50: remember what this intent latched, so the verdict has
-            // something to undo. Recorded even for a peer that will never answer -
-            // applyXferAcks sweeps the unanswered on the same wall clock.
-            XferOut o;
-            o.src = f.src; o.dst = f.dst; o.key = f.key; o.qty = f.qty;
-            o.srcPeer = !srcOwn; o.dstPeer = !dstOwn; o.sentMs = now;
-            xferOut_[pkt.xferId] = o;
+            // Protocol 58 (Phase 7): the AUTHOR's own release now happens on
+            // the host's PKT_XFER_COMMIT (applyXferCommit/processXferIntents'
+            // isAuthor branch), keyed (authorId,transferId) and reading the
+            // release magnitude straight off the commit's own quantity field -
+            // no bookkeeping needs to be remembered here anymore (xferOut_ /
+            // the old protocol-50 first-ACK path is retired; see applyXferAcks).
             char b[240]; _snprintf(b, sizeof(b) - 1,
                 "[xfer] SEND id=%u sid='%s' type=%u qty=%d src=%u,%u,%u,%u,%u(%s) dst=%u,%u,%u,%u,%u(%s)",
                 pkt.xferId, pkt.stringID, pkt.itemType, f.qty,
@@ -1736,7 +2018,70 @@ void Replicator::detectAndPublishTransfers(GameWorld* gw, NetLink& net, u32 owne
     }
 }
 
+// SUPERSEDED (protocol 58, Phase 7 Plan 01 Task 2) - dormant, no longer
+// called from Plugin.cpp. First-ACK-wins settling of a broadcast intent is
+// ambiguous at N>=3 (a non-participant's PARTIAL/REJECT could release the
+// author's latches early, or mask a true participant's REJECT);
+// processXferIntents + applyXferCommit below replace this as the settle
+// path. Kept as a drain-and-discard stub only so a stray InboundInvXfer
+// entry (impossible in practice - PKT_INV_XFER is now host-terminated and
+// only the host's processXferIntents ever drains it) cannot grow the queue.
 void Replicator::applyTransfers(GameWorld* gw, Inbound& in, NetLink& net, u32 localId) {
+    std::deque<InboundInvXfer> got;
+    in.drainInvXfers(got);
+    (void)gw; (void)net; (void)localId;
+}
+
+// SUPERSEDED (protocol 50 -> 58, Phase 7 Plan 01 Task 2) - dormant, no
+// longer called from Plugin.cpp. PKT_INV_XFER_ACK is no longer authored by
+// anyone (applyXferCommit settles via the host's commit, not a per-receiver
+// ACK); kept as a drain-and-discard stub for the same reason as
+// applyTransfers above.
+void Replicator::applyXferAcks(GameWorld* gw, Inbound& in, u32 localId) {
+    std::deque<InboundInvXferAck> got;
+    in.drainInvXferAcks(got);
+    (void)gw; (void)localId;
+}
+
+// Protocol 58 shared apply primitive - see the declaration doc comment in
+// Replicator.h for the full contract (host-decides-once vs receiver-
+// executes-the-decision).
+int Replicator::relocateOrFabricate(GameWorld* gw, const unsigned int sHand[5],
+                                     const unsigned int dHand[5], const char* sid,
+                                     u32 itemType, int quantity, u16 quality, u8 level,
+                                     const char* manufacturer, const char* material,
+                                     u8 permission, int* outMoved, int* outFab) {
+    int moved = engine::moveItemBetweenContainers(gw, sHand, dHand, sid, itemType, quantity);
+    int fab = 0;
+    if (moved < quantity && permission == (u8)XFER_COMMIT_FABRICATE) {
+        // Same gate applyTransfers used: non-gear always fabricates a
+        // shortfall; gear only under KENSHICOOP_WEAPON_FAB (default on); a
+        // worn CONTAINER (backpack) never fabricates (the template mints an
+        // EMPTY bag, so the trade would land as a contents-less duplicate).
+        static int gearFab = -1;
+        if (gearFab < 0) { const char* e = getenv("KENSHICOOP_WEAPON_FAB"); gearFab = (e && e[0] == '0') ? 0 : 1; }
+        if ((!isGearType(itemType) || gearFab) && !engine::isContainerItemType(itemType))
+            fab = engine::addItemsToContainerBySid(gw, dHand, sid, itemType, quantity - moved,
+                                                   (int)quality, manufacturer, material, level);
+    }
+    if (outMoved) *outMoved = moved;
+    if (outFab)   *outFab   = fab;
+    return moved + fab;
+}
+
+// HOST ONLY (protocol 58, Phase 7 INV-02) - see the declaration doc comment
+// in Replicator.h for the full contract. Arbitrates every received transfer
+// intent exactly once via XferCommit.h's pendingXfer_ state machine and
+// broadcasts the single authoritative verdict.
+//
+// XFER_GRACE_MS review (research Pitfall 5): the host round-trip this commit
+// model adds does NOT lengthen the worst-case latch window versus the OLD
+// ACK path - both are exactly one request/response hop for the author
+// (intent -> verdict), and a non-author receiver's own latch (created here,
+// released only by catch-up/deadline, never by the commit itself) is
+// unchanged from applyTransfers' original per-receiver latch shape. 10s
+// stays correct; no bump needed.
+void Replicator::processXferIntents(GameWorld* gw, Inbound& in, NetLink& net, u32 localId) {
     std::deque<InboundInvXfer> got;
     in.drainInvXfers(got);
     if (got.empty()) return;
@@ -1744,47 +2089,202 @@ void Replicator::applyTransfers(GameWorld* gw, Inbound& in, NetLink& net, u32 lo
     unsigned long now = nowMs();
     for (std::deque<InboundInvXfer>::iterator it = got.begin(); it != got.end(); ++it) {
         const InvXferPacket& p = it->pkt;
-        if (p.ownerId == localId) continue; // never act on our own (relay safety)
-        std::pair<u32, u32> id(p.ownerId, p.xferId);
-        if (appliedXfers_.count(id) != 0) continue; // idempotent (reliable resend / replay)
-        appliedXfers_.insert(id);
-        if (appliedXfers_.size() > 4096) appliedXfers_.erase(appliedXfers_.begin());
+
+        // T-07-05: the author must own the source OR destination domain - an
+        // intent touching only domains it does not own is rejected outright.
+        // No commit is authored at all (there is no legitimate transfer to
+        // announce, and every genuine client's own drag always touches a
+        // domain it owns - this only fires on a forged/buggy sender).
+        bool authorOwnsSrc = (p.srcOwnerId == p.ownerId);
+        bool authorOwnsDst = (p.dstOwnerId == p.ownerId);
+        if (!authorOwnsSrc && !authorOwnsDst) {
+            char b[180]; _snprintf(b, sizeof(b) - 1,
+                "[xfer] REJECT-DOMAIN id=%u author=%u src_owner=%u dst_owner=%u",
+                p.xferId, p.ownerId, p.srcOwnerId, p.dstOwnerId);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            continue;
+        }
+
+        // xferBegin: PENDING once per (authorId,transferId) - a duplicate or
+        // replayed intent (reliable-channel resend) is a no-op here.
+        // pendingXferSeq_ stamps insertion order for the WR-05 cap eviction.
+        if (!coop::xferBegin(pendingXfer_, p.ownerId, p.xferId, pendingXferSeq_)) continue;
+        // A fresh xferBegin always yields a fresh commit (nothing else ever
+        // calls xferCommitOnce for a key xferBegin just opened this tick) -
+        // defensive, matching the state machine's own PENDING->COMMITTED
+        // contract rather than assuming it.
+        if (!coop::xferCommitOnce(pendingXfer_, p.ownerId, p.xferId)) continue;
+        // WR-05: cap-evict only AFTER the commit transition (the old call sat
+        // between begin and commit, where at cap it could evict the very key
+        // just opened - silently dropping a legitimate intent). Eviction is
+        // insertion-seq ordered (oldest-inserted first), so the just-committed
+        // key (max seq) is never the candidate.
+        coop::xferEvictOldest(pendingXfer_, 4096);
+
         Key sk; sk.t = p.sType; sk.c = p.sContainer; sk.cs = p.sContainerSerial;
         sk.i = p.sIndex; sk.s = p.sSerial;
         Key dk; dk.t = p.dType; dk.c = p.dContainer; dk.cs = p.dContainerSerial;
         dk.i = p.dIndex; dk.s = p.dSerial;
-        // Either end may be a mine the peer emptied, whose hand is its own.
+        XKey key(std::string(p.stringID), p.itemType);
+
+        int applied;
+        u8  outcome;
+        bool isAuthor = (p.ownerId == localId);
+        if (isAuthor) {
+            // Host-as-author (a host player's own cross-owner drag): the
+            // physical drag already performed the move on THIS instance -
+            // nothing left to apply here. Release our own optimistic latch
+            // (set in detectAndPublishTransfers on this SAME instance) at
+            // the full requested magnitude, matching the old ACK-release
+            // convention (releaseXferLatch is a safe no-op on an end that
+            // was never latched, e.g. an owned container).
+            applied = (int)p.quantity;
+            outcome = (u8)XFER_COMMIT_RELOCATE;
+            releaseXferLatch(sk, key, +(int)p.quantity);
+            releaseXferLatch(dk, key, -(int)p.quantity);
+        } else {
+            // The host relocates/fabricates ITS OWN copy of the two
+            // containers, exactly like any other non-author receiver would -
+            // the host is also "an instance" that tracks copies of every
+            // squad/registered container via its own live simulation.
+            unsigned int sHand[5]; handForContainerKey(sk, sHand);
+            unsigned int dHand[5]; handForContainerKey(dk, dHand);
+            int moved = 0, fab = 0;
+            applied = relocateOrFabricate(gw, sHand, dHand, p.stringID, p.itemType,
+                                          (int)p.quantity, p.quality, p.level,
+                                          p.manufacturer, p.material,
+                                          (u8)XFER_COMMIT_FABRICATE, &moved, &fab);
+            outcome = (applied <= 0) ? (u8)XFER_COMMIT_REJECT
+                    : (fab > 0)      ? (u8)XFER_COMMIT_FABRICATE
+                                     : (u8)XFER_COMMIT_RELOCATE;
+            bool srcOwn = ownedContainers_.count(sk) != 0 || ownHands_.count(sk) != 0;
+            bool dstOwn = ownedContainers_.count(dk) != 0 || ownHands_.count(dk) != 0;
+            if (applied > 0) {
+                if (!srcOwn) {
+                    XferLatch& L = xferLatch_[sk][key];
+                    L.delta -= applied; L.deadlineMs = now + XFER_GRACE_MS;
+                    if (L.delta == 0) xferLatch_[sk].erase(key);
+                }
+                if (!dstOwn) {
+                    XferLatch& L = xferLatch_[dk][key];
+                    L.delta += applied; L.deadlineMs = now + XFER_GRACE_MS;
+                    if (L.delta == 0) xferLatch_[dk].erase(key);
+                }
+            }
+            if (isGearType(p.itemType)) {
+                wdSuppress_[std::make_pair(sk, key.first)] = now + XFER_GRACE_MS;
+                wdSuppress_[std::make_pair(dk, key.first)] = now + XFER_GRACE_MS;
+            }
+            // Keep the transfer detector blind to the relocation we just made.
+            xferRebase(gw, sk);
+            xferRebase(gw, dk);
+        }
+
+        XferCommitPacket xc; memset(&xc, 0, sizeof(xc));
+        xc.type = (u8)PKT_XFER_COMMIT;
+        xc.authorId = p.ownerId;
+        xc.transferId = p.xferId;
+        xc.srcOwnerId = p.srcOwnerId;
+        xc.dstOwnerId = p.dstOwnerId;
+        xc.sType = p.sType; xc.sContainer = p.sContainer; xc.sContainerSerial = p.sContainerSerial;
+        xc.sIndex = p.sIndex; xc.sSerial = p.sSerial;
+        xc.dType = p.dType; xc.dContainer = p.dContainer; xc.dContainerSerial = p.dContainerSerial;
+        xc.dIndex = p.dIndex; xc.dSerial = p.dSerial;
+        strncpy(xc.stringID, p.stringID, sizeof(xc.stringID) - 1);
+        xc.itemType = p.itemType;
+        xc.quantity = p.quantity;
+        xc.quality = p.quality;
+        xc.level = p.level;
+        strncpy(xc.manufacturer, p.manufacturer, sizeof(xc.manufacturer) - 1);
+        strncpy(xc.material, p.material, sizeof(xc.material) - 1);
+        xc.outcome = outcome;
+        xc.applied = (u16)((applied < 0) ? 0 : (applied > 65535 ? 65535 : applied));
+        net.queueXferCommit(xc);
+
+        const char* on = (outcome == (u8)XFER_COMMIT_RELOCATE)  ? "RELOCATE"
+                       : (outcome == (u8)XFER_COMMIT_FABRICATE) ? "FABRICATE" : "REJECT";
+        char b[240]; _snprintf(b, sizeof(b) - 1,
+            "[xfer] COMMIT id=%u author=%u outcome=%s applied=%u sid='%s' type=%u qty=%u",
+            p.xferId, p.ownerId, on, (unsigned)xc.applied,
+            p.stringID, p.itemType, (unsigned)p.quantity);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+}
+
+// ALL clients (protocol 58, Phase 7 INV-02/INV-04) - see the declaration doc
+// comment in Replicator.h for the full contract. Settles a transfer on the
+// host's single broadcast verdict instead of a per-receiver ACK race.
+void Replicator::applyXferCommit(GameWorld* gw, Inbound& in, NetLink& net, u32 localId) {
+    std::deque<InboundXferCommit> got;
+    in.drainXferCommits(got);
+    if (got.empty()) return;
+    const unsigned long XFER_GRACE_MS = 10000;
+    unsigned long now = nowMs();
+    for (std::deque<InboundXferCommit>::iterator it = got.begin(); it != got.end(); ++it) {
+        const XferCommitPacket& c = it->pkt;
+        std::pair<u32, u32> id(c.authorId, c.transferId);
+        if (appliedXfers_.count(id) != 0) continue; // idempotent (reliable resend/replay)
+        appliedXfers_.insert(id);
+        if (appliedXfers_.size() > 4096) appliedXfers_.erase(appliedXfers_.begin());
+
+        Key sk; sk.t = c.sType; sk.c = c.sContainer; sk.cs = c.sContainerSerial;
+        sk.i = c.sIndex; sk.s = c.sSerial;
+        Key dk; dk.t = c.dType; dk.c = c.dContainer; dk.cs = c.dContainerSerial;
+        dk.i = c.dIndex; dk.s = c.dSerial;
+        XKey key(std::string(c.stringID), c.itemType);
+        const char* on = (c.outcome == (u8)XFER_COMMIT_RELOCATE)  ? "RELOCATE"
+                       : (c.outcome == (u8)XFER_COMMIT_FABRICATE) ? "FABRICATE" : "REJECT";
+
+        if (c.authorId == localId) {
+            // We authored this transfer - the local drag already performed
+            // the move on THIS instance. Release our own optimistic latch
+            // now that the host's commit is the authoritative word, for
+            // EVERY outcome (a REJECT's release is itself the rollback: it
+            // lets applyInventories put our local copy back the way the
+            // true owner sees it, through the reconcile path rather than a
+            // second mutation that could itself dupe).
+            releaseXferLatch(sk, key, +(int)c.quantity);
+            releaseXferLatch(dk, key, -(int)c.quantity);
+            XferCommitAckPacket ack; memset(&ack, 0, sizeof(ack));
+            ack.type = (u8)PKT_XFER_COMMIT_ACK;
+            ack.ownerId = localId; ack.authorId = c.authorId; ack.transferId = c.transferId;
+            ack.applied = c.applied; ack.verdict = c.outcome;
+            net.queueXferCommitAck(ack);
+            char b[200]; _snprintf(b, sizeof(b) - 1,
+                "[xfer] APPLY-COMMIT id=%u author=%u outcome=%s applied=%u (author, latch released)",
+                c.transferId, c.authorId, on, (unsigned)c.applied);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            (void)gw;
+            continue;
+        }
+
+        if (c.outcome == (u8)XFER_COMMIT_REJECT) {
+            // Void: nothing was ever applied anywhere but the author's own
+            // (now-reverted) optimism - no local action, no second mutation.
+            char b[160]; _snprintf(b, sizeof(b) - 1,
+                "[xfer] APPLY-COMMIT id=%u author=%u outcome=REJECT (no local action)",
+                c.transferId, c.authorId);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            continue;
+        }
+
         unsigned int sHand[5]; handForContainerKey(sk, sHand);
         unsigned int dHand[5]; handForContainerKey(dk, dHand);
-        // Relocate OUR copy of the real item between the same two containers - the
-        // conservation move (never fabricates or destroys), so gear survives.
-        int moved = engine::moveItemBetweenContainers(gw, sHand, dHand, p.stringID,
-                                                      p.itemType, (int)p.quantity);
-        int fab = 0;
-        if (moved < (int)p.quantity) {
-            // Our src copy is short (desync) - fabricate the shortfall into dst so the
-            // trade still lands. Non-gear always did this; gear joined once spike 451
-            // made weapon fabrication work (armour always could). Dupe safety: the
-            // latch below keeps stale snapshots from reconciling the fab away, and
-            // wdSuppress_ keeps the W2 weapon census from reading the count edge as a
-            // ground pickup. KENSHICOOP_WEAPON_FAB=0 restores gear-never-fabricates
-            // (weapons also die inside createItemAndAdd on the same env).
-            // A worn CONTAINER (backpack) NEVER fabricates: the template mints an EMPTY bag,
-            // so the trade would land as a contents-less duplicate the moment our real copy
-            // resolves. A short container transfer stays short and reconcile corrects it.
-            static int gearFab = -1;
-            if (gearFab < 0) { const char* e = getenv("KENSHICOOP_WEAPON_FAB"); gearFab = (e && e[0] == '0') ? 0 : 1; }
-            if ((!isGearType(p.itemType) || gearFab) && !engine::isContainerItemType(p.itemType))
-                fab = engine::addItemsToContainerBySid(gw, dHand, p.stringID, p.itemType,
-                                                       (int)p.quantity - moved, (int)p.quality,
-                                                       p.manufacturer, p.material, p.level);
-        }
-        XKey key(std::string(p.stringID), p.itemType);
-        // Latch OUR peer end(s) too: an in-flight stale snapshot (captured by its
-        // owner before this transfer) must not reconcile the relocation away.
+        int moved = 0, fab = 0;
+        // WR-02: act on c.applied - the HOST-RESOLVED unit count (the field
+        // Wire.h defines as "the unit count a receiver's relocate/fabricate
+        // body acts on") - never c.quantity, the author's original request.
+        // On a partial commit (host's src copy held fewer units than asked,
+        // gear-fab off) a receiver whose own src copy held MORE would
+        // otherwise move the full request and diverge from the host's world
+        // by the difference until the latch deadline self-healed it. The
+        // latches below stay keyed to the LOCAL applied amount, as before.
+        int applied = relocateOrFabricate(gw, sHand, dHand, c.stringID, c.itemType,
+                                          (int)c.applied, c.quality, c.level,
+                                          c.manufacturer, c.material, c.outcome,
+                                          &moved, &fab);
         bool srcOwn = ownedContainers_.count(sk) != 0 || ownHands_.count(sk) != 0;
         bool dstOwn = ownedContainers_.count(dk) != 0 || ownHands_.count(dk) != 0;
-        int applied = moved + fab;
         if (applied > 0) {
             if (!srcOwn) {
                 XferLatch& L = xferLatch_[sk][key];
@@ -1797,84 +2297,43 @@ void Replicator::applyTransfers(GameWorld* gw, Inbound& in, NetLink& net, u32 lo
                 if (L.delta == 0) xferLatch_[dk].erase(key);
             }
         }
-        if (isGearType(p.itemType)) {
+        if (isGearType(c.itemType)) {
             wdSuppress_[std::make_pair(sk, key.first)] = now + XFER_GRACE_MS;
             wdSuppress_[std::make_pair(dk, key.first)] = now + XFER_GRACE_MS;
         }
         // Keep the transfer detector blind to the relocation we just made.
         xferRebase(gw, sk);
         xferRebase(gw, dk);
-        // Protocol 50: answer. The author cannot know any of this - only the
-        // receiver knows whether its own copy of the source actually held the
-        // item - so state it rather than let a deadline stand in for it.
-        InvXferAckPacket ack; memset(&ack, 0, sizeof(ack));
-        ack.type        = (u8)PKT_INV_XFER_ACK;
-        ack.ownerId     = localId;
-        ack.xferOwnerId = p.ownerId;
-        ack.xferId      = p.xferId;
-        ack.applied     = (u16)((applied < 0) ? 0 : (applied > 65535 ? 65535 : applied));
-        ack.requested   = p.quantity;
-        ack.verdict     = (u8)((applied <= 0) ? XFER_ACK_REJECT
-                             : (applied >= (int)p.quantity) ? XFER_ACK_ACCEPT
-                             : XFER_ACK_PARTIAL);
-        net.queueInvXferAck(ack);
+
+        // Participant bookkeeping ack (audit only - never settles anything).
+        if (srcOwn || dstOwn) {
+            XferCommitAckPacket ack; memset(&ack, 0, sizeof(ack));
+            ack.type = (u8)PKT_XFER_COMMIT_ACK;
+            ack.ownerId = localId; ack.authorId = c.authorId; ack.transferId = c.transferId;
+            ack.applied = (u16)((applied < 0) ? 0 : (applied > 65535 ? 65535 : applied));
+            ack.verdict = c.outcome;
+            net.queueXferCommitAck(ack);
+        }
+
         char b[240]; _snprintf(b, sizeof(b) - 1,
-            "[xfer] APPLY id=%u from=%u sid='%s' type=%u qty=%u moved=%d fab=%d ack=%u",
-            p.xferId, p.ownerId, p.stringID, p.itemType, (unsigned)p.quantity,
-            moved, fab, (unsigned)ack.verdict);
+            "[xfer] APPLY-COMMIT id=%u author=%u outcome=%s moved=%d fab=%d applied=%d",
+            c.transferId, c.authorId, on, moved, fab, applied);
         b[sizeof(b) - 1] = '\0'; coop::logLine(b);
     }
 }
 
-void Replicator::applyXferAcks(GameWorld* gw, Inbound& in, u32 localId) {
-    std::deque<InboundInvXferAck> got;
-    in.drainInvXferAcks(got);
-    unsigned long now = nowMs();
-    for (std::deque<InboundInvXferAck>::iterator it = got.begin(); it != got.end(); ++it) {
-        const InvXferAckPacket& a = it->pkt;
-        if (a.xferOwnerId != localId) continue;      // not answering us (relay safety)
-        std::map<u32, XferOut>::iterator o = xferOut_.find(a.xferId);
-        if (o == xferOut_.end()) continue;           // already settled or swept
-        const XferOut& x = o->second;
-        // Back out this intent's latch contribution, and do it for EVERY
-        // verdict - the latch exists only to bridge the window where the
-        // receiver had not answered yet, and the answer has arrived:
-        //   accepted - the receiver's snapshots now carry the move, so holding
-        //              the latch for the rest of the grace only delays
-        //              convergence
-        //   partial  - the units the receiver refused are units its snapshots
-        //              still show where they were, and we want to converge on
-        //              that, not defend our optimistic copy of them
-        //   rejected - the same thing at full size. Dropping the latch is what
-        //              lets applyInventories put our local copy back the way
-        //              the owner sees it; that is the rollback, through the
-        //              reconcile path rather than a second mutation that could
-        //              itself dupe.
-        if (x.srcPeer) releaseXferLatch(x.src, x.key, +x.qty);
-        if (x.dstPeer) releaseXferLatch(x.dst, x.key, -x.qty);
-        const char* vn = (a.verdict == XFER_ACK_ACCEPT)  ? "accept"
-                       : (a.verdict == XFER_ACK_PARTIAL) ? "partial" : "reject";
-        char b[224]; _snprintf(b, sizeof(b) - 1,
-            "[xfer] ACK id=%u from=%u verdict=%s applied=%u/%u waitedMs=%lu sid='%s'",
-            a.xferId, a.ownerId, vn, (unsigned)a.applied, (unsigned)a.requested,
-            now - x.sentMs, x.key.first.c_str());
+// HOST ONLY (protocol 58) - audit/correlation only, no state change.
+void Replicator::applyXferCommitAck(Inbound& in, u32 localId) {
+    std::deque<InboundXferCommitAck> got;
+    in.drainXferCommitAcks(got);
+    for (std::deque<InboundXferCommitAck>::iterator it = got.begin(); it != got.end(); ++it) {
+        const XferCommitAckPacket& a = it->pkt;
+        char b[160]; _snprintf(b, sizeof(b) - 1,
+            "[xfer] COMMIT-ACK id=%u from=%u applied=%u verdict=%u",
+            a.transferId, a.ownerId, (unsigned)a.applied, (unsigned)a.verdict);
         b[sizeof(b) - 1] = '\0'; coop::logLine(b);
-        xferOut_.erase(o);
-        (void)gw;
     }
-    // Sweep intents nobody answered. The latches themselves already expire on
-    // XFER_GRACE_MS; this only stops the pending map growing over a session and
-    // records that the channel went unanswered, which is the signal that the
-    // peer is an older build (or that the "reliable" channel was not).
-    const unsigned long XFER_ACK_WAIT_MS = 15000;    // > XFER_GRACE_MS
-    for (std::map<u32, XferOut>::iterator i = xferOut_.begin(); i != xferOut_.end(); ) {
-        if (now - i->second.sentMs < XFER_ACK_WAIT_MS) { ++i; continue; }
-        char b[176]; _snprintf(b, sizeof(b) - 1,
-            "[xfer] ACK-MISSING id=%u sid='%s' qty=%d (fell back to the wall clock)",
-            i->first, i->second.key.first.c_str(), i->second.qty);
-        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
-        xferOut_.erase(i++);
-    }
+    (void)localId;
 }
 
 // Undo one intent's contribution to a latch. `delta` is the inverse of what

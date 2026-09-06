@@ -23,6 +23,12 @@ Scenario* makeScenario(const std::string& name) {
     if ((s = makeCharStateScenario(name))) return s;
     if ((s = makeBuildingScenario(name)))  return s;
     if ((s = makeSessionScenario(name)))   return s;
+    if ((s = makeMilestoneAScenario(name))) return s;
+    if ((s = makePlayerStateScenario(name))) return s;
+    if ((s = makeItemConservationScenario(name))) return s;
+    if ((s = makeWorldStateScenario(name))) return s;
+    if ((s = makeConsensusScenario(name))) return s;
+    if ((s = makeSaveLoadScenario(name))) return s;
     return 0;
 }
 

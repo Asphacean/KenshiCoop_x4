@@ -21,11 +21,138 @@ typedef float          f32;
 typedef double         f64;
 
 // Protocol version. The full version-by-version history (what each bump added
-// and why) lives in resources/PROTOCOL_HISTORY.md - keep it there, not here, so
+// and why) lives in docs/PROTOCOL_HISTORY.md - keep it there, not here, so
 // this header stays a definition file. When you bump PROTOCOL_VERSION, add the
-// matching entry at the bottom of that doc. The version is checked at handshake
-// and a mismatch is rejected (no back-compat).
-const u16 PROTOCOL_VERSION = 55;
+// matching entry at the top of that doc's v53->vN section. The version is
+// checked at handshake and a mismatch is rejected (no back-compat) - see
+// docs/PROTOCOL_HISTORY.md's "Mismatch-rejection behavior" section for the
+// exact host/client contract.
+//
+// v56 (Phase 2 Plan 03): adds the multi-peer roster announcements
+// (PKT_PLAYER_JOINED / PKT_PLAYER_LEFT, RosterPacket) - every connected client
+// now learns the FULL set of connected PlayerIds, not just its own id from
+// WELCOME. No wire-format change to any existing packet.
+//
+// v57 (Phase 3 Plan 03): adds the host-authoritative ownership-rank
+// announcement (PKT_OWN_RANKS, OwnRanksPacket) - the host broadcasts the full
+// map<PlayerId,set<rank>> as a per-player bitmask whenever roster membership
+// or dynamic tab ownership changes, generalizing the rank=playerId default
+// (OWN-01/OWN-03) so overrides and dynamically created squad tabs also
+// resolve identically on every machine.
+//
+// v58 (Phase 7 Plan 01): replaces the optimistic, first-ACK-wins cross-owner
+// transfer path with a host-committed two-phase model, closing the load-
+// bearing N>=3 gap where a join<->join transfer intent silently terminated
+// at the host (no relay, no forge check, not even the FAILSAFE log) - the
+// true destination owner never heard about the trade. InvXferPacket (the
+// intent) gains srcOwnerId/dstOwnerId so the host can route/validate without
+// a game-thread hand lookup; the intent is now a host-terminated CLIENT-
+// REQUEST (routingClassOf(PKT_INV_XFER) == RELAY_NONE, not
+// RELAY_FAILSAFE_LOG), with rejectIfForgedOwner on the receive branch (the
+// one owner-tagged reliable packet that lacked it). Two new packets carry the
+// commit: PKT_XFER_COMMIT (host -> all, the single authoritative verdict -
+// relocate/fabricate/reject, decided ONCE by the host, never N independent
+// per-receiver fabrications) and PKT_XFER_COMMIT_ACK (participant -> host,
+// bookkeeping/audit only - it never settles anything). InvXferAckPacket stays
+// on the wire for now but is superseded as the settle path; the author's
+// xferLatch_ release now keys on the host's COMMIT/REJECT instead of the
+// first peer ACK. Plan 02 adds the claim-contention packets under this same
+// v58 surface; no second bump for that.
+//
+// v58 (Phase 7 Plan 02) additions: world-item claim/pickup contention gets
+// the same host-committed shape. WorldItemClaimHeader gains authorClaimMs
+// (the claimant's nowMs() at the claim-detection edge, same frame as
+// EntityBatchHeader.sendMs so the host's existing per-owner peerClock_
+// mapping applies to it); PKT_WORLD_ITEM_CLAIM is now the claim INTENT
+// (claimant -> host, host-terminated CLIENT-REQUEST), superseding the old
+// author-destroy-on-notice semantics that let two simultaneous pickups of
+// the same item each keep a copy (the applyWorldClaims "no track; already
+// gone" silent dup, a bug even at 2 players). The host runs a bounded
+// contention window (ClaimArbiter.h, engine-free) keyed (authorId, netId),
+// mapping each claim's stamp via peerClock_, and broadcasts exactly one
+// PKT_CLAIM_VERDICT (host -> all, ClaimVerdictPacket) naming the earliest
+// mapped-stamp winner - ties within an eps tie-band or an unmappable stamp
+// break to the lowest playerId, and once committed a later-arriving
+// earlier-stamped claim is authoritatively rejected (commit is final). The
+// author destroys its real ground object only on the verdict; every losing
+// claimant rolls back its optimistic local pickup.
+//
+// v59 (Phase 8 Plan 02, WORLD-03): cell-claim authority becomes host-
+// authoritative and broadcast, closing the per-instance divergent reduce
+// (rebuildClaimedCells' std::map-iteration-order tie-break, the host-vs-
+// peer binary collapse, the single-author cellLastOwner_ history, no
+// disconnect cleanup, and a census plane that could represent only ONE
+// author at a time). PKT_CELL_CLAIM is re-pointed to a host-terminated
+// INTENT (wire shape unchanged; routingClassOf == RELAY_NONE, was Class A) -
+// every instance still PUBLISHES its own claims, but only the HOST folds
+// them into claimSlots_ and runs the reduce; a join no longer grants itself
+// authority from its own just-sent claim (the RTT dual-authorship window
+// this closes). The host runs a new engine-free reduce (CellMap.h:
+// reduceCellMap, continuity -> host-if-party -> lowest-playerId, presence-
+// based hysteresis, a PURE function of its inputs so shuffled insertion
+// order cannot change the verdict) and broadcasts the single authoritative
+// map on the NEW PKT_CELL_MAP (host -> all, Class B, CellMapPacket) whenever
+// it changes or on a slow re-assert cadence; every client (host included)
+// adopts ONLY a host-authored map (a client-authored PKT_CELL_MAP is
+// rejected) and stops running its own local reduce - the per-cell fresh-
+// contest rule subsumes the old co-location collapse, so every instance
+// reads the SAME verdict for every contested cell by construction.
+// PKT_NPC_CENSUS moves from Class B (host-only) to Class A (relayed
+// join->join, broadcast-except) with no wire change (NpcCensusHeader
+// already carries ownerId) - the intake becomes per-owner
+// (map<ownerId,CensusSet>) so a second author's 1 Hz census no longer WIPES
+// the first author's existence claims, the substrate that makes the host
+// map usable at N>=3. Disconnect/rejoin is owner-scoped: a departing
+// owner's claimSlots_/census/cellLastOwner_ entries are erased (its cells
+// revert to host until re-claimed) and the host re-reduces + re-broadcasts;
+// a reconnecting owner's stale claim slots are connect-edge purged so its
+// seq restart at 1 is never dropped by the wrap guard.
+//
+// v60 (Phase 9 Plan 01, CONS-01): the shared money pool becomes correct at
+// N>=3 - money-only wire change, the ONLY wire change this phase. Three
+// genuine at-N defects (09-RESEARCH.md's Money Trace): a single scalar
+// MoneyPacket::ackSeq the host overwrote with whichever owner folded last
+// (so a join popped its poolPending_ against a FOREIGN owner's ack space -
+// the wallet bounce/double-count), an overdraft path that folded
+// unconditionally and clamped the pool at 0 (silently minting value with no
+// reject), and a reconnect purge that never erased the money fold state (a
+// rejoined join's restarted seq=1 delta was dropped as "already folded"
+// forever). Fixed by: MoneyPacket's ackSeq scalar becomes a per-owner ack
+// VECTOR (u8 ackCount + Entry{ownerId,ackSeq}[MAX_PLAYERS], the
+// OwnRanksPacket entries[] idiom) where ackSeq = the highest
+// MoneyDeltaPacket.seq PROCESSED (folded OR rejected) for that owner, so
+// each join pops its own pending queue against ONLY its own entry;
+// MoneyDeltaPacket gains authorSpendMs (the author's nowMs() at
+// delta-detection, the WorldItemClaimHeader.authorClaimMs idiom) so a
+// would-overdraw spend can be arbitrated by TIMESTAMP order (earliest
+// adjusted stamp folds, epsMs tie-band broken by the lowest playerId,
+// commit-final - MoneyFold.h, the ClaimArbiter.h lineage applied to the
+// single shared pool); and the new PKT_MONEY_REJECT (host -> all broadcast,
+// MoneyRejectPacket) makes a rejected purchase's verdict observable and
+// identical on every instance - the buyer's own ack still advances past the
+// rejected seq, which is what pops the optimistic pending delta and
+// produces the visible refund (adopt-the-host-total, no new engine write).
+//
+// v61 (Phase 10 Plan 01): the coordinated save/load planes become correct at
+// N>=3 - save/load-only wire change, the ONLY wire change this phase (SAVE-01/
+// 02/03, 10-RESEARCH.md's Save/Load Flow Trace). Three genuine at-N defects: a
+// last-of-N-ACKs-wins collapse (the ACK drain discarded SaveAckPacket.ownerId
+// and SaveXfer.cpp's noteAck kept only g_lastAckXferId/g_lastAckOk, so one
+// client's ok=1 structurally "committed" the whole group); no positive load
+// ACK existed on the wire (only LOAD_NACK), so the host never learned a join
+// finished a coordinated load and a join stuck in the NACK-flow waited
+// forever; and concurrent save/load requests silently last-wins (no
+// arbitration, no rejection). Fixed by two new engine-free host-side headers
+// (SaveCoord.h/LoadCoord.h, the ClaimArbiter.h/MoneyFold.h lineage) driving
+// per-client transfer/ACK/retry/drop state machines and a first-wins
+// CoordArbiter shared by both planes, plus two new packets: PKT_LOAD_ACK
+// (join -> host, the missing positive half of the load ACK/NACK pair) and
+// PKT_COORD_REJECT (host -> requester unicast, the observable first-wins
+// rejection verdict naming both the rejected and active request ids). No
+// struct change to any existing save/load packet; unicast targeting for a
+// retry-to-one-client is transport-level (a queue-side destId), not a wire
+// field.
+const u16 PROTOCOL_VERSION = 61;
 
 // Packet type tags (first byte of every packet).
 enum PacketType {
@@ -76,7 +203,17 @@ enum PacketType {
     PKT_INV_XFER_ACK     = 45,// RELIABLE transfer verdict (protocol 50); InvXferAckPacket
     PKT_MONEY_DELTA      = 46,// RELIABLE join money-pool delta (join -> host, protocol 52); MoneyDeltaPacket
     PKT_DEED             = 47,// RELIABLE property-ownership row (protocol 54); DeedPacket
-    PKT_FIXTURE          = 48 // RELIABLE runtime-fixture identity row (protocol 55); FixturePacket
+    PKT_FIXTURE          = 48,// RELIABLE runtime-fixture identity row (protocol 55); FixturePacket
+    PKT_PLAYER_JOINED    = 49,// RELIABLE host-broadcast roster announcement (protocol 56); RosterPacket
+    PKT_PLAYER_LEFT      = 50,// RELIABLE host-broadcast roster announcement (protocol 56); RosterPacket
+    PKT_OWN_RANKS        = 51,// RELIABLE host-broadcast ownership-rank announcement (protocol 57); OwnRanksPacket
+    PKT_XFER_COMMIT      = 52,// RELIABLE host-authoritative transfer verdict (protocol 58); XferCommitPacket
+    PKT_XFER_COMMIT_ACK  = 53,// RELIABLE participant bookkeeping ack (protocol 58); XferCommitAckPacket
+    PKT_CLAIM_VERDICT    = 54,// RELIABLE host-authoritative claim-contention verdict (protocol 58); ClaimVerdictPacket
+    PKT_CELL_MAP         = 55,// RELIABLE host-authoritative cell-claim map (protocol 59); CellMapPacket
+    PKT_MONEY_REJECT     = 56,// RELIABLE host-authoritative insufficient-funds verdict (protocol 60); MoneyRejectPacket
+    PKT_LOAD_ACK         = 57,// RELIABLE positive coordinated-load completion (join -> host, protocol 61); LoadAckPacket
+    PKT_COORD_REJECT     = 58 // RELIABLE first-wins arbitration reject (host -> requester unicast, protocol 61); CoordRejectPacket
 };
 
 // One-shot transition events carried on the RELIABLE channel. Continuous state
@@ -128,6 +265,13 @@ enum EventType {
 // every driven body at once).
 const u32 OWNER_ID_ALL = 0xFFFFFFFFu;
 
+// Maximum simultaneous players, host included (Phase 2). PlayerId 0 is always
+// the host; joins occupy the lowest free slot in [1, MAX_PLAYERS). A connect
+// beyond this cap is rejected cleanly (enet_peer_disconnect + logged reason)
+// instead of admitted with a desync warning - replaces the old 2-player
+// `if (id >= 2)` guard at NetLink.cpp's connect handler.
+const u32 MAX_PLAYERS = 4;
+
 #pragma pack(push, 1)
 
 struct HelloPacket {
@@ -141,6 +285,38 @@ struct WelcomePacket {
     u8  type;     // = PKT_WELCOME
     u16 version;  // host's PROTOCOL_VERSION (client re-checks)
     u32 playerId; // id the host assigned to this client
+};
+
+// Roster announcement (protocol 56, host -> client, Class B host-broadcast):
+// a player joined or left the session. Sent (a) targeted at a freshly
+// connecting client once per already-connected peer, so it learns the full
+// roster it missed, and (b) broadcast to every connected client (including
+// the newcomer) whenever the registry membership changes, so everyone stays
+// in sync. Same minimal fixed-size shape as WelcomePacket - one PlayerId, no
+// variable-length tail - so it round-trips through readPacket<T>()'s
+// fixed-size length guard like every other small packet on this wire.
+struct RosterPacket {
+    u8  type;     // = PKT_PLAYER_JOINED or PKT_PLAYER_LEFT
+    u32 playerId; // the PlayerId that joined or left
+};
+
+// Ownership-rank announcement (protocol 57, host -> client, Class B
+// host-broadcast): the host's authoritative map<PlayerId,set<rank>>, encoded
+// as one (playerId, rankMask) entry per connected player. rankMask bit R set
+// means that playerId owns squad-tab rank R (see OwnRanks.h's
+// ranksToMask/maskToRanks). Fixed-size, no variable tail - mirrors
+// RosterPacket's shape so it round-trips through readPacket<T>()'s
+// fixed-size length guard like every other small packet on this wire. Sent
+// whenever roster membership OR dynamic tab ownership changes (Plan 03);
+// clients apply ONLY this host-authored map - T-03-06: a peer-authored rank
+// claim is never accepted.
+struct OwnRanksPacket {
+    u8  type;  // = PKT_OWN_RANKS
+    u8  count; // valid entries in 'entries' (<= MAX_PLAYERS)
+    struct Entry {
+        u32 playerId;
+        u32 rankMask;
+    } entries[MAX_PLAYERS];
 };
 
 // A reliable one-shot transition. 'subject' is the hand the event happened TO; the
@@ -612,11 +788,25 @@ struct WorldItemRemoveHeader {
 // authorId scopes the netIds: they belong to the AUTHOR's netId space, not the claimer's.
 // v1 claims a WHOLE stack; a partial-stack pickup (take 3 of 10) needs quantity accounting
 // and still leaves the author's remainder on the ground.
+//
+// Protocol 58 (Phase 7 Plan 02, INV-03): PKT_WORLD_ITEM_CLAIM is now the claim
+// INTENT (claimant -> host, host-terminated CLIENT-REQUEST), not a notice the
+// author acts on directly - two simultaneous claims for the same item used to
+// each destroy nothing/keep a copy (applyWorldClaims' "no track; already gone"
+// silent dup, a bug even at 2 players). authorClaimMs is the claimant's own
+// nowMs() at the claim-detection edge (proxy-consumed liveness), in the SAME
+// frame as EntityBatchHeader.sendMs so the host's existing per-owner
+// peerClock_ offset (Replicator.h) maps it into the host's local clock. The
+// host collects every claim for (authorId, netId) within a bounded
+// contention window (ClaimArbiter.h) and broadcasts one PKT_CLAIM_VERDICT
+// naming the deterministic winner (earliest mapped stamp, eps tie-band /
+// unmappable-stamp break to the lowest playerId, commit-final).
 struct WorldItemClaimHeader {
-    u8  type;     // = PKT_WORLD_ITEM_CLAIM
-    u32 ownerId;  // the CLAIMING sender (who consumed the proxy)
-    u32 authorId; // the item's author (whose netId space the ids below belong to)
-    u8  count;    // number of u32 netIds that follow
+    u8  type;          // = PKT_WORLD_ITEM_CLAIM
+    u32 ownerId;       // the CLAIMING sender (who consumed the proxy)
+    u32 authorId;      // the item's author (whose netId space the ids below belong to)
+    u32 authorClaimMs; // protocol 58: claimant's nowMs() at claim-detection (see above)
+    u8  count;         // number of u32 netIds that follow
 };
 
 // 16 * sizeof(WorldItemEntry)=1168 + header(6) stays under a 1400 B datagram.
@@ -727,9 +917,21 @@ struct InvXferPacket {
                      // Item*, which carries its own grade and needs nothing from the wire.
     char manufacturer[48];
     char material[48];
+    // protocol 58: the resolved OWNER PlayerIds of the source/destination
+    // containers, filled by the AUTHOR's game thread (Replicator::ownerOfHand())
+    // at intent-build time. This is what lets the host's net thread route/
+    // validate the intent without a game-thread hand->owner lookup of its own -
+    // the exact gap that used to force PKT_INV_XFER into RELAY_FAILSAFE_LOG (a
+    // join<->join intent silently died at the host with no relay, no forge
+    // check, not even the FAILSAFE log). The intent is now a host-terminated
+    // CLIENT-REQUEST (routingClassOf == RELAY_NONE): the host arbitrates via
+    // XferCommit.h and broadcasts the verdict on PKT_XFER_COMMIT below.
+    u32 srcOwnerId;
+    u32 dstOwnerId;
 };
 
-// ---- Protocol 50: transfer VERDICT ------------------------------------------
+// ---- Protocol 50: transfer VERDICT (SUPERSEDED by protocol 58's
+// PKT_XFER_COMMIT below) ------------------------------------------------------
 // PKT_INV_XFER is optimistic. The author moves the item locally, latches both
 // peer ends so the owner's in-flight snapshots cannot reconcile the move away,
 // and then waits out a 10 s wall clock - because nothing ever comes back. That
@@ -753,6 +955,15 @@ struct InvXferPacket {
 // build, or a drop on a channel that is nominally reliable but disconnected),
 // so this strictly narrows the window rather than replacing one guess with a
 // dependency.
+//
+// Protocol 58 note: this struct stays on the wire (byte-for-byte, no
+// renumbering) but is no longer the settling verdict - ANY receiver's ACK
+// used to settle a broadcast intent first-ACK-wins, which is ambiguous at
+// N>=3 (a non-participant's PARTIAL/REJECT could release the author's latches
+// early, or mask a true participant's REJECT). PKT_XFER_COMMIT (below) is now
+// the single host-authored verdict every client applies; this struct is kept
+// only so an old-build receiver's stray ACK still parses (it is otherwise
+// ignored by the v58 apply path).
 struct InvXferAckPacket {
     u8  type;        // = PKT_INV_XFER_ACK
     u32 ownerId;     // sender of the ACK (the receiver that applied it)
@@ -767,6 +978,104 @@ enum XferAckVerdict {
     XFER_ACK_REJECT  = 0,
     XFER_ACK_ACCEPT  = 1,
     XFER_ACK_PARTIAL = 2
+};
+
+// ---- Protocol 58: host-committed two-phase TRANSFER verdict -----------------
+// The host-authoritative replacement for InvXferAckPacket's first-ACK-wins
+// settle path. PKT_INV_XFER (above) is now a host-terminated intent: the host
+// (XferCommit.h's pending-transfer state machine, keyed (authorId, transferId))
+// arbitrates it exactly once and broadcasts this single verdict to EVERY
+// connected client (host-as-participant included, so the log evidence is
+// identical regardless of who the host is) - never a per-receiver decision.
+// `outcome` is decided ONCE by the host (relocate the real item, fabricate a
+// shortfall under the same backpack-never-fabricates + KENSHICOOP_WEAPON_FAB
+// gate the old applyTransfers used, or reject) so N independent per-receiver
+// fabrications can never happen. `applied` is the host-resolved unit count a
+// receiver's relocate/fabricate body acts on. transferId is the AUTHOR's own
+// per-sender xferId (not a host-minted id) - keeping the author's id in the
+// key is what lets N different authors' transferId=1 never collide (the
+// Phase 5 composite-key rule, FoldDedup.h).
+struct XferCommitPacket {
+    u8   type;        // = PKT_XFER_COMMIT
+    u32  authorId;     // ownerId of the client that authored the original intent
+    u32  transferId;   // the author's own xferId (per-sender monotonic)
+    u32  srcOwnerId;
+    u32  dstOwnerId;
+    // SOURCE/DESTINATION container hands, same raw save-stable layout as
+    // InvXferPacket - every receiver needs these to locate its own copies of
+    // the two containers; srcOwnerId/dstOwnerId alone only say WHO owns them,
+    // not WHERE they are.
+    u32 sType;
+    u32 sContainer;
+    u32 sContainerSerial;
+    u32 sIndex;
+    u32 sSerial;
+    u32 dType;
+    u32 dContainer;
+    u32 dContainerSerial;
+    u32 dIndex;
+    u32 dSerial;
+    // item identity - same descriptive shape as InvXferPacket (item identity
+    // on the transfer wire is descriptive: sid/type/qty/quality/level/
+    // manufacturer/material, never instance-scoped; two identical stacks are
+    // indistinguishable, and the commit arbitrates QUANTITIES per
+    // (container,sid,type), not instances).
+    char stringID[48];
+    u32  itemType;
+    u16  quantity;    // units the ORIGINAL intent requested (echo, audit)
+    u16  quality;
+    u8   level;
+    char manufacturer[48];
+    char material[48];
+    u8   outcome;     // XferCommitOutcome below - the host's ONE decision
+    u16  applied;     // host-resolved units a receiver's apply acts on
+};
+
+enum XferCommitOutcome {
+    XFER_COMMIT_RELOCATE  = 0, // the real Item* moves src -> dst on every receiver
+    XFER_COMMIT_FABRICATE = 1, // a shortfall is minted into dst (gear-gated, never backpacks)
+    XFER_COMMIT_REJECT    = 2  // void: release latches, let the next snapshot reconcile
+};
+
+// ---- Protocol 58: transfer-commit bookkeeping ACK ---------------------------
+// Participant -> host, reliable. Unlike InvXferAckPacket this NEVER settles
+// anything - PKT_XFER_COMMIT already is the settled verdict the instant the
+// host broadcasts it. This is audit/bookkeeping only (a `[xfer] COMMIT-ACK`
+// log line the host can correlate against its own COMMIT line); losing one on
+// the wire has no correctness consequence.
+struct XferCommitAckPacket {
+    u8  type;        // = PKT_XFER_COMMIT_ACK
+    u32 ownerId;     // the ACKing participant's own id
+    u32 authorId;    // authorId of the commit being acknowledged
+    u32 transferId;  // transferId of the commit being acknowledged
+    u16 applied;     // echo of the commit's applied count
+    u8  verdict;      // echo of the commit's outcome (XferCommitOutcome)
+};
+
+// ---- Protocol 58: host-committed claim-contention VERDICT (Phase 7 Plan 02, INV-03) ----
+// The host-authoritative answer to every PKT_WORLD_ITEM_CLAIM intent for one item
+// identity (authorId, netId): ClaimArbiter.h's bounded contention window (host-only,
+// engine-free) collects every claim seen within the window, maps each claimant's
+// authorClaimMs via peerClock_, and picks the single winner - earliest mapped stamp,
+// ties within an eps tie-band or any unmappable stamp break to the lowest playerId,
+// commit-final (a later-arriving earlier-stamped claim after this verdict already
+// closed the window is authoritatively rejected, never re-awarded). Broadcast to
+// EVERY connected client (Class B, like PKT_XFER_COMMIT) so the item's AUTHOR (who
+// may not even be one of the claimants) learns to destroy its real ground object and
+// every claimant learns whether it won. `verdict` is always CLAIM_AWARD from the
+// host's point of view (it always names ONE winner); a receiver that is a claimant
+// but NOT winnerPlayerId derives its own REJECT locally by comparing localId.
+struct ClaimVerdictPacket {
+    u8  type;           // = PKT_CLAIM_VERDICT
+    u32 authorId;        // whose netId space (the item's author)
+    u32 netId;            // which item within that author's netId space
+    u32 winnerPlayerId;   // the single deterministic winner
+    u8  verdict;          // ClaimVerdict below
+};
+
+enum ClaimVerdict {
+    CLAIM_AWARD  = 0, // winnerPlayerId is the single winner (the only value the host ever sends)
+    CLAIM_REJECT = 1  // reserved: a receiver derives its own reject locally, never sent as-is
 };
 
 // Reserved netId meaning "no/invalid world item".
@@ -982,27 +1291,63 @@ struct StatsPacket {
 // the CHANGE (MoneyDeltaPacket) and the host publishes the authoritative TOTAL.
 //
 // Host -> join: the authoritative pool total, change-gated with a safety
-// resend. ackSeq is the highest join delta already folded into that total, so
-// the join can re-apply its still-unacked deltas on top instead of watching a
-// fresh purchase revert and then re-apply. money is signed because the engine
-// field is an int (the host clamps the pool at 0).
+// resend. Protocol 60 (CONS-01): the old single `ackSeq` scalar assumed ONE
+// remote peer and is replaced by a per-owner ack VECTOR - the OwnRanksPacket
+// entries[] idiom - so at N>=3 each join pops its own poolPending_ against
+// ITS OWN entry only, never a foreign owner's ack space (the proven wallet
+// bounce/double-count, 09-RESEARCH.md). ackSeq per player = the highest
+// MoneyDeltaPacket.seq PROCESSED (folded OR rejected, MoneyFold.h) for that
+// owner - "processed" (not just "folded") is what pops a rejected delta and
+// produces the visible refund. One broadcast serves every join; each reads
+// only the Entry whose ownerId == its own localId. money is signed because
+// the engine field is an int (the pool itself never goes negative - a spend
+// that would overdraw it is rejected, never clamped).
 struct MoneyPacket {
-    u8  type;    // = PKT_MONEY
-    u32 ownerId; // network player id of the sender (the host)
-    u32 ackSeq;  // highest MoneyDeltaPacket.seq folded into this total (0 = none)
-    int money;   // the authoritative shared pool
+    u8  type;     // = PKT_MONEY
+    u32 ownerId;  // network player id of the sender (the host)
+    u8  ackCount; // valid entries in 'acks' (<= MAX_PLAYERS)
+    struct Entry {
+        u32 ownerId; // the acked player's PlayerId
+        u32 ackSeq;  // highest MoneyDeltaPacket.seq PROCESSED (folded OR rejected)
+    } acks[MAX_PLAYERS];
+    int money;    // the authoritative shared pool
 };
 
 // Join -> host: one signed change the join's LOCAL economy already applied
 // (purchase, sale, loot, bounty, hire). Reliable + ordered, so the host folds
-// each delta exactly once; seq is monotonic per session and comes back as
-// MoneyPacket::ackSeq. A single ackSeq assumes ONE remote peer (the two-player
-// design target) - a third player would need a per-peer ack.
+// each delta exactly once; seq is monotonic per session and comes back as the
+// join's own MoneyPacket::acks[] entry. Protocol 60 (CONS-01): authorSpendMs
+// is the author's nowMs() at delta-detection (same frame as the wallet
+// sample, the WorldItemClaimHeader.authorClaimMs idiom) - the host maps it
+// via peerClock_ so a would-overdraw spend can be arbitrated by TIMESTAMP
+// order (MoneyFold.h) instead of folding unconditionally and clamping the
+// pool at 0.
 struct MoneyDeltaPacket {
-    u8  type;    // = PKT_MONEY_DELTA
-    u32 ownerId; // network player id of the sender (the join)
-    u32 seq;     // monotonic per-session delta sequence (starts at 1)
-    int delta;   // signed change to the pool (negative = spent)
+    u8  type;          // = PKT_MONEY_DELTA
+    u32 ownerId;       // network player id of the sender (the join)
+    u32 seq;           // monotonic per-session delta sequence (starts at 1)
+    int delta;         // signed change to the pool (negative = spent)
+    u32 authorSpendMs; // protocol 60: author's nowMs() at delta-detection
+};
+
+// ---- Protocol 60: host-authoritative insufficient-funds VERDICT (CONS-01) ----
+// The host-authoritative answer to a MoneyDeltaPacket that MoneyFold.h's
+// overdraft window rejected (the pool cannot cover every competing spend in
+// the window): host -> all broadcast (Class B, the PKT_CLAIM_VERDICT/
+// PKT_XFER_COMMIT precedent), so the deterministic verdict is observable and
+// identical on every instance, not just inferred by the buyer from an ack
+// that silently advanced past its seq. The buyer's own ack ALSO advances past
+// the rejected seq (MoneyPacket::acks[]) - that is what pops the optimistic
+// poolPending_ entry and produces the visible refund (the existing adopt-
+// the-host-total write path, no new engine surface). A client-authored
+// PKT_MONEY_REJECT is rejected host-side (the PKT_CLAIM_VERDICT/PKT_CELL_MAP
+// isHost_ precedent) - this verdict is host-authoritative only.
+struct MoneyRejectPacket {
+    u8  type;          // = PKT_MONEY_REJECT
+    u32 buyerId;       // the join whose delta was rejected
+    u32 seq;           // the rejected MoneyDeltaPacket.seq
+    int delta;         // the rejected delta's own signed value (audit)
+    int poolAtVerdict; // the pool total at the moment of the verdict
 };
 
 // ---- Protocol 24: player-faction relation row --------------------------------
@@ -1465,6 +1810,40 @@ struct LoadNackPacket {
     char name[48];    // save name ('\0'-padded)
 };
 
+// ---- Protocol 61: positive coordinated-load ACK + first-wins arbitration ----
+// SAVE-02's missing half: LOAD_NACK exists (above) but the host never learned
+// when a join's coordinated load actually SUCCEEDED - a join stuck in the
+// NACK-flow whose post-transfer commit failed "re-based and kept waiting"
+// forever (10-RESEARCH.md's Failure Handling table). Join -> host: the
+// coordinated load this loadId named either succeeded (ok=1, latched through
+// the WORLD-RELOAD gameplay-live edge - loads take tens of seconds, so this is
+// TRUE completion, not "loadSave() returned true") or failed (ok=0, the early-
+// fail signal LoadCoord.h's per-client state machine retries/drops on).
+struct LoadAckPacket {
+    u8  type;    // = PKT_LOAD_ACK
+    u32 ownerId; // network player id of the sender (the join)
+    u32 loadId;  // the LOAD_GO/coordinated load being acknowledged
+    u8  ok;      // 1 = loaded + live; 0 = failed
+};
+
+// SAVE-03's observable half: the host-authoritative CoordArbiter (LoadCoord.h)
+// serializes save/load requests first-wins; a concurrent/overlapping request
+// is rejected rather than silently last-wins-superseded. Host -> the
+// REJECTED requester only (Class D unicast, the InvXferAckPacket precedent) -
+// never broadcast, and a client-authored one is rejected host-side (the
+// PKT_CLAIM_VERDICT/PKT_CELL_MAP isHost_ precedent). Carries BOTH the
+// rejected request's own ids and the currently-active transition's ids, so
+// the requester's log/UI can name what it lost to.
+struct CoordRejectPacket {
+    u8  type;             // = PKT_COORD_REJECT
+    u32 requesterId;      // the rejected requester's network player id
+    u32 reqId;            // the rejected requester's own SaveReq/LoadReq reqId
+    u8  kind;             // 0 = COORD_SAVE, 1 = COORD_LOAD (LoadCoord.h::CoordKind)
+    u8  reason;           // 0 = busy (the only reason this phase defines)
+    u32 activeRequesterId;// the CURRENTLY active transition's requester (0 = host-local)
+    u32 activeReqId;      // the currently active transition's own reqId
+};
+
 // ---- Protocol 33: production machine sync ------------------------------------
 // One machine state row, HOST-authoritative (world-simulation precedent: the
 // host's engine is the one whose production/power/farming ticks count; the
@@ -1499,17 +1878,29 @@ struct ProdPacket {
 };
 
 // ---- Protocol 38: research tech-tree sync -------------------------------------
-// One KNOWN-research row, HOST-authoritative (world-simulation precedent: the
-// host's tech tree is the party's). Identity is the RESEARCH GameData stringID
-// - cross-client stable (both clients enumerate the identical record set from
+// One KNOWN-research row. Identity is the RESEARCH GameData stringID -
+// cross-client stable (both clients enumerate the identical record set from
 // the shared save, spike 401). The host streams a row for every sid its
 // Research store reports known (first sight = the session baseline, then a
 // safety resend); the join applies via Research::startResearch, which is
 // idempotent (already-known sids are skipped by an isKnown pre-check).
 // Un-learning does not exist in the engine, so rows only ever ADD knowledge.
+//
+// Phase 8 (08-01, WORLD-02): the wire struct is UNCHANGED, but the packet is
+// now genuinely bidirectional. A JOIN also publishes: after silently seeding
+// its shared-save baseline (no ~384-sid dump at connect), it sends its own
+// GENUINELY NEW (post-baseline) local unlocks as host-terminated INTENTS
+// (routingClassOf(PKT_RESEARCH) was already RELAY_NONE pre-Phase-8 - no
+// routing change). The HOST applies a join's intent through the SAME
+// idempotent researchStartBySid path a join uses for the host's own
+// broadcast, then its own publisher broadcasts the newly-known sid so every
+// OTHER join converges - closing the prior gap where a join's local unlock
+// never crossed at any N (publishResearch was hostAuth-gated to never run on
+// a join).
 struct ResearchPacket {
     u8  type;      // = PKT_RESEARCH
-    u32 ownerId;   // network player id of the sender (the host)
+    u32 ownerId;   // network player id of the sender (host stream OR, since
+                   // Phase 8, a join's own post-baseline-unlock intent)
     u32 seq;       // per-sender monotonic (stale-row guard)
     char sid[48];  // RESEARCH GameData stringID (the wire key)
 };
@@ -1565,6 +1956,45 @@ struct CellClaimPacket {
     i32 cellX;    // ZoneManager::getMapSector coords, = the zone.X.Y filename
     i32 cellY;
 };
+
+// Cell-claim MAP (protocol 59, WORLD-03, host -> all, Class B host-
+// broadcast): the host's single authoritative verdict, computed by
+// CellMap.h's engine-free reduceCellMap (continuity -> host-if-party ->
+// lowest-playerId) over every connected owner's claim slots. Carries only
+// the currently-CLAIMED cells (bounded - claimedCells_ tracks at most one
+// entry per live tab across every connected owner, comfortably under
+// CELL_MAP_MAX) - a cell ABSENT from this list fail-opens to the host on
+// every instance (the existing AUTHSRC_OPEN semantics), so vacated-cell
+// history never needs to ride the wire. Sent on change and on a slow
+// re-assert cadence (reconnect insurance, same shape as the old [cell] MAP
+// dump cadence). A client-authored PKT_CELL_MAP is rejected - applyCellMap
+// adopts ONLY a map whose source peer is the host (the PKT_OWN_RANKS
+// host-source-guard precedent: a client's ENet connection has exactly one
+// peer, so anything a client receives here genuinely came from the host).
+struct CellMapPacket {
+    u8  type;   // = PKT_CELL_MAP
+    u32 seq;    // host's own monotonic publish counter (log correlation)
+    u16 count;  // valid entries in 'entries' (<= CELL_MAP_MAX)
+    struct Entry {
+        i32 cellX;
+        i32 cellY;
+        u32 ownerId; // the cell's resolved authoritative owner
+    } entries[64]; // CELL_MAP_MAX, spelled out (a const can't size an array
+                   // member declared ahead of its own definition here)
+};
+
+// >= the live tab cap with headroom (research Open Question 3: bounded
+// packet, one memory - never an unbounded vacated-cell dump). Must match
+// CellMapPacket::entries' array size above exactly.
+const unsigned int CELL_MAP_MAX = 64;
+// Phase 8 review IN-03: compile-time lock on that "must match" - the array
+// literal (sender truncation bound), the receiver clamp, and
+// sizeof(CellMapPacket) all silently desync if either side is edited alone.
+// C++03 negative-array-size trick (no static_assert on VC10): this typedef
+// fails to compile the moment entries[] and CELL_MAP_MAX disagree.
+typedef char cellmap_entries_match_cell_map_max[
+    (sizeof(((CellMapPacket*)0)->entries) / sizeof(CellMapPacket::Entry)
+        == CELL_MAP_MAX) ? 1 : -1];
 
 struct TimePingPacket {
     u8  type;       // = PKT_TIME_PING

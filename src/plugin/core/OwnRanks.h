@@ -19,6 +19,10 @@
 
 #include <set>
 #include <string>
+// Phase 3 Plan 03: pulls in only the u32 typedef (+ zero game/Win32 deps of
+// its own - see Wire.h's own header comment), so this stays the pure,
+// game-free layer prototest links without the Replicator/game.
+#include "../../netproto/Wire.h"
 
 namespace coop {
 
@@ -44,6 +48,50 @@ inline void resolveOwnRanks(std::set<unsigned int>& ranks, bool isHost, bool fro
     if (fromEnv) return;
     ranks.clear();
     ranks.insert(isHost ? 0u : 1u);
+}
+
+// Phase 3 Plan 03 (OWN-01/OWN-03): re-resolve to the deterministic
+// rank=playerId default once a REAL network id is known (WELCOME assigns it
+// on the join; the host's id is always 0). Overload, not a replacement - the
+// (isHost,fromEnv) form above stays the pre-WELCOME default (Config.cpp's
+// load-time call, when localId is not yet known). fromEnv preserves an
+// explicit override exactly like the other overload.
+inline void resolveOwnRanks(std::set<unsigned int>& ranks, u32 localId, bool fromEnv) {
+    if (fromEnv) return;
+    ranks.clear();
+    ranks.insert(localId);
+}
+
+// Phase 3 (OWN-01/OWN-02, POC-01): the deterministic default rank->PlayerId
+// ownership mapping - until a host-authoritative announcement overrides it
+// (Plan 03's Replicator::setAllOwnRanks/allOwnRanks_), the owner of squad-tab
+// rank R is simply PlayerId R (MAIN_GOAL.MD section 4). Pure and game-free
+// (no GameWorld/engine dependency) so the no-game unit layer (prototest) can
+// assert the bijection - each rank maps to exactly one PlayerId, and the
+// {0,1,2,3} roster yields disjoint single-owner ranks - without linking the
+// Replicator/game. Consumed by Replicator::publishOwned()
+// (src/plugin/sync/ReplicatorPublish.cpp) to populate the per-tick
+// handOwner_ map behind Replicator::ownerOfHand().
+inline u32 ownerForRank(unsigned int rank) { return rank; }
+
+// Phase 3 Plan 03: encode/decode a set of squad-tab ranks as a bitmask (bit R
+// set means rank R is present) - the wire shape OwnRanksPacket's per-player
+// rankMask field carries (Wire.h). Ranks fit comfortably in [0,31); MAX_PLAYERS
+// (4) is far under that ceiling, and any out-of-range rank is silently
+// dropped by ranksToMask rather than corrupting adjacent bits.
+inline u32 ranksToMask(const std::set<unsigned int>& ranks) {
+    u32 mask = 0;
+    for (std::set<unsigned int>::const_iterator it = ranks.begin(); it != ranks.end(); ++it) {
+        if (*it < 32u) mask |= (1u << *it);
+    }
+    return mask;
+}
+
+inline void maskToRanks(u32 mask, std::set<unsigned int>& out) {
+    out.clear();
+    for (unsigned int r = 0; r < 32u; ++r) {
+        if (mask & (1u << r)) out.insert(r);
+    }
 }
 
 } // namespace coop

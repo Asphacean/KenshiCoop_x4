@@ -167,6 +167,15 @@ static void adoptLoadedName(const char* nm) {
     setCurrentGameName(std::string(nm));
 }
 
+// Phase 11 review WR-04: the last UNSUPPRESSED load name the detour let
+// through - a suppressed load changes no world, so it must not update this.
+// Read by the join's gameplay-live LOAD_ACK edge (Plugin.cpp) to verify the
+// live world is the coordinated save the GO named, not something the user
+// loaded manually in between. Plain char buffer (no std::string) so it can
+// be written inside loadDetourEdge's SEH __try block (C2712).
+static char g_lastLocalLoadName[48] = { 0 };
+const char* lastLocalLoadName() { return g_lastLocalLoadName; }
+
 // Shared edge/suppression body. Returns true when the original must run
 // (i.e. the load was NOT suppressed). 'via' tags the log with the entry.
 static bool loadDetourEdge(const char* nm, const char* via) {
@@ -179,6 +188,10 @@ static bool loadDetourEdge(const char* nm, const char* via) {
         strncpy(r.name, nm, sizeof(r.name) - 1);
         r.suppressed = suppress ? 1 : 0;
         if (g_loadEdges.size() < 8) g_loadEdges.push_back(r);
+        if (!suppress) {
+            strncpy(g_lastLocalLoadName, r.name, sizeof(g_lastLocalLoadName) - 1);
+            g_lastLocalLoadName[sizeof(g_lastLocalLoadName) - 1] = '\0';
+        }
         char b[160];
         _snprintf(b, sizeof(b) - 1,
                   "[load] LOCAL-LOAD name='%s' suppressed=%d bypass=%d via=%s",
@@ -243,6 +256,12 @@ HandCtorFn    g_handCtorFn    = 0;
 // player-controlled character. Non-virtual, so resolved at runtime.
 typedef void (__fastcall* CharSetDestFn)(Character* self, const Ogre::Vector3* pos, bool shift);
 CharSetDestFn g_charSetDestFn = 0;
+// Character::teleport: the CHARACTER-level teleport - the same
+// Character-vs-CharMovement split as setDestination above, for the teleport
+// half (see EngineInternal.h's CharTeleportFn comment for the measured
+// evidence). The Vector3 is an ABSOLUTE destination (KenshiLib's 'moveBy'
+// arg name is wrong - measured, run 20260903_145920_N4).
+CharTeleportFn g_charTeleportFn = 0;
 
 // Stage 4 NPC replication: nearby-character interest query + AI quieting.
 // getCharactersWithinSphere fills a lektor with nearby characters (as RootObject*
@@ -395,6 +414,7 @@ NotifySeeSneakFn  g_notifySeeSneakFn  = 0;
 CamGetCenterFn    g_camGetCenterFn    = 0;
 CamIsInitFn       g_camIsInitFn       = 0;
 CamFocusFn        g_camFocusFn        = 0;
+CamTeleportFn     g_camTeleportFn     = 0;
 
 // Limb state with the engine's null policy: robotLimbs is lazily allocated, and
 // a null robotLimbs means "no limb ever lost/replaced" == ORIGINAL on all four.
@@ -657,6 +677,11 @@ typedef Item* (__fastcall* BuyItemFn)(Inventory* self, Item* itemToBuy,
 // TRADER's platoon before a programmatic purchase - what opening the trade
 // window would have done. (ShopTrader::updateInventory itself is private.)
 typedef void  (__fastcall* PlatoonRefreshInvFn)(ActivePlatoon* self, bool firstTime);
+// ActivePlatoon::teleport(pos): the engine's own squad-scope relocation (the
+// teleportTo/teleportMessage deferred machinery - the player-squad teleport
+// path). See EngineInternal.h's PlatoonTeleportFn comment for the measured
+// park() gap (run 20260903_135913_N4) this lever closes.
+typedef void  (__fastcall* PlatoonTeleportFn)(ActivePlatoon* self, const Ogre::Vector3* pos);
 // ShopTrader::getTrader accessor - the raw `trader` member read null on every
 // enumerated vendor (run 103547), so the engine's own accessor is the fallback
 // (it may resolve the trader lazily / from a different field).
@@ -666,6 +691,7 @@ OwnGetMoneyFn g_ownGetMoneyFn = 0;
 OwnSetMoneyFn g_ownSetMoneyFn = 0;
 BuyItemFn     g_buyItemFn     = 0;
 PlatoonRefreshInvFn g_platoonRefreshInvFn = 0;
+PlatoonTeleportFn   g_platoonTeleportFn   = 0;
 ShopGetTraderFn     g_shopGetTraderFn     = 0;
 
 // Property deeds (protocol 54). Buying a house/shop adds the building's hand to
@@ -1543,6 +1569,12 @@ void resolve() {
     g_charSetDestFn = (CharSetDestFn)KenshiLib::GetRealAddress(
         static_cast<void (Character::*)(const Ogre::Vector3&, bool)>(
             &Character::setDestination));
+    // Character-level teleport (Phase 8 gap closure; non-fatal: unresolved ->
+    // engine::teleportCharTo returns false and the claim leg's attempt ladder
+    // moves to its camera-streamed park path). Overloaded, so disambiguate.
+    g_charTeleportFn = (CharTeleportFn)KenshiLib::GetRealAddress(
+        static_cast<void (Character::*)(const Ogre::Vector3&)>(
+            &Character::teleport));
 
     // Stage 4 NPC replication. Non-fatal: if unresolved, NPC streaming/quieting
     // is simply skipped (squad sync still works).
@@ -1618,6 +1650,10 @@ void resolve() {
     // scenario simply runs with the camera wherever the save left it).
     g_camFocusFn =
         (CamFocusFn)KenshiLib::GetRealAddress(&CameraClass::focusCameraOnObject);
+    // Camera teleport (Phase 8 gap closure; non-fatal: unresolved -> the claim
+    // leg's zone pre-stream step no-ops and its ladder keeps retrying the
+    // body-level levers).
+    g_camTeleportFn = (CamTeleportFn)KenshiLib::GetRealAddress(&CameraClass::teleport);
     // Consensus game-speed sync (non-fatal: unresolved -> speed sync off).
     g_setGameSpeedFn = (SetGameSpeedFn)KenshiLib::GetRealAddress(&GameWorld::setGameSpeed);
     g_userPauseFn    = (UserPauseFn)KenshiLib::GetRealAddress(&GameWorld::userPause);    g_togglePauseFn = (UserPauseFn)KenshiLib::GetRealAddress(&GameWorld::togglePause);
@@ -1688,6 +1724,11 @@ void resolve() {
     g_buyItemFn     = (BuyItemFn)KenshiLib::GetRealAddress(&Inventory::buyItem);
     g_platoonRefreshInvFn =
         (PlatoonRefreshInvFn)KenshiLib::GetRealAddress(&ActivePlatoon::refreshInventory);
+    // Squad-scope teleport (Phase 8 gap closure; non-fatal: unresolved ->
+    // engine::teleportSquad returns false and its scenario caller falls back
+    // to the legacy park() path, logging the mode it used).
+    g_platoonTeleportFn =
+        (PlatoonTeleportFn)KenshiLib::GetRealAddress(&ActivePlatoon::teleport);
     g_shopGetTraderFn = (ShopGetTraderFn)KenshiLib::GetRealAddress(&ShopTrader::getTrader);
     // Property deeds (protocol 54; non-fatal: unresolved -> CAP_DEED off and the
     // deed channel refuses to write, which the deed_probe reports).
