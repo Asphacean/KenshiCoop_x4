@@ -97,3 +97,8 @@ nul
 .claude/
 .cursor/
 MAIN_GOAL.MD
+# GSD phase/process reports (kept locally; the committed docs/ are contributor references only)
+docs/PHASE_*_GATE.md
+docs/PHASE_*_MATRIX.md
+docs/MILESTONE_*_GATE.md
+docs/TWO_PLAYER_ASSUMPTIONS.md
