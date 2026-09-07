@@ -4195,6 +4195,112 @@ int main() {
         dc1.stop(); dc2.stop(); dc3.stop();
     }
 
+    // ---- host NetLink restart must not leak join slots (F2 OFFLINE -> ONLINE)
+    // ------------------------------------------------------------------------
+    // g_net is a reused singleton, so the F2 panel's OFFLINE -> ONLINE toggle
+    // is stop() + startHost() on the SAME NetLink object. threadLoop() ends
+    // with enet_host_destroy(), which frees the entire ENetPeer array, so
+    // every PeerState::peer left in registry_ dangles afterwards. Without a
+    // session-boundary reset the restarted host inherits the old slot table:
+    // the lowest-free-slot scan in [1, MAX_PLAYERS) sees the stale ids as
+    // occupied and refuses legitimate joins with a truthful-looking but wrong
+    // "MAX_PLAYERS=4 slots full", while sendTo()/broadcast() would dereference
+    // the freed peer pointers.
+    //
+    // Restarting the HOST (not a client) is what makes this leg deterministic:
+    // stop() is local and synchronous, so unlike a client reconnect it needs
+    // no ENet peer-timeout wait (see the NOTE on slot reuse in the
+    // 4th-client-rejection leg above).
+    std::printf("\n-- host NetLink restart does not leak join slots --\n");
+    {
+        const int RESET_PORT = 28800;
+        Inbound rsHostInbound;
+        NetLink rsHost;
+        CHECK("restart leg: host startHost", rsHost.startHost(RESET_PORT, &rsHostInbound));
+        Sleep(200);
+
+        // Fill all 3 join slots in the FIRST session.
+        {
+            Inbound a1In, a2In, a3In;
+            NetLink a1, a2, a3;
+            CHECK("restart leg: session-1 client1 startClient",
+                  a1.startClient("127.0.0.1", RESET_PORT, &a1In));
+            CHECK("restart leg: session-1 client2 startClient",
+                  a2.startClient("127.0.0.1", RESET_PORT, &a2In));
+            CHECK("restart leg: session-1 client3 startClient",
+                  a3.startClient("127.0.0.1", RESET_PORT, &a3In));
+
+            std::deque<u32> acc;
+            {
+                DWORD deadline = GetTickCount() + 8000;
+                do {
+                    drainConnectsInto(rsHostInbound, acc);
+                    if (acc.size() >= 3) break;
+                    Sleep(20);
+                } while (GetTickCount() < deadline);
+            }
+            CHECK("restart leg: session-1 filled all 3 join slots", acc.size() >= 3);
+
+            // Host goes OFFLINE first, exactly like the F2 toggle. Doing this
+            // BEFORE stopping the clients is deliberate: it denies the host any
+            // chance to observe ENet peer timeouts, so the only thing that can
+            // empty registry_ is the session-boundary reset under test.
+            rsHost.stop();
+            a1.stop(); a2.stop(); a3.stop();
+        }
+        Sleep(300);
+
+        // Same object back ONLINE - the inherited-slot-table edge.
+        CHECK("restart leg: host startHost again on the same NetLink object",
+              rsHost.startHost(RESET_PORT, &rsHostInbound));
+        Sleep(200);
+
+        Inbound b1In, b2In, b3In;
+        NetLink b1, b2, b3;
+        CHECK("restart leg: session-2 client1 startClient",
+              b1.startClient("127.0.0.1", RESET_PORT, &b1In));
+        CHECK("restart leg: session-2 client2 startClient",
+              b2.startClient("127.0.0.1", RESET_PORT, &b2In));
+        CHECK("restart leg: session-2 client3 startClient",
+              b3.startClient("127.0.0.1", RESET_PORT, &b3In));
+
+        std::deque<u32> acc2;
+        {
+            DWORD deadline = GetTickCount() + 8000;
+            do {
+                drainConnectsInto(rsHostInbound, acc2);
+                if (acc2.size() >= 3) break;
+                Sleep(20);
+            } while (GetTickCount() < deadline);
+        }
+        // THE regression check: under the pre-fix code the very first session-2
+        // client is rejected ("slots full"), so the host observes ZERO connects.
+        CHECK("restart leg: the restarted host admits all 3 joins again "
+              "(stale slots were not carried over)", acc2.size() >= 3);
+
+        std::set<u32> ids2;
+        ids2.insert(b1.localId());
+        ids2.insert(b2.localId());
+        ids2.insert(b3.localId());
+        CHECK("restart leg: session-2 joins got 3 distinct PlayerIds", ids2.size() == 3);
+        bool inRange2 = true;
+        for (std::set<u32>::const_iterator it = ids2.begin(); it != ids2.end(); ++it)
+            if (*it < 1 || *it >= MAX_PLAYERS) inRange2 = false;
+        CHECK("restart leg: session-2 PlayerIds are all within {1,2,3} - no id 0 "
+              "(rejected/never-assigned) among them", inRange2);
+
+        // A rejected client never reaches gameplay, so it would report a
+        // disconnect instead of a slot. Zero leaves = nobody was turned away.
+        std::deque<u32> b1Leaves, b2Leaves, b3Leaves;
+        drainLeavesInto(b1In, b1Leaves);
+        drainLeavesInto(b2In, b2Leaves);
+        drainLeavesInto(b3In, b3Leaves);
+        CHECK("restart leg: no session-2 join observed a rejection disconnect",
+              b1Leaves.empty() && b2Leaves.empty() && b3Leaves.empty());
+
+        b1.stop(); b2.stop(); b3.stop(); rsHost.stop();
+    }
+
     std::printf("\nnettest: %d/%d checks passed - %s\n",
                 g_total - g_failed, g_total, g_failed == 0 ? "PASS" : "FAIL");
     int rc = g_failed == 0 ? 0 : 1;

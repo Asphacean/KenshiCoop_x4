@@ -104,8 +104,31 @@ bool NetLink::startClient(const std::string& ip, int port, Inbound* inbound) {
     return launchThread();
 }
 
+// Session-boundary reset - see the rationale block on the declaration in
+// NetLink.h. Safe without a lock ONLY because both call sites run on the main
+// thread with no worker alive (before CreateThread / after the join in stop()).
+void NetLink::resetSessionRoster() {
+    // Drop the stale slot table BEFORE the pointers it holds can be reused.
+    // Never touch PeerState::peer here: threadLoop()'s enet_host_destroy()
+    // has already freed the peer array, so these pointers are dangling and
+    // must be discarded, not reset/disconnected.
+    registry_.clear();
+    // Accepted-epoch bookkeeping is per-session too. The client path already
+    // clears it on its own session boundary (the DISCONNECT branch, with the
+    // rationale "all local epoch bookkeeping for this session is moot"); the
+    // host path had no equivalent, so a restarted host would judge a
+    // reconnecting player's first batches against the PREVIOUS session's
+    // accepted epoch.
+    epochSeen_.clear();
+}
+
 bool NetLink::launchThread() {
     if (enet_initialize() != 0) { netErr("enet_initialize failed"); return false; }
+    // Every session starts with an empty roster, regardless of how the previous
+    // one ended. This is the load-bearing call: stop() early-returns when
+    // thread_ == 0, so a start that follows such a path would otherwise inherit
+    // the old slot table.
+    resetSessionRoster();
     stopFlag_ = 0;
     thread_ = CreateThread(0, 0, &NetLink::threadEntry, this, 0, 0);
     if (thread_ == 0) { netErr("CreateThread failed"); enet_deinitialize(); return false; }
@@ -132,6 +155,13 @@ void NetLink::stop() {
         thread_ = 0;
         enet_deinitialize();
     }
+    // Unconditional and AFTER the join above: once stop() returns, no worker
+    // owns these maps, and every ENetPeer* registry_ held was freed by
+    // threadLoop()'s enet_host_destroy(). Clearing here means a stopped NetLink
+    // never sits around holding dangling peer pointers, so a later
+    // sendTo()/broadcast() cannot resurrect them. Idempotent, so a double stop()
+    // (or stop() from ~NetLink after an explicit one) is harmless.
+    resetSessionRoster();
 }
 
 void NetLink::setOwnedEntities(u32 ownerId, const EntityState* arr, unsigned int count) {

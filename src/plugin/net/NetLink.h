@@ -577,6 +577,24 @@ private:
     struct PeerState { ENetPeer* peer; /* + per-player bookkeeping added in later plans */ };
     std::map<u32 /*PlayerId*/, PeerState> registry_;
 
+    // Session-boundary reset for the two net-thread-only per-session maps
+    // above (registry_ + epochSeen_). MUST be called only while NO worker
+    // thread is running - i.e. from launchThread() before CreateThread, and
+    // from stop() after the worker has been joined. Both windows are
+    // main-thread-exclusive, which is why these otherwise net-thread-only
+    // containers may be touched here without a lock.
+    //
+    // Why this is required: threadLoop() ends with enet_host_destroy(), which
+    // frees the whole ENetPeer array. Every PeerState::peer in registry_ then
+    // dangles. Because a NetLink instance is a reused singleton (g_net), an
+    // F2-panel OFFLINE -> ONLINE toggle calls stop() then startHost() on the
+    // SAME object, so without this reset the new session inherits the old
+    // session's slot table: sendTo()/broadcast() would dereference freed
+    // ENetPeer pointers, and the lowest-free-slot scan would treat the stale
+    // ids as occupied and refuse legitimate joins with a truthful-looking but
+    // wrong "MAX_PLAYERS slots full".
+    void resetSessionRoster();
+
     // Steam P2P transport (set before launch; read-only on the net thread
     // thereafter). 0 = stock UDP transport.
     unsigned long long steamPeer_;
