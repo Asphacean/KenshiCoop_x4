@@ -212,6 +212,171 @@ bool cppWhat(const EXCEPTION_RECORD* er, char* out, size_t cap) {
     } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
 }
 
+// ---- fault context: which register, and what bytes actually ran ---------------
+// Added 2026-09-07, after a fault this tracer described but nobody could explain.
+// Two inputs were missing, and both are cheap to record from inside the handler:
+//
+//   * WHICH REGISTER held the bad pointer. The READ/WRITE line says what address
+//     was touched; it does not say through what. Naming the register turns a
+//     shape-match guess into a yes/no question the log answers by itself - the
+//     leading candidate for the 2026-09-07 fault predicts a vtable load through
+//     rcx == -1, and "rcx+0x0" versus anything else decides it. The near-miss
+//     form matters as much as the exact one: a fault at rcx+0x48 is a field load
+//     off a struct pointer, which names the offset of the guilty member.
+//
+//   * THE BYTES THAT ACTUALLY EXECUTED. That fault's RVA was MID-INSTRUCTION in
+//     kenshi_x64.exe on disk, under every 64K-aligned base tried, and no base
+//     made the frame chain self-consistent - so the disk image is NOT the code
+//     that ran (RE_Kenshi rewrites the image at load; it ships MinHook and
+//     courgette). Neither the vendored KenshiLib header RVAs nor RE_Kenshi's own
+//     1.0.65 RVA tables bridge the gap: under 6% of either lands on a .pdata
+//     function start in the installed exe, and no constant delta exists. So a
+//     module+RVA alone cannot be symbolized, and the one input that would let
+//     the decode and the instruction-boundary test be redone offline is the
+//     LOADED bytes around rip. This carries them out in the log.
+//
+// Cost is ~15 extra lines per fault report, which the existing per-site budget
+// already caps at REPORTS_PER_SITE. Both stay inside the handler's rules: no
+// allocation, no locks, fixed stack buffers, and every read of possibly-bad
+// memory in its own __try, so a wild rip costs one row rather than the report.
+
+// Window around rip. Wide enough that the longest x64 instruction cannot escape
+// either end, and that a disassembler has real context to re-sync on.
+const int CODE_BACK = 0x40;
+const int CODE_FWD  = 0x40;
+const int CODE_ROW  = 16;
+
+// Copy one row out of memory that may not be there. Row at a time on purpose: a
+// window straddling the end of a mapped page still yields everything up to the
+// boundary instead of nothing.
+bool readRow(const unsigned char* src, unsigned char* dst) {
+    __try {
+        for (int i = 0; i < CODE_ROW; ++i) dst[i] = src[i];
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+// Plain lowercase hex, space separated, nothing else - these rows get pasted
+// straight into a byte decoder, so no ASCII column and no half-row marker.
+void hexRow(const unsigned char* row, char* out) {
+    static const char* HEX = "0123456789abcdef";
+    int k = 0;
+    for (int i = 0; i < CODE_ROW; ++i) {
+        out[k++] = HEX[(row[i] >> 4) & 0xf];
+        out[k++] = HEX[row[i] & 0xf];
+        out[k++] = ' ';
+    }
+    out[k - 1] = '\0';
+}
+
+void reportCode(const void* rip) {
+    if (!rip) return;
+    const unsigned char* start = (const unsigned char*)rip - CODE_BACK;
+
+    char where[MAX_PATH + 32];
+    attribute(start, where, sizeof(where));
+
+    char b[MAX_PATH + 256];
+    _snprintf(b, sizeof(b) - 1,
+              "[crash]   code window %s = rip-0x%x (%d bytes of the LOADED image, "
+              "which need not match the file on disk)",
+              where, (unsigned)CODE_BACK, (int)(CODE_BACK + CODE_FWD));
+    b[sizeof(b) - 1] = '\0';
+    coop::logLine(b);
+
+    for (int off = -CODE_BACK; off < CODE_FWD; off += CODE_ROW) {
+        const unsigned char* p = (const unsigned char*)rip + off;
+        unsigned char row[CODE_ROW];
+        char hex[CODE_ROW * 3];
+        if (readRow(p, row)) {
+            hexRow(row, hex);
+        } else {
+            _snprintf(hex, sizeof(hex) - 1, "<unreadable>");
+            hex[sizeof(hex) - 1] = '\0';
+        }
+        _snprintf(b, sizeof(b) - 1, "[crash]   code rip%c0x%02x %p  %s",
+                  off < 0 ? '-' : '+', (unsigned)(off < 0 ? -off : off), p, hex);
+        b[sizeof(b) - 1] = '\0';
+        coop::logLine(b);
+    }
+}
+
+// The integer register file, x64. Ordered rax,rcx,rdx,rbx,rsp,rbp,rsi,rdi,r8..r15
+// - the encoding order, not alphabetical, so a ModRM field read out of the code
+// window above indexes straight into this list.
+void reportRegs(EXCEPTION_POINTERS* ep) {
+    CONTEXT* c = ep->ContextRecord;
+    char b[512];
+    if (!c) return;
+    if ((c->ContextFlags & CONTEXT_INTEGER) != CONTEXT_INTEGER) {
+        _snprintf(b, sizeof(b) - 1,
+                  "[crash]   regs unavailable (contextFlags=0x%08lx)",
+                  (unsigned long)c->ContextFlags);
+        b[sizeof(b) - 1] = '\0';
+        coop::logLine(b);
+        return;
+    }
+
+    static const char* NAMES[16] = { "rax","rcx","rdx","rbx","rsp","rbp","rsi","rdi",
+                                     "r8","r9","r10","r11","r12","r13","r14","r15" };
+    const ULONG_PTR r[16] = { c->Rax, c->Rcx, c->Rdx, c->Rbx, c->Rsp, c->Rbp,
+                              c->Rsi, c->Rdi, c->R8,  c->R9,  c->R10, c->R11,
+                              c->R12, c->R13, c->R14, c->R15 };
+
+    for (int i = 0; i < 16; i += 4) {
+        _snprintf(b, sizeof(b) - 1,
+                  "[crash]   %-3s=%016llx %-3s=%016llx %-3s=%016llx %-3s=%016llx",
+                  NAMES[i + 0], (unsigned long long)r[i + 0],
+                  NAMES[i + 1], (unsigned long long)r[i + 1],
+                  NAMES[i + 2], (unsigned long long)r[i + 2],
+                  NAMES[i + 3], (unsigned long long)r[i + 3]);
+        b[sizeof(b) - 1] = '\0';
+        coop::logLine(b);
+    }
+    _snprintf(b, sizeof(b) - 1, "[crash]   rip=%016llx eflags=%08lx",
+              (unsigned long long)c->Rip, (unsigned long)c->EFlags);
+    b[sizeof(b) - 1] = '\0';
+    coop::logLine(b);
+
+    // Which register the faulting address came out of. Exact match means the
+    // pointer itself was bad; a small positive delta means a field load off a
+    // bad base, and the delta IS the member offset.
+    if (ep->ExceptionRecord->ExceptionCode != ACCESS_VIOLATION ||
+        ep->ExceptionRecord->NumberParameters < 2)
+        return;
+    const ULONG_PTR at = ep->ExceptionRecord->ExceptionInformation[1];
+    char hit[256]; hit[0] = '\0';
+    size_t used = 0;
+    for (int i = 0; i < 16; ++i) {
+        const ULONG_PTR d = (ULONG_PTR)(at - r[i]);
+        if (d > 0xfff) continue;                 // unsigned: negatives wrap out
+        // A near miss only counts from a register that could BE a pointer. Most
+        // registers are zero most of the time, so on a low fault address every
+        // one of them sits within 0x1000 of it - measured: a planted read of
+        // 0x48 named ELEVEN registers, which is a wall of noise hiding the one
+        // line that matters. An exact match is always reported (that IS the
+        // pointer); a delta is only reported off a register big enough to be an
+        // address. When nothing qualifies and the address is itself tiny, the
+        // address alone already says "null-ish base + that offset".
+        if (d != 0 && r[i] < 0x10000) continue;
+        char one[40];
+        _snprintf(one, sizeof(one) - 1, "%s%s+0x%x",
+                  used ? " " : "", NAMES[i], (unsigned)d);
+        one[sizeof(one) - 1] = '\0';
+        const size_t l = strlen(one);
+        if (used + l + 1 >= sizeof(hit)) break;
+        memcpy(hit + used, one, l + 1);
+        used += l;
+    }
+    _snprintf(b, sizeof(b) - 1, "[crash]   fault address held by: %s",
+              used ? hit : "<no integer register within 0x1000 - computed or "
+                          "spilled operand>");
+    b[sizeof(b) - 1] = '\0';
+    coop::logLine(b);
+}
+
 // A throw, in one line: which type, what it said, and where from. No stack and no
 // second line - see REPORTS_PER_THROW for why. Reads as a breadcrumb rather than an
 // alarm, because the overwhelming majority of these are caught; the ones that matter
@@ -263,6 +428,12 @@ void report(EXCEPTION_POINTERS* ep, const char* origin) {
         b[sizeof(b) - 1] = '\0';
         coop::logLine(b);
     }
+
+    // Registers first, then the code that ran: together they say what the bad
+    // pointer was held in and which instruction dereferenced it - the two facts
+    // a module+RVA on its own cannot supply. See the block above reportCode.
+    reportRegs(ep);
+    reportCode(ep->ExceptionRecord->ExceptionAddress);
 
     // The caller chain, as module+RVA per frame. This is the difference between
     // naming a fault and explaining it: the faulting address alone identified
@@ -351,9 +522,9 @@ void install(const char* dir, const char* modeTag) {
 
     char b[192];
     _snprintf(b, sizeof(b) - 1,
-              "[crash] fault tracer installed (veh=%d, uefChains=%d, stacks=%d); "
-              "watching AV + C++ throws + hard-fatal codes; dumps come from "
-              "tools\\_dumplive.ps1, not from inside the fault",
+              "[crash] fault tracer installed (veh=%d, uefChains=%d, stacks=%d, "
+              "regs+code=1); watching AV + C++ throws + hard-fatal codes; dumps "
+              "come from tools\\_dumplive.ps1, not from inside the fault",
               g_veh ? 1 : 0, g_prev ? 1 : 0, g_capture ? 1 : 0);
     b[sizeof(b) - 1] = '\0';
     coop::logLine(b);

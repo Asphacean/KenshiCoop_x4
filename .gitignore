@@ -36,6 +36,14 @@ tools/build_out.txt
 # Ad-hoc debug scratch scripts and captured screenshots
 tools/_*.ps1
 tools/_*.png
+# ...with two exceptions. These two are NOT scratch: CrashDump.cpp's triage path
+# names them as the only supported way to get a dump ("no dump from inside the
+# fault"), and on 2026-09-07 a crash investigation stalled precisely because the
+# underscore rule above had kept them out of every checkout - the comment below
+# cites _dumplive.ps1 as if it were committed, and it never was. They keep the
+# documented names so that reference stays true, and are tracked explicitly.
+!tools/_dumplive.ps1
+!tools/_dmpinfo.ps1
 # One-off UI verification captures (menu/banner screenshots). Same rationale as
 # the scratch PNGs above: megabytes of frames that only mean something during
 # the session that took them.
