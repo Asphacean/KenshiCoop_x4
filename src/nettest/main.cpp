@@ -36,6 +36,9 @@
 
 #include "../plugin/net/NetLink.h"
 #include "../plugin/core/Inbound.h"
+// leave-queue OWNER_ID_ALL expansion (host-link drop) - pure header, engine-free,
+// so the drop leg below runs the SAME code Plugin.cpp's leave drain does.
+#include "../plugin/core/PeerRoster.h"
 #include "../plugin/CoopLog.h"
 #include "../plugin/net/SteamP2P.h"
 // Phase 8 review CR-01: the cross-sender deed-collision leg folds the REAL
@@ -4094,6 +4097,102 @@ int main() {
               parityGotGo && parityGotBegin);
 
         pc1.stop(); pHost.stop();
+    }
+
+    // ---- host-link-drop roster teardown (PeerRoster.h) -------------------
+    // A CLIENT connected together with 2 OTHER clients loses the host. The
+    // host is the only link a client has and every other player's state is
+    // relayed through it, so that single ENet DISCONNECT means the whole
+    // roster is gone at once - NetLink pushes the OWNER_ID_ALL sentinel for
+    // it (the client branch of ENET_EVENT_TYPE_DISCONNECT).
+    //
+    // The regression this locks (2026-09-07, x4 branch): every consumer of a
+    // drained leave id is owner-scoped by `==` equality, so the sentinel used
+    // to match NOTHING and the client's entire teardown no-opped. The
+    // presence set and Replicator::knownPeers_ kept the dead ids forever
+    // (resetSession() deliberately preserves knownPeers_, so no world reload
+    // healed it) and each reconnect stacked the new ids on top.
+    //
+    // This leg drives the REAL transport - a real host + 3 real clients over
+    // loopback UDP, then NetLink::stop() on the HOST - and then runs the
+    // drained queue through the SAME production expansion Plugin.cpp's
+    // processNetEvents uses (coop::expandLeaveQueue), modelling the two
+    // owner-scoped roster erases the live loop performs per expanded id. The
+    // assertion is the one the plan named: afterwards both roster structures
+    // are EMPTY.
+    std::printf("\n-- host-link drop at N=4: one sentinel tears down the whole "
+                "client-side roster (PeerRoster.h) --\n");
+    {
+        const int DROP_PORT = 28700;
+        Inbound dHostInbound;
+        NetLink dHost;
+        CHECK("drop leg: host startHost", dHost.startHost(DROP_PORT, &dHostInbound));
+        Sleep(200);
+
+        Inbound dc1Inbound, dc2Inbound, dc3Inbound;
+        NetLink dc1, dc2, dc3;
+        CHECK("drop leg: client1 startClient",
+              dc1.startClient("127.0.0.1", DROP_PORT, &dc1Inbound));
+        CHECK("drop leg: client2 startClient",
+              dc2.startClient("127.0.0.1", DROP_PORT, &dc2Inbound));
+        CHECK("drop leg: client3 startClient",
+              dc3.startClient("127.0.0.1", DROP_PORT, &dc3Inbound));
+
+        // client1 is the OBSERVER. Build its roster the way Plugin.cpp does:
+        // insert every id its own connect drain reports (the host's id 0 via
+        // WELCOME, the other two joins via the PKT_PLAYER_JOINED roster
+        // broadcast) - g_connectedPeers.insert(*it) plus the
+        // Replicator::notePeerConnected(*it) mirror.
+        std::set<u32> connected;   // models Plugin.cpp's g_connectedPeers
+        std::set<u32> known;       // models Replicator::knownPeers_
+        std::deque<u32> connAcc;
+        {
+            DWORD deadline = GetTickCount() + 8000;
+            do {
+                drainConnectsInto(dc1Inbound, connAcc);
+                if (connAcc.size() >= 3) break; // host + the 2 other joins
+                Sleep(20);
+            } while (GetTickCount() < deadline);
+        }
+        for (size_t i = 0; i < connAcc.size(); ++i) {
+            connected.insert(connAcc[i]);
+            known.insert(connAcc[i]);
+        }
+        CHECK("drop leg: observer tracks the host + both other joins before the "
+              "drop (3 ids)", connected.size() == 3 && connected.count(0) == 1);
+
+        // Force the HOST's NetLink down. stop() tears the local ENet host
+        // down with no wire-level graceful disconnect, so each client learns
+        // via ENet's own peer-timeout detection (deterministic, but not
+        // instant - default timeoutMinimum is 5000 ms per third_party/enet's
+        // vendored protocol.c), exactly like a real host process dying.
+        dHost.stop();
+
+        std::deque<u32> leaveAcc;
+        bool sawSentinel = waitForLeaveId(dc1Inbound, leaveAcc, OWNER_ID_ALL, 20000);
+        CHECK("drop leg: the observer's leave queue carries the OWNER_ID_ALL "
+              "sentinel after the host's NetLink went down", sawSentinel);
+
+        // The production expansion + the per-id owner-scoped erases the live
+        // leave loop runs, then the session-boundary clear its flag gates.
+        std::deque<u32> expanded;
+        bool linkDown = expandLeaveQueue(leaveAcc, connected, expanded);
+        for (size_t i = 0; i < expanded.size(); ++i) {
+            connected.erase(expanded[i]); // g_connectedPeers.erase(*it)
+            known.erase(expanded[i]);     // Replicator::notePeerLeft(*it)
+        }
+        if (linkDown) known.clear();      // Replicator::clearKnownPeers()
+
+        CHECK("drop leg: the drop is classified as a session boundary, not one "
+              "peer's departure", linkDown);
+        CHECK("drop leg: the sentinel expanded to all 3 tracked ids, so the "
+              "owner-scoped teardown actually ran", expanded.size() == 3);
+        CHECK("drop leg: g_connectedPeers is EMPTY after the host-link drop",
+              connected.empty());
+        CHECK("drop leg: Replicator::knownPeers_ is EMPTY after the host-link "
+              "drop", known.empty());
+
+        dc1.stop(); dc2.stop(); dc3.stop();
     }
 
     std::printf("\nnettest: %d/%d checks passed - %s\n",

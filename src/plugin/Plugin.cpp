@@ -35,6 +35,7 @@
 #include "core/CrashDump.h"
 #include "core/OwnRanks.h"
 #include "core/Inbound.h"
+#include "core/PeerRoster.h" // leave-queue OWNER_ID_ALL expansion (host-link drop)
 #include "net/NetLink.h"
 #include "net/SteamP2P.h"
 #include "net/SteamInvite.h"
@@ -569,9 +570,27 @@ void driveConnectPushQueue() {
 // per event. The net thread already logs the handshake; this proves the event
 // reached the game thread cleanly (and is where later stages spawn/sweep).
 void processNetEvents(GameWorld* gw) {
-    std::deque<coop::u32> conns, leaves;
+    std::deque<coop::u32> conns, drainedLeaves;
     g_inbound.drainConnects(conns);
-    g_inbound.drainLeaves(leaves);
+    g_inbound.drainLeaves(drainedLeaves);
+    // The leave queue can carry the OWNER_ID_ALL sentinel ("my single link to
+    // the host went down" - NetLink's client DISCONNECT branch) alongside real
+    // PlayerIds, and EVERY consumer below is owner-scoped by `==` equality, so
+    // the sentinel would match nothing and the whole teardown would silently
+    // no-op (see PeerRoster.h for the regression this guards). Expand it into
+    // the concrete roster those consumers can act on, so one code path serves
+    // both entry kinds at every N - including N=2, where it expands to the one
+    // connected id.
+    std::deque<coop::u32> leaves;
+    const bool hostLinkDown =
+        coop::expandLeaveQueue(drainedLeaves, g_connectedPeers, leaves);
+    if (hostLinkDown) {
+        char lb[160];
+        _snprintf(lb, sizeof(lb) - 1,
+                  "[leave] host link down; expanded to %u tracked peer(s) for teardown",
+                  (unsigned)leaves.size());
+        lb[sizeof(lb) - 1] = '\0'; coopLog(lb);
+    }
     for (std::deque<coop::u32>::iterator it = conns.begin(); it != conns.end(); ++it) {
         char b[96];
         _snprintf(b, sizeof(b) - 1, "handshake: peer present id=%u (local id=%u)",
@@ -773,6 +792,21 @@ void processNetEvents(GameWorld* gw) {
             coopLog("[save] JOIN save suppression OFF (peer left)");
         }
     }
+    // A host-link drop is a session BOUNDARY, not one peer's departure: the
+    // per-id loop above tore down every id we were TRACKING, but the
+    // session-global roster state is not owner-scoped and so has no per-id
+    // erase to reach it. knownPeers_/allOwnRanks_ are deliberately PRESERVED
+    // by resetSession() (Replicator.h) so a world reload keeps them, which is
+    // exactly why they must be dropped explicitly here - otherwise dead
+    // PlayerIds accumulate for the life of the process and the next
+    // reconnect's roster is inserted on top of them. Same call, same
+    // rationale, as sessionResetForUi()'s panel-disconnect path (WR-02); the
+    // host re-announces the full map on the next connect edge.
+    if (hostLinkDown) {
+        g_repl.clearKnownPeers();
+        coopLog("[leave] host link down; roster + own-ranks cleared "
+                "(session boundary)");
+    }
     // Phase 3 Plan 03 (OWN-01/OWN-03, T-03-06): HOST re-announces the
     // authoritative ownership-rank map whenever roster membership changed this
     // drain (no-op on a join - announceOwnRanks is gated to isHostRole()).
@@ -803,8 +837,11 @@ void processNetEvents(GameWorld* gw) {
     // carry no per-owner scoping to filter on) - it stays ONE call per leave
     // BATCH, matching its own structural (not per-peer) contract. The
     // per-owner cleanup itself now runs inside the leaves loop above, once
-    // per departing id (Phase 3 Plan 04).
-    if (!leaves.empty()) {
+    // per departing id (Phase 3 Plan 04). hostLinkDown is ORed in so the
+    // flush still happens when the link dropped while we tracked NO peers
+    // (expansion yields an empty list, but the world state we received over
+    // that link is just as gone).
+    if (!leaves.empty() || hostLinkDown) {
         g_inbound.flushWorldState();
     }
 }

@@ -31,6 +31,7 @@
 #include "../plugin/core/WorkPose.h"
 #include "../plugin/core/DeathLatch.h"
 #include "../plugin/core/Inbound.h" // Phase 0 queue-lifecycle fixes (header-only)
+#include "../plugin/core/PeerRoster.h" // leave-queue OWNER_ID_ALL expansion (host-link drop)
 #include "../plugin/game/EngineFaults.h" // Phase 5c: fault throttle (pure inline)
 #include "../plugin/game/EngineCaps.h"   // Phase 5d: capability registry (pure inline)
 #include "../plugin/sync/ChangeGate.h"   // Phase 6: change-gated send/accept policy
@@ -1488,6 +1489,160 @@ static void testOwnRanks() {
         }
         CHECK("dynamic-tab: decoded map resolves rank to its creator",
               resolvedOwner == CREATOR);
+    }
+}
+
+// ---- 6b. Leave-queue expansion (PeerRoster.h) -----------------------------------
+// Guards the host-link-drop leave path (regression found 2026-09-07 on the x4
+// branch). Inbound's leave queue carries real PlayerIds AND the OWNER_ID_ALL
+// sentinel NetLink pushes on a CLIENT's ENET_EVENT_TYPE_DISCONNECT ("my single
+// link to the host went down"). Every consumer of a drained id is owner-scoped
+// by `==` equality, so before this expansion the sentinel matched NOTHING and
+// the client's whole teardown no-opped: the observable symptom was
+// "[leave] cleared proxies=0 released=0 ... pins=0 ... xfer voided=0" for
+// owner=4294967295 while the presence set and Replicator::knownPeers_ kept the
+// dead ids forever (resetSession() deliberately preserves knownPeers_, so no
+// world reload healed it and each reconnect stacked new ids on top).
+//
+// The two asserted properties are exactly what the live drain depends on:
+//   1. a sentinel expands to every tracked peer, so the owner-scoped teardown
+//      actually runs, and applying the expansion leaves the presence set EMPTY;
+//   2. the return flag distinguishes "the session ended" from "one peer left",
+//      which is what gates the session-global clearKnownPeers().
+
+// Model of Plugin.cpp's processNetEvents leave drain: expand, then run the
+// per-id owner-scoped erase over both roster structures exactly as the live
+// loop does (g_connectedPeers.erase / Replicator::notePeerLeft), plus the
+// session-boundary clearKnownPeers() the flag gates. Returns the expanded
+// list so a caller can assert its contents too.
+static bool applyLeaveDrain(const std::deque<u32>& drained,
+                            std::set<u32>& connected,
+                            std::set<u32>& known,
+                            std::deque<u32>& expanded) {
+    bool linkDown = expandLeaveQueue(drained, connected, expanded);
+    for (size_t i = 0; i < expanded.size(); ++i) {
+        connected.erase(expanded[i]);  // g_connectedPeers.erase(*it)
+        known.erase(expanded[i]);      // Replicator::notePeerLeft(*it)
+    }
+    if (linkDown) known.clear();       // Replicator::clearKnownPeers()
+    return linkDown;
+}
+
+static bool idsAre(const std::deque<u32>& d, const char* csv) {
+    std::string want(csv), got;
+    for (size_t i = 0; i < d.size(); ++i) {
+        char b[16]; _snprintf(b, sizeof(b) - 1, "%u", (unsigned)d[i]); b[15] = '\0';
+        if (i) got += ",";
+        got += b;
+    }
+    return got == want;
+}
+
+static void testLeaveExpansion() {
+    std::printf("== leave-queue expansion (PeerRoster.h) ==\n");
+
+    // THE REGRESSION, at N=4: a client tracking 3 other peers loses its host
+    // link. One sentinel must tear down all three, and both roster structures
+    // must end EMPTY - the assertion that failed before this fix.
+    {
+        std::set<u32> connected; connected.insert(0); connected.insert(2); connected.insert(3);
+        std::set<u32> known(connected);
+        std::deque<u32> drained; drained.push_back(OWNER_ID_ALL);
+        std::deque<u32> expanded;
+        bool linkDown = applyLeaveDrain(drained, connected, known, expanded);
+        CHECK("N=4 host-link drop: sentinel expands to all 3 tracked peers",
+              idsAre(expanded, "0,2,3"));
+        CHECK("N=4 host-link drop: reported as a session boundary", linkDown);
+        CHECK("N=4 host-link drop: connected-peer set ends EMPTY", connected.empty());
+        CHECK("N=4 host-link drop: knownPeers_ ends EMPTY", known.empty());
+    }
+
+    // Compatibility shape (1 host + 1 client UDP): the SAME path, no small-N
+    // special case - the sentinel expands to the single tracked id and the
+    // teardown the 2-player build got from its global resetSession() still
+    // happens.
+    {
+        std::set<u32> connected; connected.insert(0);
+        std::set<u32> known(connected);
+        std::deque<u32> drained; drained.push_back(OWNER_ID_ALL);
+        std::deque<u32> expanded;
+        bool linkDown = applyLeaveDrain(drained, connected, known, expanded);
+        CHECK("N=2 host-link drop: sentinel expands to the sole host id",
+              idsAre(expanded, "0"));
+        CHECK("N=2 host-link drop: reported as a session boundary", linkDown);
+        CHECK("N=2 host-link drop: both roster structures end EMPTY",
+              connected.empty() && known.empty());
+    }
+
+    // An ORDINARY leave is untouched: one peer's departure must NOT be read as
+    // a session boundary, and the survivors must stay in the presence set (the
+    // PEER-02/03 isolation invariant).
+    {
+        std::set<u32> connected; connected.insert(0); connected.insert(2); connected.insert(3);
+        std::set<u32> known(connected);
+        std::deque<u32> drained; drained.push_back(2);
+        std::deque<u32> expanded;
+        bool linkDown = applyLeaveDrain(drained, connected, known, expanded);
+        CHECK("ordinary leave: passes through as itself", idsAre(expanded, "2"));
+        CHECK("ordinary leave: NOT a session boundary", !linkDown);
+        CHECK("ordinary leave: survivors stay present",
+              connected.size() == 2 && connected.count(0) && connected.count(3));
+        CHECK("ordinary leave: survivors stay in knownPeers_",
+              known.size() == 2 && known.count(0) && known.count(3));
+    }
+
+    // Mixed drain, wire order preserved, and DEDUPED: a roster PKT_PLAYER_LEFT
+    // for peer 2 landing in the same drain as the host-link drop must not run
+    // peer 2's teardown (or log its purge lines) twice.
+    {
+        std::set<u32> connected; connected.insert(0); connected.insert(2); connected.insert(3);
+        std::deque<u32> drained; drained.push_back(2); drained.push_back(OWNER_ID_ALL);
+        std::deque<u32> expanded;
+        CHECK("mixed drain: id 2 first (wire order), then the rest ascending",
+              expandLeaveQueue(drained, connected, expanded)
+              && idsAre(expanded, "2,0,3"));
+    }
+    {
+        std::set<u32> connected; connected.insert(0); connected.insert(2);
+        std::deque<u32> drained;
+        drained.push_back(OWNER_ID_ALL); drained.push_back(OWNER_ID_ALL);
+        std::deque<u32> expanded;
+        CHECK("two sentinels in one drain still expand to each id exactly once",
+              expandLeaveQueue(drained, connected, expanded)
+              && idsAre(expanded, "0,2"));
+    }
+
+    // The sentinel must never survive expansion into the owner-scoped
+    // consumers - that IS the no-op bug. Includes the defensive case of a
+    // presence set that a prior build's leak left holding the sentinel.
+    {
+        std::set<u32> connected; connected.insert(0); connected.insert(OWNER_ID_ALL);
+        std::deque<u32> drained; drained.push_back(OWNER_ID_ALL);
+        std::deque<u32> expanded;
+        bool linkDown = expandLeaveQueue(drained, connected, expanded);
+        bool clean = true;
+        for (size_t i = 0; i < expanded.size(); ++i)
+            if (expanded[i] == OWNER_ID_ALL) clean = false;
+        CHECK("expansion never emits OWNER_ID_ALL to an owner-scoped consumer",
+              linkDown && clean && idsAre(expanded, "0"));
+    }
+
+    // Degenerate inputs: a drop with nothing tracked is still a session
+    // boundary (the flag is what the caller acts on), and an empty drain is
+    // not a boundary at all.
+    {
+        std::set<u32> connected;
+        std::deque<u32> drained; drained.push_back(OWNER_ID_ALL);
+        std::deque<u32> expanded;
+        CHECK("drop with no tracked peers: boundary flag set, expansion empty",
+              expandLeaveQueue(drained, connected, expanded) && expanded.empty());
+    }
+    {
+        std::set<u32> connected; connected.insert(0);
+        std::deque<u32> drained;
+        std::deque<u32> expanded; expanded.push_back(99); // must be overwritten
+        CHECK("empty drain: no boundary, no ids (out is cleared)",
+              !expandLeaveQueue(drained, connected, expanded) && expanded.empty());
     }
 }
 
@@ -4251,6 +4406,7 @@ int main() {
     testContentHash();
     testInterp();
     testOwnRanks();
+    testLeaveExpansion();
     testSteamIdParse();
     testWorkPoseMatch();
     testTaskClear();
