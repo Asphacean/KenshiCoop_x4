@@ -32,6 +32,7 @@
 #include "../plugin/core/DeathLatch.h"
 #include "../plugin/core/Inbound.h" // Phase 0 queue-lifecycle fixes (header-only)
 #include "../plugin/core/PeerRoster.h" // leave-queue OWNER_ID_ALL expansion (host-link drop)
+#include "../plugin/test/PauseSchedule.h" // pause_stress repro-driver cycle schedule (pure)
 #include "../plugin/game/EngineFaults.h" // Phase 5c: fault throttle (pure inline)
 #include "../plugin/game/EngineCaps.h"   // Phase 5d: capability registry (pure inline)
 #include "../plugin/sync/ChangeGate.h"   // Phase 6: change-gated send/accept policy
@@ -1643,6 +1644,253 @@ static void testLeaveExpansion() {
         std::deque<u32> expanded; expanded.push_back(99); // must be overwritten
         CHECK("empty drain: no boundary, no ids (out is cleared)",
               !expandLeaveQueue(drained, connected, expanded) && expanded.empty());
+    }
+}
+
+// ---- 6b. pause_stress cycle schedule (test/PauseSchedule.h) ---------------------
+// The `pause_stress` scenario is a REPRO DRIVER for the 0xc0000005 investigation
+// (.planning/debug/crash-av-worker-thread.md, lead E-21): it repeatedly drives
+// the session into a replicated pause, because a replicated pause is the one
+// stimulus provably common to both processes that faulted in the field.
+//
+// The driver as a whole can only be judged by a live 2-process rig. Its
+// SCHEDULE cannot: it is a pure function of elapsed wall-clock ms and the local
+// role, so it is asserted here, in milliseconds, with no game. Three properties
+// carry real weight (the rest are boundaries around them):
+//
+//   1. ROLE ALTERNATION. Exactly one side owns each cycle's vote, and the owner
+//      flips every cycle. The fault reproduced in BOTH roles, so a driver that
+//      only ever votes from one side would exercise half the replication
+//      direction and a clean run would mean even less than it already does.
+//   2. THE HOLD SPANS THE FAULT WINDOW. The field faults landed 3.7 s and 7.9 s
+//      after the pause. A hold trimmed below ~8 s would resume the world before
+//      the window the driver exists to sit inside - a silent loss of the whole
+//      point, invisible in any log.
+//   3. ONE VOTE PER EDGE, NEVER PER TICK. The vote goes out through the same
+//      hooked setter a UI click uses; per-tick writes would flood the consensus
+//      channel and drown the traffic the run is there to read.
+//
+// NOTE ON SCOPE, deliberately: passing these checks says the schedule is
+// correct. It says NOTHING about whether the driver reproduces the crash, and a
+// clean run of it eliminates nothing (debug file, E-26).
+
+// Walk the schedule at a fixed tick and record what each side would do. Returns
+// the act log as "cycle:who:act" entries, which is the whole observable.
+struct PauseAct { int cycle; bool isHost; bool paused; unsigned long atMs; };
+
+static void simulatePauseRun(const coop::PauseCycle& g, unsigned long tickMs,
+                             unsigned long untilMs, std::vector<PauseAct>& out) {
+    coop::PauseEdgeState hostEdge = coop::pauseEdgeInit();
+    coop::PauseEdgeState joinEdge = coop::pauseEdgeInit();
+    for (unsigned long t = 0; t <= untilMs; t += tickMs) {
+        coop::PausePhase ph = coop::pausePhaseAt(g, t);
+        for (int r = 0; r < 2; ++r) {
+            bool isHost = (r == 0);
+            coop::PauseEdgeState& st = isHost ? hostEdge : joinEdge;
+            if (coop::pauseShouldAct(ph, isHost, st)) {
+                PauseAct a; a.cycle = ph.cycle; a.isHost = isHost;
+                a.paused = ph.wantPaused; a.atMs = t;
+                out.push_back(a);
+                coop::pauseNoteActed(ph, st);
+            }
+        }
+    }
+}
+
+static void testPauseSchedule() {
+    std::printf("== pause_stress cycle schedule (test/PauseSchedule.h) ==\n");
+
+    const coop::PauseCycle g = coop::pauseStressGeometry();
+
+    // ---- Property 2 first: the geometry must still cover the field window ----
+    // 7900 ms is the LATER of the two observed post-pause fault latencies
+    // (client 3.7 s, host 7.9 s). This is the check that catches someone
+    // "tidying" the hold down to a few seconds.
+    CHECK("hold spans the later field fault latency (7.9 s)",
+          coop::pauseHoldSpansFaultWindow(g, 7900UL));
+    CHECK("hold also spans the earlier field fault latency (3.7 s)",
+          coop::pauseHoldSpansFaultWindow(g, 3700UL));
+    CHECK("hold does NOT claim to span an absurd latency (predicate is real, "
+          "not a constant true)", !coop::pauseHoldSpansFaultWindow(g, 600000UL));
+
+    // ---- Unarmed window: nobody votes before the first pause time -----------
+    {
+        coop::PausePhase p0 = coop::pausePhaseAt(g, 0);
+        CHECK("t=0: unarmed", !p0.armed);
+        CHECK_EQ("t=0: cycle is -1", (unsigned long long)(p0.cycle + 1), 0ull);
+        CHECK("t=0: not paused", !p0.wantPaused);
+        CHECK("t=0: the HOST is not a voter (unarmed)",
+              !coop::pauseVoterIsMe(p0, true));
+        CHECK("t=0: the JOIN is not a voter either - the isHost==hostVotes test "
+              "must not make false==false a voter before arming",
+              !coop::pauseVoterIsMe(p0, false));
+
+        coop::PausePhase pm1 = coop::pausePhaseAt(g, g.firstPauseAtMs - 1);
+        CHECK("one ms before arming: still unarmed", !pm1.armed);
+    }
+
+    // ---- The arm instant: cycle 0, paused, host votes ----------------------
+    {
+        coop::PausePhase p = coop::pausePhaseAt(g, g.firstPauseAtMs);
+        CHECK("arm instant: armed", p.armed);
+        CHECK_EQ("arm instant: cycle 0", (unsigned long long)p.cycle, 0ull);
+        CHECK("arm instant: wants the world PAUSED", p.wantPaused);
+        CHECK("arm instant: the host owns cycle 0's vote",
+              p.hostVotes && coop::pauseVoterIsMe(p, true));
+        CHECK("arm instant: the join does NOT vote on cycle 0",
+              !coop::pauseVoterIsMe(p, false));
+    }
+
+    // ---- Hold/gap boundaries, both neighbours of each edge ------------------
+    {
+        const unsigned long arm = g.firstPauseAtMs;
+        CHECK("last ms of the hold is still paused",
+              coop::pausePhaseAt(g, arm + g.pauseHoldMs - 1).wantPaused);
+        CHECK("first ms of the gap is NOT paused",
+              !coop::pausePhaseAt(g, arm + g.pauseHoldMs).wantPaused);
+        CHECK("the gap stays in the SAME cycle (the resume belongs to the "
+              "cycle that paused, not to the next one)",
+              coop::pausePhaseAt(g, arm + g.pauseHoldMs).cycle == 0);
+        const unsigned long cyc = g.pauseHoldMs + g.resumeGapMs;
+        CHECK("last ms of the gap is still cycle 0",
+              coop::pausePhaseAt(g, arm + cyc - 1).cycle == 0);
+        CHECK("cycle rolls exactly at the cycle length",
+              coop::pausePhaseAt(g, arm + cyc).cycle == 1);
+        CHECK("the new cycle starts PAUSED",
+              coop::pausePhaseAt(g, arm + cyc).wantPaused);
+    }
+
+    // ---- Property 1: role alternation, over a whole run ---------------------
+    {
+        const unsigned long cyc = g.pauseHoldMs + g.resumeGapMs;
+        bool alternates = true, exactlyOneVoter = true;
+        for (int c = 0; c < 12; ++c) {
+            coop::PausePhase p = coop::pausePhaseAt(g, g.firstPauseAtMs + (unsigned long)c * cyc);
+            if (p.hostVotes != ((c % 2) == 0)) alternates = false;
+            // Exactly one of the two roles is the voter - never both, never
+            // neither - at every armed instant.
+            int voters = (coop::pauseVoterIsMe(p, true) ? 1 : 0) +
+                         (coop::pauseVoterIsMe(p, false) ? 1 : 0);
+            if (voters != 1) exactlyOneVoter = false;
+        }
+        CHECK("role alternation: even cycles host, odd cycles join, 12 cycles "
+              "deep", alternates);
+        CHECK("role alternation: EXACTLY one role is the voter at every armed "
+              "cycle (never both, never neither)", exactlyOneVoter);
+    }
+
+    // ---- Property 3 + the full-run shape: simulate the shipped run ----------
+    {
+        std::vector<PauseAct> acts;
+        // 50 ms tick ~ a 20 fps floor; the driver is called once per game tick.
+        simulatePauseRun(g, 50, coop::pauseStressHostDurationMs(), acts);
+
+        const unsigned long cyc = g.pauseHoldMs + g.resumeGapMs;
+        const unsigned long span = coop::pauseStressHostDurationMs() - g.firstPauseAtMs;
+        const int fullCycles = (int)(span / cyc); // cycles that complete inside the run
+
+        CHECK("full run: at least 12 pause/resume cycles fit (the run is a "
+              "repeated lottery, not a single sample)", fullCycles >= 12);
+
+        // One pause act and one resume act per cycle, and no cycle acted twice.
+        bool onePausePerCycle = true, oneResumePerCycle = true;
+        bool noDoubleAct = true, initiatorAlternates = true;
+        for (int c = 0; c <= fullCycles; ++c) {
+            int pauses = 0, resumes = 0, hostActs = 0, joinActs = 0;
+            for (size_t i = 0; i < acts.size(); ++i) {
+                if (acts[i].cycle != c) continue;
+                if (acts[i].paused) ++pauses; else ++resumes;
+                if (acts[i].isHost) ++hostActs; else ++joinActs;
+            }
+            if (c < fullCycles) { // a partial trailing cycle may lack its resume
+                if (pauses != 1) onePausePerCycle = false;
+                if (resumes != 1) oneResumePerCycle = false;
+                // Every act of a cycle comes from the SAME side, and it is the
+                // side the parity rule names.
+                bool expectHost = ((c % 2) == 0);
+                if (expectHost ? (joinActs != 0) : (hostActs != 0))
+                    initiatorAlternates = false;
+            }
+            if (pauses > 1 || resumes > 1) noDoubleAct = false;
+        }
+        CHECK("full run: exactly ONE pause vote per completed cycle (edge, not "
+              "per-tick)", onePausePerCycle);
+        CHECK("full run: exactly ONE resume vote per completed cycle",
+              oneResumePerCycle);
+        CHECK("full run: no cycle is ever acted on twice in the same phase",
+              noDoubleAct);
+        CHECK("full run: every cycle's acts come from the parity-named side "
+              "only - the non-initiator stays an observer",
+              initiatorAlternates);
+
+        // Pause and resume strictly alternate in time across the whole run:
+        // two pauses in a row would mean the world never resumed between holds.
+        bool strictAlternation = true;
+        for (size_t i = 1; i < acts.size(); ++i)
+            if (acts[i].paused == acts[i - 1].paused) strictAlternation = false;
+        CHECK("full run: pause and resume strictly alternate across the whole "
+              "run (the world always runs again between holds)",
+              strictAlternation && !acts.empty());
+        CHECK("full run: the first act of the run is a PAUSE",
+              !acts.empty() && acts[0].paused);
+
+        // The host must exit with the world RUNNING: self-exit while paused
+        // leaves the last save/teardown work to a stopped sim.
+        CHECK("full run: the host's own exit instant is in a RUNNING phase, "
+              "not inside a hold",
+              !coop::pausePhaseAt(g, coop::pauseStressHostDurationMs()).wantPaused);
+        CHECK("full run: the join stops BEFORE the host, so the host is still "
+              "live to log the join's exit",
+              coop::pauseStressJoinDurationMs() < coop::pauseStressHostDurationMs());
+    }
+
+    // ---- Tick-rate robustness: the schedule must not depend on the tick -----
+    {
+        // A coarse and a deliberately non-divisor tick (frame times are never
+        // round). Both must still produce one pause and one resume per cycle.
+        const unsigned long ticks[3] = { 16, 250, 137 };
+        const unsigned long cyc4 = g.firstPauseAtMs
+                                 + 4 * (g.pauseHoldMs + g.resumeGapMs) + 1000;
+        bool allStable = true;
+        for (int k = 0; k < 3; ++k) {
+            std::vector<PauseAct> acts;
+            simulatePauseRun(g, ticks[k], cyc4, acts);
+            int pauses = 0, resumes = 0;
+            for (size_t i = 0; i < acts.size(); ++i)
+                if (acts[i].paused) ++pauses; else ++resumes;
+            if (pauses != 5 || resumes != 4) allStable = false;
+            for (size_t i = 1; i < acts.size(); ++i)
+                if (acts[i].paused == acts[i - 1].paused) allStable = false;
+        }
+        CHECK("tick-rate robustness: 16/250/137 ms ticks all yield the same 5 "
+              "pause + 4 resume edges over 4 cycles, strictly alternating",
+              allStable);
+    }
+
+    // ---- Degenerate geometries: never divide by zero, never wedge -----------
+    {
+        coop::PauseCycle z = coop::makePauseCycle(1000, 0, 0);
+        coop::PausePhase p = coop::pausePhaseAt(z, 5000);
+        CHECK("zero-length cycle never arms (no division by zero on the game "
+              "thread)", !p.armed && p.cycle == -1 && !p.wantPaused);
+        CHECK("zero-length cycle: nobody is a voter",
+              !coop::pauseVoterIsMe(p, true) && !coop::pauseVoterIsMe(p, false));
+
+        coop::PauseCycle z2 = coop::makePauseCycle(0, 5000, 5000);
+        CHECK("zero arm delay: armed at t=0, paused, host votes",
+              coop::pausePhaseAt(z2, 0).armed &&
+              coop::pausePhaseAt(z2, 0).wantPaused &&
+              coop::pausePhaseAt(z2, 0).hostVotes);
+
+        // All-hold geometry (no gap): stays paused forever, which the strict
+        // alternation check above would catch in the shipped geometry - proven
+        // here to be a property of the geometry, not of the phase function.
+        coop::PauseCycle allHold = coop::makePauseCycle(0, 5000, 0);
+        CHECK("gapless geometry is paused at every instant (so the shipped "
+              "geometry's non-zero gap is what makes the world run again)",
+              coop::pausePhaseAt(allHold, 0).wantPaused &&
+              coop::pausePhaseAt(allHold, 4999).wantPaused &&
+              coop::pausePhaseAt(allHold, 5000).wantPaused);
     }
 }
 
@@ -4407,6 +4655,7 @@ int main() {
     testInterp();
     testOwnRanks();
     testLeaveExpansion();
+    testPauseSchedule();
     testSteamIdParse();
     testWorkPoseMatch();
     testTaskClear();

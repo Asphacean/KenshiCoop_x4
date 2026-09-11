@@ -6,6 +6,7 @@
 // Must NOT: change any SCENARIO log string (oracle API, resources/CODE_MAP.md).
 
 #include "ScenarioSupport.h"
+#include "PauseSchedule.h" // pause_stress cycle schedule (pure; unit-tested in prototest)
 
 namespace coop {
 namespace {
@@ -1831,6 +1832,115 @@ private:
     unsigned int  striker_[5];
 };
 
+// pause_stress (DEBUG-ONLY repro driver for .planning/debug/crash-av-worker-thread.md,
+// lead E-21 - NOT a gate and deliberately NOT in scripts/scenarios.psd1).
+//
+// E-21 established that the one stimulus provably common to BOTH faulting
+// processes of the 0xc0000005 READ 0xFFFFFFFFFFFFFFFF double crash was a
+// REPLICATED PAUSE (`[speed] REQ RECV owner=1 mult=0.00 paused=1` -> `[speed]
+// SET mult=0.00 paused=1`), applied 3.7 s before the client's fault and 7.9 s
+// before the host's. speed_sync already simulates user speed clicks, but only
+// ever 3x/1x - it never drives mult=0.00/paused=1, so it cannot exercise this.
+//
+// This scenario cycles the session through the pause repeatedly and holds it
+// there for the width of the observed fault window, so a run gets many chances
+// at a window a normal session enters once. Two design points matter:
+//   * The INITIATOR ALTERNATES between host and join. E-20 proved the fault
+//     site is role-INDEPENDENT (both roles faulted at the identical RVA), so a
+//     driver that only ever pauses from one side would only test half the
+//     replication direction. Even cycles: host votes. Odd cycles: join votes.
+//     The non-initiator only observes, so the pause it applies arrives over the
+//     wire exactly as it did in the field.
+//   * The HOLD spans the fault window. The field faults landed 3.7 s and 7.9 s
+//     after the pause, so the hold is 14 s - comfortably past both - and the
+//     resume gap is short, to fit as many cycles as possible into a run.
+//
+// ctx.elapsedMs is GetTickCount()-based wall clock (Plugin.cpp:2570), NOT game
+// time, so the schedule keeps advancing while the world is paused and the
+// resume always fires. This is load-bearing: on a game-time clock the first
+// pause would wedge the scenario forever.
+//
+// Both sides log `SCENARIO PAUSESTRESS OBS t=<ms> mult=<f> paused=<n>` at 1 Hz
+// (the observed EFFECTIVE speed, i.e. post-consensus) plus one
+// `SCENARIO PAUSESTRESS cycle=<n> who=<host|join> act=<pause|resume> ok=<n>`
+// per vote. Read those against the plugin's own `[speed] REQ`/`REQ RECV`/`SET`
+// lines to confirm each pause really replicated before judging a run.
+//
+// The cycle schedule itself lives in test/PauseSchedule.h as pure functions.
+// It is the only half of this driver that can be verified WITHOUT a live rig,
+// and src/prototest::testPauseSchedule() asserts it there - including the
+// role-alternation invariant and the hold-spans-the-fault-window property. The
+// scenario CALLS those functions rather than keeping a private copy, so those
+// checks guard what actually ships.
+class PauseStressScenario : public TimedScenario {
+public:
+    PauseStressScenario()
+        : TimedScenario("pause_stress", 0), lastLogMs_(0), cyclesIssued_(0),
+          pausesObserved_(0), edge_(pauseEdgeInit()), sawPausedNow_(false) {}
+
+    virtual void onStart(const ScenarioContext&) {}
+
+    virtual bool onTick(const ScenarioContext& ctx) {
+        const PausePhase ph = pausePhaseAt(pauseStressGeometry(), ctx.elapsedMs);
+        const int  cycle      = ph.cycle;
+        const bool wantPaused = ph.wantPaused;
+
+        if (pauseShouldAct(ph, ctx.isHost, edge_)) {
+            // One write per phase edge. writeGameSpeed goes through the
+            // engine's hooked setters, so it registers as captured USER INTENT
+            // - the same path a real UI click takes, which is what makes the
+            // vote replicate.
+            bool ok = wantPaused ? engine::writeGameSpeed(ctx.gw, 0.0f, true)
+                                 : engine::writeGameSpeed(ctx.gw, 1.0f, false);
+            char b[128];
+            _snprintf(b, sizeof(b) - 1,
+                      "SCENARIO PAUSESTRESS cycle=%d who=%s act=%s ok=%d",
+                      cycle, ctx.isHost ? "host" : "join",
+                      wantPaused ? "pause" : "resume", ok ? 1 : 0);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            if (wantPaused && ok) ++cyclesIssued_;
+            pauseNoteActed(ph, edge_);
+        }
+
+        if (ctx.elapsedMs - lastLogMs_ >= 1000 || lastLogMs_ == 0) {
+            lastLogMs_ = ctx.elapsedMs;
+            float mult = 0.0f; bool paused = false;
+            if (engine::readGameSpeed(ctx.gw, &mult, &paused)) {
+                // Count the EDGE, not the samples, so the count is a count of
+                // replicated pauses rather than of ticks spent paused.
+                if (paused && !sawPausedNow_) ++pausesObserved_;
+                sawPausedNow_ = paused;
+                char b[128];
+                _snprintf(b, sizeof(b) - 1,
+                          "SCENARIO PAUSESTRESS OBS t=%lu mult=%.2f paused=%d "
+                          "cycle=%d want=%d issued=%u seen=%u",
+                          ctx.elapsedMs, mult, paused ? 1 : 0, cycle,
+                          wantPaused ? 1 : 0, cyclesIssued_, pausesObserved_);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            }
+        }
+
+        unsigned long dur = ctx.isHost ? pauseStressHostDurationMs()
+                                       : pauseStressJoinDurationMs();
+        if (ctx.elapsedMs >= dur) {
+            // "Passed" only means the driver did its job: it drove pauses and
+            // this process actually observed the paused world. It says NOTHING
+            // about the crash - a clean run is a NON-reproduction, which per
+            // E-26 eliminates nothing.
+            passed_ = (pausesObserved_ >= 2);
+            return true;
+        }
+        return false;
+    }
+
+private:
+    unsigned long  lastLogMs_;
+    unsigned int   cyclesIssued_;
+    unsigned int   pausesObserved_;
+    PauseEdgeState edge_;
+    bool           sawPausedNow_;
+};
+
 // speed_probe (vote-decoupling phase-0 spike, HOST-side, log-only): prove the
 // three claims the decoupled design rests on, with speedSync forced OFF so the
 // replicator can't fight the probe:
@@ -2425,6 +2535,7 @@ Scenario* makeCharStateScenario(const std::string& name) {
     if (name == "sneak_detect") return new SneakDetectScenario();
     if (name == "speed_sync")   return new SpeedSyncScenario();
     if (name == "speed_probe")  return new SpeedProbeScenario();
+    if (name == "pause_stress") return new PauseStressScenario();
     if (name == "shackle_probe") return new ShackleProbeScenario("shackle_probe");
     if (name == "shackle_sync")  return new ShackleProbeScenario("shackle_sync");
     return 0;
