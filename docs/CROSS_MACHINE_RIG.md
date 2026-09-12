@@ -124,9 +124,18 @@ green verdict actively misleading. "I copied the file" is not verification.
    ```
    pkill -f 'kenshi_x64[.]exe'; sleep 3
    M=$HOME/.local/share/Steam/steamapps/common/Kenshi/mods/KenshiCoop
-   sha256sum "$M/KenshiCoop.dll"; ls -la --time-style=full-iso "$M/KenshiCoop.dll"
-   mkdir -p $HOME/rekit/backup && cp -p "$M/KenshiCoop.dll" $HOME/rekit/backup/
+   PRE=$(sha256sum "$M/KenshiCoop.dll" | cut -d' ' -f1)
+   echo "$PRE"; ls -la --time-style=full-iso "$M/KenshiCoop.dll"
+   mkdir -p $HOME/rekit/backup
+   cp -p "$M/KenshiCoop.dll" "$HOME/rekit/backup/KenshiCoop.dll.prefix-${PRE:0:8}"
    ```
+
+   **Name the backup after the hash it holds.** A plain
+   `cp … $HOME/rekit/backup/` writes the same basename every time, so the
+   *second* cross-machine run silently destroys the first run's superseded
+   binary — the one artifact that proves what the Deck was carrying before.
+   Because STEP 0 runs before every measurement, that overwrite is the normal
+   case, not an edge case.
 
 3. **Deploy and prove the copy landed.** Confirm the mod directory really is
    where this install loads from (`RE_Kenshi_log.txt` shows
@@ -155,10 +164,32 @@ green verdict actively misleading. "I copied the file" is not verification.
    the protocol **now**: a mismatch is rejected at handshake by design and
    would otherwise surface as an unexplained connection failure mid-run.
 
-5. **Record it.** Both SHA-256 values, the superseded hash and its mtime, the
+5. **Stop the provenance launch before the gate run.** It is a full game
+   process holding the same port and save fixture. Kill it explicitly
+   (`pkill -f 'kenshi_x64[.]exe'`) and close the ssh session that started it;
+   a leftover provenance instance would join the measured run as a fourth,
+   undeclared participant.
+
+6. **Record it.** Both SHA-256 values, the superseded hash and its mtime, the
    build stamp and the protocol, in a provenance file kept with the run
    artifacts. This launch is a provenance check, **not** a gate run — do not
    record it in `tools/test-runs/census_repro_history.jsonl`.
+
+   **Append, do not overwrite.** When a later run re-runs STEP 0, keep the
+   earlier measurement in a `history` array inside the same provenance file
+   rather than replacing it. The value of a provenance record is that it can
+   be read back later; a record that only ever holds the newest measurement
+   cannot answer "what was the Deck running when run 1 was judged?".
+
+> **Worked example — this gate is not theatre.** Phase 13 plan 13-02 rebuilt
+> the Harness configuration on Windows for the loopback leg. That changed
+> nothing in `src/`, but it changed the binary's `__DATE__`/`__TIME__` stamp
+> and therefore its hash. At the start of plan 13-03 the Deck was still
+> carrying plan 13-01's copy (`f533540d…`, stamp `Sep 12 2026 07:47:28`)
+> against the current Windows build (`a96e0790…`, stamp
+> `Sep 12 2026 08:20:29`). Nothing else in the pipeline would have noticed:
+> the protocol matched, the run would have completed, and the verdict would
+> have been green. **A local rebuild of any kind makes the remote copy stale.**
 
 ---
 
@@ -193,6 +224,17 @@ ssh -o ServerAliveInterval=20 deck@<deck-tailnet-name> '$HOME/rekit/launch_auto.
 A fully detached launch (`setsid`, `nohup`, `&` + immediate disconnect) **dies
 with the session**. Keep the ssh connection open for the whole run; background
 the *local* command instead if your tooling needs the shell back.
+
+**Put the environment in a small per-run wrapper on the Deck, not on the ssh
+command line.** Write `~/rekit/<run>_launch.sh` containing the exports below
+followed by `exec "$HOME/rekit/launch_auto.sh"`, `scp` it over, `chmod +x`,
+then run *that* one path over ssh. A single
+`ssh deck 'A=1 B=2 … ~/rekit/launch_auto.sh'` has to survive two levels of
+shell quoting and is where a silently-dropped variable hides; the wrapper is
+also the artifact that records exactly what the remote participant's
+environment was. Strip CRLFs (`sed -i 's/\r$//'`) if it was authored on
+Windows — a `\r` on the shebang line makes the Deck report
+`bad interpreter`.
 
 ### The Deck's environment
 
@@ -231,15 +273,38 @@ fixture. `scripts/run_test4.ps1` restores the fixture into every *local*
 instance's save root before each run; do the same for the Deck by hand:
 
 ```
-# Windows
+# Windows (Git Bash)
 tar -C fixtures/saves -cf /tmp/fixture.tar <save-name>
 scp /tmp/fixture.tar deck@<deck-tailnet-name>:/tmp/
 
 # Deck - prefix AppData save root
 S=$HOME/.local/share/Steam/steamapps/compatdata/233860/pfx/drive_c/users/steamuser/AppData/Local/kenshi/save
 rm -rf "$S/<save-name>" && tar -C "$S" -xf /tmp/fixture.tar
-sha256sum "$S/<save-name>/quick.save"     # must equal the repo fixture's
 ```
+
+**Keep the archive path free of a Windows drive letter.** GNU tar parses
+`C:\…` / `C:/…` as `host:path` and fails with
+`tar: Cannot connect to C: resolve failed`. Use a POSIX-style path
+(`/tmp/…`, or `cygpath -u` the destination first).
+
+### Verify the whole save tree, not just `quick.save`
+
+```
+# both machines - must print the same 14 lines
+cd <save root>/<save-name> && find . -type f | sort | \
+  while read f; do echo "$(sha256sum "$f" | cut -d' ' -f1) ${f#./}"; done
+```
+
+A single `sha256sum quick.save` is **not** sufficient, because the drift this
+step exists to undo is not confined to `quick.save`. Measured on this
+project's Deck before cross-machine run 2: the drifted `wanderer4` held **27**
+files against the repo fixture's **14** — thirteen extra `platoon/` files
+(`Dust Bandits_0`, `Herbivore_0`, four `Holy Nation Outlaws_*`, five
+`Starving Bandits_*`, `Trade Ninjas_1`) baked in by the previous run's
+connect-push, plus different `zone/` and `portraits_texture.png` contents. The
+`rm -rf` above removes them — but if anyone ever extracts *over* the existing
+directory, a `quick.save`-only check passes while the extra bodies remain and
+the census oracle silently compares two different worlds.
 
 ---
 
@@ -337,8 +402,23 @@ census figures exist *only* there — `verdict.json`'s `census_convergence` entr
 carries an empty `metrics` object. Read the two `host vs joinK: …` lines and
 the final `WNPC4 RESULT:` line from `judge.log`.
 
-On Windows PowerShell, `Tee-Object` writes UTF-16; re-encode `judge.log` as
-UTF-8 if other tooling needs to read it.
+On Windows PowerShell, `Tee-Object` writes UTF-16, which `grep`, `git` and any
+non-PowerShell check cannot read. Every later verification in this project
+greps `judge.log`, so capture it as UTF-8 **without a BOM** in the first place:
+
+```powershell
+$out  = & powershell -NoProfile -ExecutionPolicy Bypass -File scripts\analyze_run4.ps1 `
+          -RunDir $runDir -ExpectedInstances 3 2>&1
+$text = ($out | ForEach-Object { $_.ToString() }) -join "`r`n"
+[System.IO.File]::WriteAllText(
+    (Join-Path $runDir 'judge.log'), $text,
+    (New-Object System.Text.UTF8Encoding($false)))
+Write-Host $text
+```
+
+`New-Object System.Text.UTF8Encoding($false)` is the part that matters:
+`-Encoding utf8` in Windows PowerShell 5.1 writes a BOM, and a BOM breaks a
+first-line match.
 
 ---
 
