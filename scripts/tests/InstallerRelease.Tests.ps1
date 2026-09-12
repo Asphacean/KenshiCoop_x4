@@ -431,8 +431,26 @@ $vReal = Get-Verdict $blockersDoc
 Check "D2 make_mod_kit.ps1 derives a verdict from the blockers file" ($vReal -ne $null)
 Check "D3 at least one blocker is OPEN today, so this build is not shippable" `
     ($vReal -ne $null -and @($vReal.releaseBlockers).Count -ge 1 -and $vReal.shippable -eq $false)
-Check "D4 WINDOWS-19 is among the open ids (the reconnect slot leak gates publication)" `
-    ($vReal -ne $null -and @($vReal.releaseBlockers) -contains "WINDOWS-19")
+# D4 used to pin WINDOWS-19 into the open set. That made a genuine FIX read as a
+# test failure, which is backwards: this check exists to prove the id list is
+# READ OUT of the file rather than invented, not to freeze which ids are open.
+# Assert the property instead - every id the verdict reports must actually appear
+# in the blockers document's open table.
+$openTableIds = @()
+foreach ($line in (Get-Content -Path $blockersDoc)) {
+    if ($line -match '^\s*##\s') { $inOpen = ($line -match '(?i)open blockers') }
+    if ($inOpen -and $line -match '^\|\s*([A-Z][A-Z0-9-]+)\s*\|') { $openTableIds += $Matches[1] }
+}
+$derived = $true
+if ($vReal -eq $null) { $derived = $false }
+else { foreach ($id in @($vReal.releaseBlockers)) { if ($openTableIds -notcontains $id) { $derived = $false } } }
+Check ("D4 every reported open id is read out of the blockers file (reported: " + `
+       ((@($vReal.releaseBlockers)) -join ',') + ")") `
+    ($derived -and @($vReal.releaseBlockers).Count -ge 1)
+# WINDOWS-19/-22 closed on 2026-09-12 (tools/test-runs/windows19_relink_fix.json).
+# Pin the direction that matters now: a CLOSED row must not be reported open.
+Check "D4b WINDOWS-19 is NOT reported open (it was fixed and measured closed)" `
+    ($vReal -ne $null -and (@($vReal.releaseBlockers) -notcontains "WINDOWS-19"))
 
 # Synthetic blockers files: the verdict must flip BOTH ways.
 $synOpen   = Join-Path $fixRoot "BLOCKERS_open.md"
@@ -494,9 +512,18 @@ if (Test-Path $prov) {
     Check "D11 the packaged verdict agrees with the blockers file" `
         ($vReal -ne $null -and $pj.shippable -eq $vReal.shippable -and
          (@($pj.releaseBlockers) -join ",") -eq (@($vReal.releaseBlockers) -join ","))
-    $kitReadme = Join-Path $repoRoot "dist\mod-kit\README.txt"
-    Check "D12 README.txt warns a player about the reconnect symptom in player language" `
-        ((Test-Path $kitReadme) -and ((Get-Content -Raw $kitReadme) -match "(?s)KNOWN ISSUES.*slots full"))
+    # D12: the reconnect paragraph must track the blocker, in BOTH directions.
+    # While WINDOWS-19/-22 is open a player must be warned; once it is closed the
+    # warning must be gone, because telling someone to "wait ten seconds before
+    # reconnecting" for a defect their build does not have is its own defect.
+    $kitReadme  = Join-Path $repoRoot "dist\mod-kit\README.txt"
+    $readmeRaw  = if (Test-Path $kitReadme) { Get-Content -Raw $kitReadme } else { "" }
+    $warns      = ($readmeRaw -match "(?s)KNOWN ISSUES.*slots full")
+    $leakOpen   = (@($vReal.releaseBlockers) -contains "WINDOWS-19") -or `
+                  (@($vReal.releaseBlockers) -contains "WINDOWS-22")
+    Check ("D12 README.txt's reconnect warning tracks the blocker (open=" + $leakOpen + `
+           " warns=" + $warns + ")") `
+        ((Test-Path $kitReadme) -and ($warns -eq $leakOpen))
 } else {
     Check "D10 a kit has been packaged so its PROVENANCE.json can be checked" $false
 }

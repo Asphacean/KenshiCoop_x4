@@ -86,3 +86,8 @@ TROUBLESHOOTING
     Look for connection lines in <Kenshi>\KenshiCoop_*.log.
   * "protocol mismatch": someone has a different build; everyone should use the
     same release.
+
+KNOWN ISSUES (this build is NOT a finished release)
+---------------------------------------------------
+  * Open release blockers in this build: INST-AUTODETECT, KIT-PROVENANCE
+    See docs/RELEASE_BLOCKERS.md in the repository for what each one means.

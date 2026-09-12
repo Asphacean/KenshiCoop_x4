@@ -245,14 +245,23 @@ TROUBLESHOOTING
 
 # A player who reconnects and is told 'slots full' deserves to have read
 # about it first. The list is the SAME one PROVENANCE.json carries.
+#
+# The reconnect paragraph is DERIVED from that list, not unconditional. It
+# describes exactly one blocker - WINDOWS-19's host-slot leak - and printing it
+# while that row is closed hands a player a workaround ("wait ten seconds") for
+# a defect their build does not have, which is its own kind of wrong. Keying it
+# to the blocker means the README can no longer drift from the gate.
+$reconnectBlockers = @($releaseBlockers | Where-Object { $_ -match '^WINDOWS-(19|22)$' })
 if ($releaseBlockers.Count -gt 0) {
     $known = "`r`n`r`nKNOWN ISSUES (this build is NOT a finished release)`r`n"
     $known += "---------------------------------------------------`r`n"
-    $known += "  * RECONNECTING can use up a player slot. If you disconnect and come`r`n"
-    $known += "    straight back, the host may still be holding your old slot for a few`r`n"
-    $known += "    seconds, so you return under a different player id - and with 3 or 4`r`n"
-    $known += "    players a second quick reconnect can be told 'slots full'. Wait about`r`n"
-    $known += "    ten seconds before reconnecting, or have the host restart the session.`r`n"
+    if ($reconnectBlockers.Count -gt 0) {
+        $known += "  * RECONNECTING can use up a player slot. If you disconnect and come`r`n"
+        $known += "    straight back, the host may still be holding your old slot for a few`r`n"
+        $known += "    seconds, so you return under a different player id - and with 3 or 4`r`n"
+        $known += "    players a second quick reconnect can be told 'slots full'. Wait about`r`n"
+        $known += "    ten seconds before reconnecting, or have the host restart the session.`r`n"
+    }
     $known += "  * Open release blockers in this build: " + ($releaseBlockers -join ", ") + "`r`n"
     $known += "    See docs/RELEASE_BLOCKERS.md in the repository for what each one means.`r`n"
     $readmeText += $known
@@ -304,5 +313,9 @@ if ($shippable) {
         Write-Host "  the blockers file was NOT FOUND at $BlockersFile; an unknown gate is not an open door."
     }
     foreach ($b in $releaseBlockers) { Write-Host ("  open blocker: " + $b) }
-    Write-Host "  README.txt carries the reconnect symptom in player language."
+    if ($reconnectBlockers.Count -gt 0) {
+        Write-Host "  README.txt carries the reconnect symptom in player language."
+    } else {
+        Write-Host "  README.txt omits the reconnect symptom: WINDOWS-19/-22 are closed."
+    }
 }
