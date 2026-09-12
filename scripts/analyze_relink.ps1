@@ -113,7 +113,9 @@ if ($RunDir -eq "") {
     if (-not (Test-Path $pointer)) {
         Die2 "no -RunDir given and no pointer file at '$pointer' (run scripts\relink_probe.ps1 first)."
     }
-    $RunDir = (Get-Content -Raw -Path $pointer).Trim()
+    # Strip a UTF-8 BOM: Set-Content -Encoding UTF8 (which the runner uses)
+    # writes one, and a leading U+FEFF in a path is a silent lookup failure.
+    $RunDir = ((Get-Content -Raw -Path $pointer) -replace "^﻿", "").Trim()
 }
 if ($RunDir -eq "" -or -not (Test-Path $RunDir)) { Die2 "run dir not found: '$RunDir'" }
 $RunDir = (Resolve-Path -LiteralPath $RunDir).Path
