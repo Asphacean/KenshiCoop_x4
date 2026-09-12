@@ -31,8 +31,13 @@ namespace steaminvite {
 typedef unsigned long long SteamId;
 
 // Fired (on the main thread, from the Steam callback pump / tick) when an invite
-// resolves a peer. Matches Plugin.cpp's coopUiConnect(isHost, useSteam, peerId).
-typedef void (*ConnectFn)(bool isHost, bool useSteam, SteamId peerId);
+// resolves a peer. Matches Plugin.cpp's coopUiConnect(isHost, useSteam, peerId, udpAddr).
+// The trailing udpAddr matches Plugin.cpp's coopUiConnect. An inbound Steam
+// invite carries no UDP endpoint by definition, so this module always passes
+// null there and the endpoint keeps coming from the config - the signature moves
+// with coopUiConnect, the behavior does not.
+typedef void (*ConnectFn)(bool isHost, bool useSteam, SteamId peerId,
+                          const char* udpAddr);
 
 // Resolve ISteamMatchmaking/ISteamFriends from the game's steam_api64.dll and
 // register the invite/lobby/P2P Steam callbacks. Idempotent; safe to call every

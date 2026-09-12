@@ -23,7 +23,8 @@
 #include <mygui/MyGUI_Delegate.h> // MyGUI::newDelegate + CDelegate* (free-fn callbacks)
 #include <windows.h>
 
-#include "../core/SteamId.h" // parseSteamId64 (paste button) + maskSteamId64 (id rows)
+#include "../core/SteamId.h"     // parseSteamId64 (paste button) + maskSteamId64 (id rows)
+#include "../core/NetEndpoint.h" // parseHostPort + formatEndpoint (UDP paste button)
 #include "DatapanelList.h"   // pure (stuff,count) predicates over guiDatapanels
 
 namespace coop {
@@ -153,11 +154,25 @@ void markerDestroy(void* label) {
 
 // ---- In-game co-op session panel (config-driven, spike-50 DatapanelGUI stack) -
 // A native DatapanelGUI window toggled with F2. The player picks role + transport
-// (toggle BUTTONS - the only DatapanelGUI control with a callable RVA callback;
-// MyGUI comboboxes/editboxes have no reachable getters and never receive keyboard
-// focus during gameplay) and connects/leaves via a bound checkbox. The friend code
-// (peer SteamID) + UDP endpoint come from coop_config.json and are shown READ-ONLY;
-// a "Copy my Steam ID" button puts the player's own id on the clipboard to share.
+// with toggle BUTTONS and connects/leaves via a bound checkbox; the peer identity
+// (a Steam ID, or a UDP "host:port") is entered by CLIPBOARD - "Copy my Steam ID"
+// puts the player's own id out to share, "Paste friend's Steam ID" and "Paste
+// server address" read one back in. Both pasted values are per-session (memory
+// only); coop_config.json remains the source when neither is armed.
+//
+// WHY CLIPBOARD AND NOT A TYPED FIELD (corrected 2026-09-12, plan 15-01). An
+// earlier version of this comment claimed MyGUI editboxes "have no reachable
+// getters". That is WRONG and should not be repeated: DatapanelGUI::
+// setLineTextEditable (RVA 0x6FCAC0) and DataPanelLine_TextEditable::getEditBox
+// (RVA 0x111C70) are both bound and callable. The real obstacle is THIS file's
+// refresh cycle - panelBuildSeh calls _NV_clear() and recreates every row on any
+// needsRebuild, and needsRebuild fires on every status-detail change (~once a
+// second while a session is live, ~100x during a world transfer). An EditBox
+// would therefore be destroyed and re-minted under the player's fingers
+// mid-keystroke. Typed entry is a real option, but it must be preceded by making
+// the rebuild incremental (update captions in place instead of clearing); until
+// then the clipboard path is the correct mechanism, not a workaround for a
+// missing binding.
 // The GUI layer is session-agnostic: live status arrives via *st; the user's
 // actions leave via the onConnect/onDisconnect callbacks (the plugin root owns the
 // net/session/config wiring).
@@ -255,9 +270,11 @@ DataPanelLine_Button*   g_transBtn     = 0;
 DataPanelLine_Button*   g_connBtn      = 0; // Online/Offline toggle (replaces the checkbox)
 DataPanelLine_Button*   g_copyIdBtn    = 0;
 DataPanelLine_Button*   g_pasteIdBtn   = 0; // "Paste friend's Steam ID" from clipboard
+DataPanelLine_Button*   g_pasteAddrBtn = 0; // "Paste server address" from clipboard (UDP)
 DataPanelLine*          g_debugLine    = 0; // white connection-status debug row
 DataPanelLine*          g_peerLine     = 0; // white "Friend's Steam ID" row
 DataPanelLine*          g_selfLine     = 0; // white "Your Steam ID" row
+DataPanelLine*          g_addrLine     = 0; // white "Server address" row (UDP)
 std::string             g_selfIdStr;   // self SteamID as digits (set each tick; "" = none)
 
 // Friend's SteamID pasted in-panel this session (0 = none). Per-session by
@@ -266,6 +283,16 @@ std::string             g_selfIdStr;   // self SteamID as digits (set each tick;
 // where it overrides the (usually empty) config steamPeer.
 unsigned long long      g_pastedPeer   = 0;
 bool                    g_pasteFailed  = false; // last paste wasn't a valid Steam ID
+
+// UDP endpoint pasted in-panel this session ("" = none), already normalised
+// through formatEndpoint so what the row shows is what Connect will use. Exactly
+// as per-session as g_pastedPeer above and for the same reason: memory only, so
+// relaunching Kenshi clears it and NOTHING this panel does reaches a file. That
+// is what keeps the change off every disk-backed path the harness reads, and it
+// is also what makes an OFFLINE -> ONLINE cycle within one launch keep the
+// address (it is deliberately NOT cleared on disconnect).
+std::string             g_pastedAddr;
+bool                    g_addrFailed   = false; // last paste wasn't a valid host:port
 
 // Button callbacks (free functions - MyGUI::newDelegate wraps them without any
 // raw-MyGUI link). A press flips the armed flag and requests a rebuild so the
@@ -323,19 +350,69 @@ void onPasteIdBtn(DataPanelLine*) {
     g_panel.needsRebuild = true;
 }
 
+// Paste the UDP server address from the clipboard: read text, extract + validate
+// a "host:port", and store the normalised form as this session's endpoint (used
+// on the next Connect, where it overrides coop_config.json). This is the only
+// in-game way to point a UDP client at a host - before it, the endpoint could
+// only be changed by hand-editing JSON next to the DLL.
+//
+// A malformed paste must fail VISIBLY (g_addrFailed drives the row's hint), the
+// same way a bad Steam ID already does: a silent failure here would leave the
+// player pressing Connect against whatever the config file happened to contain,
+// which is the stale-endpoint hazard the relink rig refuses to run over. The
+// previously armed address is left intact on failure - parseHostPort guarantees
+// it does not half-overwrite its outputs.
+void onPasteAddrBtn(DataPanelLine*) {
+    std::string clip;
+    std::string host;
+    int port = 0;
+    if (clipboardGetText(clip) && coop::parseHostPort(clip, host, port)) {
+        g_pastedAddr  = coop::formatEndpoint(host, port);
+        g_addrFailed  = false;
+        char b[128];
+        _snprintf(b, sizeof(b) - 1, "[coop-ui] paste server addr=%s ok=1",
+                  g_pastedAddr.c_str());
+        b[sizeof(b) - 1] = '\0';
+        coop::logLine(b);
+    } else {
+        g_addrFailed = true;
+        coop::logLine("[coop-ui] paste server addr= ok=0 (clipboard not host:port)");
+    }
+    g_panel.needsRebuild = true;
+}
+
 // POD-only pointer bundle so the row-build SEH frame constructs no std::string.
+// `steam` selects which peer-identity block is built: the two Steam ID rows or
+// the UDP server-address row. Both are never shown at once - a panel that asks a
+// player to fill in a field their armed transport ignores teaches the wrong
+// thing, and g_panel.steamFlag already forces a rebuild when the Transport
+// button flips, so the swap costs nothing.
 struct PanelStrings {
     const std::string *title, *roleKey, *roleCap, *transKey, *transCap;
     const std::string *connKey, *connCap;
     const std::string *dbgKey, *dbgVal;
     const std::string *peerKey, *peerVal, *pasteKey, *pasteCap;
     const std::string *selfKey, *selfVal, *copyKey, *copyCap;
+    const std::string *addrKey, *addrVal, *pasteAddrKey, *pasteAddrCap;
     const std::string *empty;
+    bool steam;
 };
 
+// NOTE ON REGISTRATION (the v1 exit-time crash): rows are added HERE and only
+// here, inside the one existing SEH frame, on the one panel this file ever
+// mints. No second createDatapanel, no new addDatapanelToUpdateList - the single
+// registration site stays the single registration site, guarded by
+// datapanelShouldRegister in uiPanelArmSeh, which nothing below touches.
+//
+// _NV_clear() destroys every row, so EVERY g_* row pointer is either reassigned
+// by this build or explicitly nulled by it. A pointer left over from the
+// previous build would be handed a delegate and a colour a few lines later - a
+// use-after-free of exactly the kind this file keeps re-learning.
 void panelBuildSeh(DatapanelGUI* p, const PanelStrings* s) {
     __try {
         p->_NV_clear();
+        g_peerLine = 0; g_pasteIdBtn = 0; g_selfLine = 0; g_copyIdBtn = 0;
+        g_addrLine = 0; g_pasteAddrBtn = 0;
         p->setCaption(*s->title);
         g_roleBtn  = p->setLineButton(*s->roleKey,  *s->roleCap,  0);
         g_transBtn = p->setLineButton(*s->transKey, *s->transCap, 0);
@@ -344,12 +421,19 @@ void panelBuildSeh(DatapanelGUI* p, const PanelStrings* s) {
         // Connection-status debug line (coloured white below, outside SEH).
         g_debugLine = p->setLine(*s->dbgKey, *s->dbgVal, *s->empty, 0, false, true);
         p->addSpace(0, 0.35f);
-        // Friend's SteamID: pasted in-panel (Copy on their side -> Paste here).
-        g_peerLine = p->setLine(*s->peerKey, *s->peerVal, *s->empty, 0, false, true);
-        g_pasteIdBtn = p->setLineButton(*s->pasteKey, *s->pasteCap, 0);
-        p->addSpace(0, 0.35f);
-        g_selfLine = p->setLine(*s->selfKey, *s->selfVal, *s->empty, 0, false, true);
-        g_copyIdBtn = p->setLineButton(*s->copyKey, *s->copyCap, 0);
+        if (s->steam) {
+            // Friend's SteamID: pasted in-panel (Copy on their side -> Paste here).
+            g_peerLine = p->setLine(*s->peerKey, *s->peerVal, *s->empty, 0, false, true);
+            g_pasteIdBtn = p->setLineButton(*s->pasteKey, *s->pasteCap, 0);
+            p->addSpace(0, 0.35f);
+            g_selfLine = p->setLine(*s->selfKey, *s->selfVal, *s->empty, 0, false, true);
+            g_copyIdBtn = p->setLineButton(*s->copyKey, *s->copyCap, 0);
+        } else {
+            // UDP server address: the host copies "ip:port" to their friend, who
+            // pastes it here instead of hand-editing coop_config.json.
+            g_addrLine = p->setLine(*s->addrKey, *s->addrVal, *s->empty, 0, false, true);
+            g_pasteAddrBtn = p->setLineButton(*s->pasteAddrKey, *s->pasteAddrCap, 0);
+        }
         p->_NV_update();
     } __except (EXCEPTION_EXECUTE_HANDLER) {}
 }
@@ -507,8 +591,8 @@ void coopPanelTick(const CoopPanelState* st, CoopConnectFn onConnect,
             datapanelProbeLog("f2-close-after", g, g_panel.panel);
             g_panel.panel = 0; g_panel.built = false;
             g_roleBtn = 0; g_transBtn = 0; g_connBtn = 0; g_copyIdBtn = 0;
-            g_pasteIdBtn = 0;
-            g_debugLine = 0; g_peerLine = 0; g_selfLine = 0;
+            g_pasteIdBtn = 0; g_pasteAddrBtn = 0;
+            g_debugLine = 0; g_peerLine = 0; g_selfLine = 0; g_addrLine = 0;
             g_panel.open = false;
             coop::logLine("[coop-ui] panel closed");
         }
@@ -620,6 +704,24 @@ void coopPanelTick(const CoopPanelState* st, CoopConnectFn onConnect,
                                    : std::string("(Steam not running)");
         std::string copyKey  = "copyid";
         std::string copyCap  = "Copy my Steam ID";
+
+        // UDP server address: prefer the value pasted in-panel this session; fall
+        // back to naming the config, which is still the source when nothing is
+        // armed here. Unlike a Steam ID this is shown in full and deliberately
+        // so - it is the one value the player must read back to confirm before
+        // pressing Connect, and masking it would defeat the point of the row.
+        std::string addrKey = "Server address";
+        std::string addrVal;
+        if (!g_pastedAddr.empty()) {
+            addrVal = g_pastedAddr;
+        } else if (g_addrFailed) {
+            addrVal = "(clipboard was not host:port - copy it and retry)";
+        } else {
+            addrVal = "(click Paste server address, or use coop_config.json)";
+        }
+        std::string pasteAddrKey = "pasteaddr";
+        std::string pasteAddrCap = "Paste server address";
+
         std::string empty    = "";
 
         PanelStrings ps;
@@ -631,7 +733,10 @@ void coopPanelTick(const CoopPanelState* st, CoopConnectFn onConnect,
         ps.pasteKey = &pasteKey; ps.pasteCap = &pasteCap;
         ps.selfKey = &selfKey; ps.selfVal = &selfVal;
         ps.copyKey = &copyKey; ps.copyCap = &copyCap;
+        ps.addrKey = &addrKey; ps.addrVal = &addrVal;
+        ps.pasteAddrKey = &pasteAddrKey; ps.pasteAddrCap = &pasteAddrCap;
         ps.empty = &empty;
+        ps.steam = g_panel.steamFlag;
         panelBuildSeh(g_panel.panel, &ps);
 
         // Delegate assignment + white-colouring live OUTSIDE the SEH frame (pointer
@@ -642,9 +747,11 @@ void coopPanelTick(const CoopPanelState* st, CoopConnectFn onConnect,
         if (g_connBtn)    g_connBtn->callback    = MyGUI::newDelegate(&onConnBtn);
         if (g_copyIdBtn)  g_copyIdBtn->callback  = MyGUI::newDelegate(&onCopyIdBtn);
         if (g_pasteIdBtn) g_pasteIdBtn->callback = MyGUI::newDelegate(&onPasteIdBtn);
+        if (g_pasteAddrBtn) g_pasteAddrBtn->callback = MyGUI::newDelegate(&onPasteAddrBtn);
         dbgColourSeh(g_debugLine, !transfer.empty()); // amber while streaming
         dbgColourSeh(g_peerLine, false);
         dbgColourSeh(g_selfLine, false);
+        dbgColourSeh(g_addrLine, false);
 
         g_panel.built = true;
         g_panel.needsRebuild = false;
@@ -654,18 +761,25 @@ void coopPanelTick(const CoopPanelState* st, CoopConnectFn onConnect,
 
     // Connect / disconnect on the Online/Offline toggle edge (edge, not level, so
     // a connect that hasn't reported running yet is not re-fired every tick). The
-    // pasted friend id (0 if none) is handed to the plugin, which lets a non-zero
-    // value override the config steamPeer; UDP ip/port still come from the config.
+    // pasted friend id (0 if none) and the pasted UDP endpoint (null if none) are
+    // handed to the plugin, which lets each override its config counterpart; when
+    // neither is armed the config supplies both exactly as before.
+    //
+    // g_pastedAddr is NOT cleared on disconnect, by design: going OFFLINE and
+    // back ONLINE within one launch must not demand a re-paste.
     if (g_panel.connectedFlag != g_panel.lastChkVal) {
         g_panel.lastChkVal = g_panel.connectedFlag;
         if (g_panel.connectedFlag && !st->running) {
-            char b[80];
-            _snprintf(b, sizeof(b) - 1, "[coop-ui] CONNECT role=%s transport=%s",
+            char b[160];
+            _snprintf(b, sizeof(b) - 1, "[coop-ui] CONNECT role=%s transport=%s addr=%s",
                       g_panel.hostFlag ? "HOST" : "JOIN",
-                      g_panel.steamFlag ? "steam" : "udp");
+                      g_panel.steamFlag ? "steam" : "udp",
+                      g_pastedAddr.empty() ? "(none)" : g_pastedAddr.c_str());
             b[sizeof(b) - 1] = '\0';
             coop::logLine(b);
-            if (onConnect) onConnect(g_panel.hostFlag, g_panel.steamFlag, g_pastedPeer);
+            if (onConnect) onConnect(g_panel.hostFlag, g_panel.steamFlag, g_pastedPeer,
+                                     g_pastedAddr.empty() ? (const char*)0
+                                                          : g_pastedAddr.c_str());
         } else if (!g_panel.connectedFlag && st->running) {
             coop::logLine("[coop-ui] DISCONNECT requested");
             if (onDisconnect) onDisconnect();

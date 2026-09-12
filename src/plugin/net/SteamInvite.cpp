@@ -297,7 +297,7 @@ void onLobbyEnter(LobbyEnter_t* r) {
     b[sizeof(b) - 1] = '\0';
     steamLog(b);
     setStatus("Connecting to host...");
-    if (g_onConnect) g_onConnect(false, true, owner);
+    if (g_onConnect) g_onConnect(false, true, owner, (const char*)0);
 }
 
 void onP2PSessionRequest(P2PSessionRequest_t* r) {
@@ -498,7 +498,7 @@ void tick() {
                     b[sizeof(b) - 1] = '\0';
                     steamLog(b);
                     setStatus("Friend joined - hosting...");
-                    if (g_onConnect) g_onConnect(true, true, m);
+                    if (g_onConnect) g_onConnect(true, true, m, (const char*)0);
                     break;
                 }
             }

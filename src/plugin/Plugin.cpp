@@ -32,6 +32,7 @@
 
 #include "CoopLog.h"
 #include "core/Config.h"
+#include "core/NetEndpoint.h"  // parseHostPort - the panel-armed UDP endpoint
 #include "core/CrashDump.h"
 #include "core/OwnRanks.h"
 #include "core/Inbound.h"
@@ -338,7 +339,8 @@ void (*g_titleUpdate_orig)(TitleScreen*)   = 0;
 // startNetworking() (which coopUiConnect reuses); forward-declared here so
 // mainLoop_hook can hand their addresses to coopPanelTick.
 void startNetworking();
-void coopUiConnect(bool isHost, bool useSteam, unsigned long long peerId);
+void coopUiConnect(bool isHost, bool useSteam, unsigned long long peerId,
+                   const char* udpAddr);
 void coopUiDisconnect();
 
 // Log to BOTH our dedicated per-line-flushed file (what the test runner reads)
@@ -364,8 +366,13 @@ void coopErr(const char* msg) { coop::logErrLine(msg); ErrorLog(msg); }
 // and do NOT add any teardown, config re-arm or networking start of our own here.
 //
 // Arguments mirror the process's CURRENT state rather than imposing new ones:
-// the running role, the running transport, and peer id 0 so the existing config
-// value stands (coopUiConnect only overrides steamPeer when peerId != 0).
+// the running role, the running transport, peer id 0 so the existing config
+// value stands (coopUiConnect only overrides steamPeer when peerId != 0), and a
+// NULL udpAddr so the endpoint keeps coming from coop_config.json. That null is
+// load-bearing, not filler: it is what keeps a harness relink byte-comparable to
+// the Phase 14 baseline this phase is measured against. Do not "helpfully" pass
+// g_cfg.ip/port here - that would make the relink exercise a different code path
+// than the one it was built to hold still.
 //
 // THREADING (14-CONTEXT decision 4): the scenario tick runs on the GAME thread,
 // which is the thread coopUiConnect requires - it touches live game state and
@@ -378,7 +385,7 @@ static bool coopScenarioRelinkSession() {
               (unsigned long)::GetCurrentThreadId());
     b[sizeof(b) - 1] = '\0';
     coopLog(b);
-    coopUiConnect(g_cfg.isHost, g_cfg.transport == "steam", 0ULL);
+    coopUiConnect(g_cfg.isHost, g_cfg.transport == "steam", 0ULL, (const char*)0);
     return true;
 }
 #endif // KENSHICOOP_HARNESS
@@ -1883,6 +1890,8 @@ void coopPanelDrive() {
         ostate = 0;
     }
     ps.detail = detail.c_str();
+    // Same 0/1/2 the overlay is about to be handed - ASSIGNED, not recomputed.
+    ps.sessionState = ostate;
 
     // Join save-transfer status for the panel: while a join streams the host's
     // world at the menu (no leader -> no screen overlay), show live progress on
@@ -3047,7 +3056,8 @@ void startNetworking() {
 // config from the panel's choices, and restarts via the shared startNetworking()
 // path (NetLink cleanly supports stop() then start again; Steam is re-armed and
 // the Replicator/Inbound session state is reset for a clean handshake).
-void coopUiConnect(bool isHost, bool useSteam, unsigned long long peerId) {
+void coopUiConnect(bool isHost, bool useSteam, unsigned long long peerId,
+                   const char* udpAddr) {
     coop::engine::datapanelListProbe("connect");
     if (g_net.isRunning()) g_net.stop();
     coop::steamp2p::shutdown();
@@ -3065,6 +3075,35 @@ void coopUiConnect(bool isHost, bool useSteam, unsigned long long peerId) {
     // normal flow is Copy my Steam ID -> friend Pastes it -> Connect, with no file
     // editing. peerId is 0 when nothing was pasted, so the config value stands.
     if (peerId != 0) g_cfg.steamPeer = peerId;
+    // A UDP endpoint pasted in the F2 panel this session wins over the config in
+    // exactly the same way, and for the same reason: a player should not have to
+    // hand-edit JSON next to the DLL to say where the host is.
+    //
+    // NOTE THE ORDER, it is the whole design. reloadPeerFromFile above is NOT
+    // removed, NOT reordered and NOT made conditional - the panel is an
+    // ADDITIONAL endpoint source with priority when armed, never a replacement.
+    // The file/env path is what the entire scenario harness, all of Phases 12-14's
+    // gates and docs/CROSS_MACHINE_RIG.md run on; a run that never touches the
+    // panel must take the endpoint from the file exactly as it did before.
+    // udpAddr is null for both non-panel callers (the relink adapter and an
+    // inbound Steam invite), so those paths are untouched by construction.
+    //
+    // The paste button already validated this string, but it is re-parsed rather
+    // than trusted: this function is the last point before the value becomes a
+    // live connect target, and parseHostPort leaves g_cfg.ip/port untouched on
+    // any failure, so a bad value degrades to the config rather than to garbage.
+    const char* endpointSrc = "file";
+    if (udpAddr && udpAddr[0] != '\0') {
+        std::string h;
+        int p = 0;
+        if (coop::parseHostPort(std::string(udpAddr), h, p)) {
+            g_cfg.ip   = h;
+            g_cfg.port = p;
+            endpointSrc = "panel";
+        } else {
+            coopErr("[coop-ui] connect: panel endpoint rejected - using config");
+        }
+    }
     // Host streams world NPCs; join drives. Under presence authority both do,
     // each for the cells it claims.
     g_repl.setStreamNpcs(isHost || g_cfg.cellAuth);
@@ -3083,12 +3122,18 @@ void coopUiConnect(bool isHost, bool useSteam, unsigned long long peerId) {
         if (!ranks.empty()) ranks += ",";
         ranks += n;
     }
-    char b[176];
+    // endpoint= and endpointSrc= are on this line so the next reader can tell
+    // from the log ALONE which source won - the panel or coop_config.json -
+    // without having to reproduce the session. This line is already the panel
+    // oracle's input; the existing src= field (ownership ranks) is unchanged.
+    char b[288];
     _snprintf(b, sizeof(b) - 1,
-              "[coop-ui] connect: role=%s transport=%s peer=%llu ownRanks={%s} src=%s",
+              "[coop-ui] connect: role=%s transport=%s peer=%llu ownRanks={%s} src=%s "
+              "endpoint=%s:%d endpointSrc=%s",
               isHost ? "HOST" : "JOIN", g_cfg.transport.c_str(),
               (unsigned long long)g_cfg.steamPeer, ranks.c_str(),
-              g_cfg.ownRanksFromEnv ? "env" : "role");
+              g_cfg.ownRanksFromEnv ? "env" : "role",
+              g_cfg.ip.c_str(), (int)g_cfg.port, endpointSrc);
     b[sizeof(b) - 1] = '\0';
     coopLog(b);
     startNetworking();
