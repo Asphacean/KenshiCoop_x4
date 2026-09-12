@@ -593,7 +593,14 @@ private:
     // ENetPeer pointers, and the lowest-free-slot scan would treat the stale
     // ids as occupied and refuse legitimate joins with a truthful-looking but
     // wrong "MAX_PLAYERS slots full".
-    void resetSessionRoster();
+    //
+    // 'where' tags WHICH boundary this is ("launch" / "stop") for the
+    // KENSHICOOP_NET_ROSTER_TRACE line emitted just before the clears. That
+    // trace is how Phase 14 OBSERVES the reset (14-CONTEXT D-06) instead of
+    // inferring it from a passing gate; with the env var unset it emits
+    // nothing at all. It reads ids and counts only - never PeerState::peer,
+    // which is already freed by the time stop() gets here.
+    void resetSessionRoster(const char* where);
 
     // Steam P2P transport (set before launch; read-only on the net thread
     // thereafter). 0 = stock UDP transport.

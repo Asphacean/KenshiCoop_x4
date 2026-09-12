@@ -27,6 +27,30 @@ const enet_uint8 CH_UNRELIABLE = 1;  // entity batches / stealth / cam (newest s
 const enet_uint8 CH_BULK       = 2;  // coordinated save/load transfer (bulk reliable)
 const int        CH_COUNT      = 3;  // channels negotiated at host-create / connect
 
+// KENSHICOOP_NET_ROSTER_TRACE: session-boundary roster trace (Phase 14, D-06).
+// Same read-once static gate shape as ReplicatorAuthority.cpp's
+// KENSHICOOP_DEBUG_CENSUS (commit 2c7ded9): with the variable unset this costs
+// one cached int compare and emits ZERO new log lines, so a run that does not
+// ask for the trace is byte-identical in output to a pre-Phase-14 run.
+//
+// Deliberately NOT a Config field. describeConfig builds the 'effective cfg'
+// banner from Config, so a field there would change that banner on EVERY run
+// and break Phase 14 criterion 4 ("a run that never invokes the lever is
+// indistinguishable from a pre-phase run") by construction.
+//
+// Read only from resetSessionRoster(), i.e. from the two main-thread-exclusive
+// windows (before CreateThread / after the worker join), so the non-atomic
+// static needs no guard.
+bool rosterTraceOn() {
+    static int on = -1;
+    if (on < 0) {
+        const char* e = ::getenv("KENSHICOOP_NET_ROSTER_TRACE");
+        // Anything but unset / empty / "0" is ON.
+        on = (e && e[0] != '\0' && !(e[0] == '0' && e[1] == '\0')) ? 1 : 0;
+    }
+    return on == 1;
+}
+
 // Net-thread diagnostics. OutputDebugStringA is thread-safe, and CoopLog guards
 // its FILE* with a lock, so both are safe to call off the main thread.
 void netLog(const char* msg) {
@@ -107,7 +131,42 @@ bool NetLink::startClient(const std::string& ip, int port, Inbound* inbound) {
 // Session-boundary reset - see the rationale block on the declaration in
 // NetLink.h. Safe without a lock ONLY because both call sites run on the main
 // thread with no worker alive (before CreateThread / after the join in stop()).
-void NetLink::resetSessionRoster() {
+void NetLink::resetSessionRoster(const char* where) {
+    // Session-boundary observation (Phase 14, 14-CONTEXT D-06). Emitted BEFORE
+    // the clears below, because the whole point is WHAT was discarded: the ids
+    // printed here are the ids a pre-9011527 binary would have carried into the
+    // next session, where the lowest-free-slot scan would read them as occupied
+    // and eventually refuse a legitimate rejoin with "MAX_PLAYERS=4 slots full".
+    // Ids and counts only - PeerState::peer is dangling here by construction.
+    if (rosterTraceOn()) {
+        // MAX_PLAYERS is 4, so the id list is at most "1,2,3". The buffer is
+        // sized well past that and truncates defensively rather than assuming
+        // the cap can never move.
+        char   ids[64];
+        size_t used = 0;
+        ids[0] = '\0';
+        for (std::map<u32, PeerState>::const_iterator it = registry_.begin();
+             it != registry_.end(); ++it) {
+            char one[24];
+            _snprintf(one, sizeof(one) - 1, "%s%u", (used == 0) ? "" : ",",
+                      (unsigned)it->first);
+            one[sizeof(one) - 1] = '\0';
+            size_t n = strlen(one);
+            if (used + n >= sizeof(ids) - 1) break; // truncate, never overrun
+            memcpy(ids + used, one, n);
+            used += n;
+            ids[used] = '\0';
+        }
+        char b[192];
+        _snprintf(b, sizeof(b) - 1,
+                  "roster-reset where=%s role=%s slots=%u ids={%s} epochs=%u",
+                  (where && where[0]) ? where : "?",
+                  isHost_ ? "host" : "client",
+                  (unsigned)registry_.size(), ids,
+                  (unsigned)epochSeen_.size());
+        b[sizeof(b) - 1] = '\0';
+        netLog(b);
+    }
     // Drop the stale slot table BEFORE the pointers it holds can be reused.
     // Never touch PeerState::peer here: threadLoop()'s enet_host_destroy()
     // has already freed the peer array, so these pointers are dangling and
@@ -128,7 +187,7 @@ bool NetLink::launchThread() {
     // one ended. This is the load-bearing call: stop() early-returns when
     // thread_ == 0, so a start that follows such a path would otherwise inherit
     // the old slot table.
-    resetSessionRoster();
+    resetSessionRoster("launch");
     stopFlag_ = 0;
     thread_ = CreateThread(0, 0, &NetLink::threadEntry, this, 0, 0);
     if (thread_ == 0) { netErr("CreateThread failed"); enet_deinitialize(); return false; }
@@ -161,7 +220,7 @@ void NetLink::stop() {
     // never sits around holding dangling peer pointers, so a later
     // sendTo()/broadcast() cannot resurrect them. Idempotent, so a double stop()
     // (or stop() from ~NetLink after an explicit one) is harmless.
-    resetSessionRoster();
+    resetSessionRoster("stop");
 }
 
 void NetLink::setOwnedEntities(u32 ownerId, const EntityState* arr, unsigned int count) {

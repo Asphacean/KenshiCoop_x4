@@ -2635,6 +2635,26 @@ void mainLoop_hook(GameWorld* gw, float dt) {
     g_lastGw = gw; // cache for the argument-less F2 UI callbacks
 
 #ifdef KENSHICOOP_HARNESS
+    // GAME-THREAD IDENTITY (14-CONTEXT D-04). mainLoop_hook IS the game thread -
+    // the single main-thread safe point this file's header block describes - so
+    // its own id is the reference the scenario relink adapter's
+    // "[coop-ui] RELINK src=scenario tid=" line is compared against. Without
+    // this line the threading claim is an argument about where the call sits;
+    // with it, analyze_relink.ps1 can assert an EQUALITY. One line per process,
+    // harness-only, so Release is untouched. CrashDump.h records no main-thread
+    // id of its own (checked), hence capturing it here.
+    {
+        static bool tidLogged = false;
+        if (!tidLogged) {
+            tidLogged = true;
+            char b[64];
+            _snprintf(b, sizeof(b) - 1, "[coop-ui] MAINTID tid=%lu",
+                      (unsigned long)::GetCurrentThreadId());
+            b[sizeof(b) - 1] = '\0';
+            coopLog(b);
+        }
+    }
+
     // TEST-ONLY (KENSHICOOP_TEST_CRASH=<seconds>): fault on purpose, to prove the
     // crash-dump filter actually produces a dump with our frames in it. A crash
     // handler nobody has ever seen fire is a coin flip, and the run it would waste
