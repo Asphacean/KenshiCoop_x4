@@ -51,6 +51,30 @@ bool rosterTraceOn() {
     return on == 1;
 }
 
+// KENSHICOOP_NET_DIRTY_STOP: HARNESS-ONLY mutation lever. When set, the
+// graceful ENet shutdown added for WINDOWS #19 / #22 is skipped, restoring the
+// exact pre-fix teardown (enet_host_destroy with no enet_peer_disconnect) so
+// the defect can be REPRODUCED on demand and the fix measured rather than
+// asserted. Same read-once static gate shape as rosterTraceOn() above, and
+// compiled out entirely in Release so no shipped build can take this path.
+//
+// Not a Config field, for the same reason rosterTraceOn() is not: describeConfig
+// builds the 'effective cfg' banner from Config, and a field there would change
+// that banner on every run (Phase 14 criterion 4).
+#ifdef KENSHICOOP_HARNESS
+bool dirtyStopOn() {
+    static int on = -1;
+    if (on < 0) {
+        const char* e = ::getenv("KENSHICOOP_NET_DIRTY_STOP");
+        // Anything but unset / empty / "0" is ON.
+        on = (e && e[0] != '\0' && !(e[0] == '0' && e[1] == '\0')) ? 1 : 0;
+    }
+    return on == 1;
+}
+#else
+bool dirtyStopOn() { return false; }
+#endif
+
 // Net-thread diagnostics. OutputDebugStringA is thread-safe, and CoopLog guards
 // its FILE* with a lock, so both are safe to call off the main thread.
 void netLog(const char* msg) {
@@ -749,6 +773,108 @@ void NetLink::flushDelayed() {
 DWORD WINAPI NetLink::threadEntry(LPVOID self) {
     reinterpret_cast<NetLink*>(self)->threadLoop();
     return 0;
+}
+
+// Graceful transport shutdown (WINDOWS #19 / #22). NET THREAD ONLY, and only
+// from the tail of threadLoop(): every ENetPeer* touched here is still owned by
+// enetHost_, which has not been destroyed yet, so nothing in this function ever
+// dereferences the dangling pointers resetSessionRoster() exists to discard.
+// The ordering contract is the whole safety argument:
+//
+//   threadLoop loop exits
+//     -> shutdownPeersGracefully()   <- peers ALIVE, wire still open (here)
+//     -> enet_host_destroy()         <- peer array freed, every pointer dangles
+//     -> stop() joins the worker
+//     -> resetSessionRoster("stop")  <- discards the now-dangling registry_
+//
+// Commit 9011527's invariant is untouched: this function never stores a peer
+// pointer, never clears registry_, and never runs after the destroy.
+void NetLink::shutdownPeersGracefully() {
+    if (!enetHost_) return;
+    if (dirtyStopOn()) {
+        netLog("graceful-stop SKIPPED (KENSHICOOP_NET_DIRTY_STOP)");
+        return;
+    }
+
+    // Collect the peers worth telling. A host has N clients in registry_; a
+    // client has exactly one server peer. Peers that are not CONNECTED (still
+    // handshaking, already gone, rejected pre-HELLO) have nothing to acknowledge
+    // and are left to enet_host_destroy().
+    ENetPeer* pending[MAX_PLAYERS];
+    unsigned  nPending = 0;
+    if (isHost_) {
+        for (std::map<u32, PeerState>::iterator it = registry_.begin();
+             it != registry_.end() && nPending < MAX_PLAYERS; ++it) {
+            ENetPeer* p = it->second.peer;
+            if (p && p->state == ENET_PEER_STATE_CONNECTED) pending[nPending++] = p;
+        }
+    } else if (serverPeer_ && serverPeer_->state == ENET_PEER_STATE_CONNECTED) {
+        pending[nPending++] = serverPeer_;
+    }
+
+    if (nPending == 0) {
+        if (rosterTraceOn()) {
+            char b[96];
+            _snprintf(b, sizeof(b) - 1, "graceful-stop role=%s peers=0 acked=0 waitedMs=0",
+                      isHost_ ? "host" : "client");
+            b[sizeof(b) - 1] = '\0';
+            netLog(b);
+        }
+        return;
+    }
+
+    for (unsigned i = 0; i < nPending; ++i) enet_peer_disconnect(pending[i], 0);
+
+    // Bounded drain so the queued disconnect command is actually SENT and, where
+    // the remote end is reachable, acknowledged. Unbounded would hang the F2
+    // panel; stop() already waits up to 5000 ms for this thread, so the budget
+    // has to stay far below that. 300 ms covers a LAN round trip many times over
+    // and is invisible next to the ~4 ms reconnect it protects.
+    const unsigned SHUTDOWN_BUDGET_MS = 300;
+    const unsigned SHUTDOWN_SLICE_MS  = 20;
+    unsigned waited = 0;
+    unsigned acked  = 0;
+    while (waited < SHUTDOWN_BUDGET_MS && acked < nPending) {
+        ENetEvent ev;
+        int rc = enet_host_service(enetHost_, &ev, SHUTDOWN_SLICE_MS);
+        waited += SHUTDOWN_SLICE_MS;
+        if (rc < 0) break;
+        if (rc == 0) continue;
+        if (ev.type == ENET_EVENT_TYPE_RECEIVE) {
+            // The session is over; nothing here may reach the game thread.
+            enet_packet_destroy(ev.packet);
+        } else if (ev.type == ENET_EVENT_TYPE_DISCONNECT) {
+            // Deliberately NOT the full per-player teardown: registry_ and
+            // epochSeen_ are about to be discarded wholesale by
+            // resetSessionRoster("stop"), and pushLeave()ing a departure the
+            // game thread will never act on would be noise. Clearing ->data
+            // keeps the id off a peer slot that is about to be freed.
+            ev.peer->data = 0;
+            ++acked;
+        }
+    }
+
+    // Anything still unacknowledged inside the budget gets one last-ditch
+    // immediate disconnect: enet_peer_disconnect_now() puts the command on the
+    // wire without waiting for a reply, which is strictly better than the
+    // pre-fix silence even when the remote end never answers.
+    if (acked < nPending) {
+        for (unsigned i = 0; i < nPending; ++i) {
+            if (pending[i]->state != ENET_PEER_STATE_DISCONNECTED)
+                enet_peer_disconnect_now(pending[i], 0);
+        }
+        enet_host_flush(enetHost_);
+    }
+
+    if (rosterTraceOn()) {
+        char b[112];
+        _snprintf(b, sizeof(b) - 1,
+                  "graceful-stop role=%s peers=%u acked=%u waitedMs=%u",
+                  isHost_ ? "host" : "client",
+                  (unsigned)nPending, (unsigned)acked, (unsigned)waited);
+        b[sizeof(b) - 1] = '\0';
+        netLog(b);
+    }
 }
 
 void NetLink::threadLoop() {
@@ -3096,6 +3222,19 @@ void NetLink::threadLoop() {
         }
     }
 
+    // WINDOWS #19 / #22 - tell the other side we are leaving BEFORE the
+    // transport goes away. enet_host_destroy() below frees the whole ENetPeer
+    // array without putting a single byte on the wire, so pre-fix the remote
+    // end kept this connection alive until ENet's own timeout expired
+    // (measured ~5.4 s in tools/test-runs/20260912_110440_N3_relink, and 3.49 s
+    // / 3.83 s in the live F2 session of 2026-09-12) while this side's
+    // reconnect returned in ~4 ms and was handed the NEXT free id. At 2 players
+    // that only looks like a cosmetic id change; at 3-4 players the free slot
+    // runs out and the next reconnect is refused with "MAX_PLAYERS=4 slots
+    // full". Runs on the net thread, still inside threadLoop, while every peer
+    // pointer is still valid - it must never move above the loop or below the
+    // destroy.
+    shutdownPeersGracefully();
     if (enetHost_) { enet_host_destroy(enetHost_); enetHost_ = 0; }
     if (steam) steamp2p::removeEnetHooks();
     InterlockedExchange(&running_, 0);

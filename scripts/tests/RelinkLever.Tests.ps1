@@ -116,6 +116,55 @@ Check "the trace is gated on KENSHICOOP_NET_ROSTER_TRACE" ($net -match 'KENSHICO
 Check "ROSTER_TRACE did not leak into Config.cpp" (-not ((Get-Content -Raw -Path $configCpp) -match 'ROSTER_TRACE'))
 Check "ROSTER_TRACE did not leak into Config.h"   (-not ((Get-Content -Raw -Path $configH)   -match 'ROSTER_TRACE'))
 
+# A10 - the graceful ENet shutdown that closes WINDOWS #19 / #22, and the
+# ORDERING that keeps commit 9011527's use-after-free repair intact.
+#
+# The whole safety argument is a sequence:
+#     shutdownPeersGracefully()  <- peers alive, wire open
+#     enet_host_destroy()        <- peer array freed, every pointer dangles
+#     resetSessionRoster("stop") <- discards the dangling registry_
+# Move the first call below the second and the fix becomes the exact
+# use-after-free 9011527 repaired. That is the regression these pins catch,
+# because no unit test can see it and a live run would only show it as a crash.
+$netH = Get-Content -Raw -Path $netLinkH
+Check "shutdownPeersGracefully declared in NetLink.h" ($netH -match 'void\s+shutdownPeersGracefully\(\)\s*;')
+$gracefulCalls = [regex]::Matches($net, 'shutdownPeersGracefully\(\)\s*;').Count
+Check "shutdownPeersGracefully called exactly once in NetLink.cpp (found $gracefulCalls)" ($gracefulCalls -eq 1)
+# The ordering pin: the call must sit IMMEDIATELY above the enet_host_destroy
+# line, with nothing but whitespace between them.
+Check "the graceful shutdown runs BEFORE enet_host_destroy (9011527's boundary)" `
+    ($net -match 'shutdownPeersGracefully\(\)\s*;\s*(\r?\n)\s*if\s*\(enetHost_\)\s*\{\s*enet_host_destroy')
+
+$gm = [regex]::Match($net, '(?ms)^void NetLink::shutdownPeersGracefully\(\)\s*\{.*?^\}')
+Check "shutdownPeersGracefully has a body to inspect" $gm.Success
+if ($gm.Success) {
+    # Judge the CODE, not the prose: the body's own comments name
+    # resetSessionRoster and enet_host_destroy precisely because the ordering
+    # against them is the safety argument, and a check that matched those
+    # sentences would fail on a correct implementation.
+    $body = [regex]::Replace($gm.Value, '//[^\r\n]*', '')
+    # It must actually put a disconnect on the wire - the entire point.
+    Check "the graceful shutdown issues enet_peer_disconnect" ($body -match 'enet_peer_disconnect\s*\(')
+    # ... and must bound the wait, or stop() -> the F2 panel hangs.
+    Check "the drain is bounded (SHUTDOWN_BUDGET_MS)" ($body -match 'SHUTDOWN_BUDGET_MS')
+    # It must NOT take over the session-boundary reset: registry_/epochSeen_
+    # stay resetSessionRoster's job, on the main thread, after the join.
+    Check "the graceful shutdown never clears registry_"    (-not ($body -match 'registry_\s*\.\s*clear'))
+    Check "the graceful shutdown never clears epochSeen_"   (-not ($body -match 'epochSeen_\s*\.\s*clear'))
+    Check "the graceful shutdown never calls resetSessionRoster" (-not ($body -match 'resetSessionRoster'))
+    # It must never itself destroy the host it is servicing.
+    Check "the graceful shutdown never calls enet_host_destroy" (-not ($body -match 'enet_host_destroy'))
+}
+
+# The RED lever: KENSHICOOP_NET_DIRTY_STOP restores pre-fix teardown so the
+# defect can be reproduced on demand. Harness-only - a shipped build must not
+# be able to take the leaking path at all.
+$dirty = [regex]::Match($net, '(?ms)#ifdef\s+KENSHICOOP_HARNESS\s*\r?\nbool\s+dirtyStopOn\(\)\s*\{.*?#else\s*\r?\nbool\s+dirtyStopOn\(\)\s*\{\s*return\s+false;\s*\}\s*\r?\n#endif')
+Check "KENSHICOOP_NET_DIRTY_STOP is harness-guarded and hard-false in Release" $dirty.Success
+Check "the dirty-stop lever is read from KENSHICOOP_NET_DIRTY_STOP" ($net -match 'KENSHICOOP_NET_DIRTY_STOP')
+Check "DIRTY_STOP did not leak into Config.cpp" (-not ((Get-Content -Raw -Path $configCpp) -match 'DIRTY_STOP'))
+Check "DIRTY_STOP did not leak into Config.h"   (-not ((Get-Content -Raw -Path $configH)   -match 'DIRTY_STOP'))
+
 # A7 - the banner/wire pins, read from the recorded pre-phase baseline.
 $baselinePath = Join-Path $repoRoot "tools\test-runs\phase14_baseline.json"
 if (-not (Test-Path $baselinePath)) {

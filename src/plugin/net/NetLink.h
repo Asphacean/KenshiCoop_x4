@@ -377,6 +377,22 @@ public:
 private:
     static DWORD WINAPI threadEntry(LPVOID self);
     void threadLoop();
+    // Graceful ENet shutdown, called from the TAIL of threadLoop() and nowhere
+    // else (WINDOWS #19 / #22). NET THREAD ONLY, and strictly BEFORE
+    // enet_host_destroy(): it sends enet_peer_disconnect to every currently
+    // CONNECTED peer and services the host for a bounded 300 ms so the command
+    // actually leaves the socket. Pre-fix the transport was destroyed silently,
+    // so the remote end held this connection open for ENet's full timeout
+    // (~5.4 s measured) while the reconnect had already been handed the next
+    // free id - the slot leak that reaches "MAX_PLAYERS slots full" at 3-4
+    // players.
+    //
+    // It must never move after the destroy: this is the same use-after-free
+    // boundary 9011527 repaired, and every ENetPeer* it reads is only valid
+    // while enetHost_ still owns the peer array. It deliberately does NOT touch
+    // registry_ or epochSeen_ - resetSessionRoster("stop") still owns that,
+    // unchanged.
+    void shutdownPeersGracefully();
     bool launchThread();
 
     // Net-thread-only: route a received entity through the WAN sim (delay/drop) when
