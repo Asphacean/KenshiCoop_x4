@@ -435,7 +435,7 @@ if ($NoLaunch) {
     }
     Start-Sleep -Seconds 3
     $lines = @()
-    if (Test-Path -LiteralPath $logPath) { $lines = @(Get-Content -LiteralPath $logPath) }
+    if (Test-Path -LiteralPath $logPath) { $lines = @(Get-Content -LiteralPath $logPath | ForEach-Object { "$_" }) }
     $loaded = @($lines | Where-Object { $_ -match 'KenshiCoop loaded!' })       | Select-Object -First 1
     $build  = @($lines | Where-Object { $_ -match 'KenshiCoop: build ' })       | Select-Object -First 1
     $role   = @($lines | Where-Object { $_ -match 'role=.* proto=v' })          | Select-Object -First 1
@@ -457,7 +457,14 @@ Write-Host ""
 Write-Host "=== 7. version, readable WITHOUT launching the game ==="
 $versionTxt = Join-Path $modDir "VERSION.txt"
 $vLines = @()
-if (Test-Path -LiteralPath $versionTxt) { $vLines = @(Get-Content -LiteralPath $versionTxt) }
+# "$_" makes a PLAIN string. Get-Content decorates every line with PSPath /
+# PSProvider note-properties, and ConvertTo-Json -Depth 12 then walks into the
+# FileSystem provider object and never comes back - the run hung here after
+# every measurement had already been taken, losing the record it existed to
+# write. Anything from Get-Content that reaches the JSON must be flattened.
+if (Test-Path -LiteralPath $versionTxt) {
+    $vLines = @(Get-Content -LiteralPath $versionTxt | ForEach-Object { "$_" })
+}
 $vBuild = ""
 $vProto = ""
 foreach ($l in $vLines) {
@@ -489,20 +496,31 @@ $protoSources = @{}
 $protoSources["VERSION.txt"] = $vProto
 $protoSources["Wire.h"]      = $wireProto
 if ($logProto) { $protoSources["plugin log"] = $logProto }
-$protoValues = @($protoSources.Values | Where-Object { $_ }) | Sort-Object -Unique
+# The @() must wrap the WHOLE pipeline: `@(x) | Sort-Object` hands a
+# one-element result back UNWRAPPED, and $protoValues[0] would then be the
+# first CHARACTER of "61". That is the very defect 9b7665a fixed in
+# install_coop.ps1, reproduced here during this plan's own live run.
+$protoValues = @($protoSources.Values | Where-Object { $_ } | Sort-Object -Unique)
 $protoAgree  = ($protoValues.Count -eq 1 -and $protoValues[0] -eq "61")
 
 $buildSources = @{}
 $buildSources["VERSION.txt"] = $vBuild
 if ($logBuild) { $buildSources["plugin log"] = $logBuild }
-$buildValues = @($buildSources.Values | Where-Object { $_ }) | Sort-Object -Unique
-$buildAgree  = ($buildValues.Count -eq 1)
+$buildValues = @($buildSources.Values | Where-Object { $_ } | Sort-Object -Unique)
+# One source is not an agreement. With -NoLaunch there is no plugin log, so the
+# build stamp is REPORTED and explicitly marked as not cross-checked rather
+# than passed on a single reading.
+$buildCrossChecked = (@($buildSources.Values | Where-Object { $_ }).Count -ge 2)
+$buildAgree  = ($buildCrossChecked -and $buildValues.Count -eq 1)
 
+$protoSourceCount = @($protoSources.Values | Where-Object { $_ }).Count
 $script:Result["version"] = [ordered]@{
     versionTxtPath = $versionTxt
     versionTxt     = @($vLines)
     buildSources   = $buildSources
     buildAgree     = $buildAgree
+    buildCrossChecked = $buildCrossChecked
+    protocolSourceCount = $protoSourceCount
     protocolSources = $protoSources
     protocolAgree  = $protoAgree
     protocolExpected = "61"
@@ -518,7 +536,8 @@ Write-Host ("  protocol          : VERSION.txt={0} log={1} Wire.h={2}  agree-on-
     $(if ($wireProto) { $wireProto } else { "?" }), $protoAgree)
 Write-Host ("  -Info exit        : {0}" -f $infoExit)
 if (-not $protoAgree)  { $script:Problems += "the protocol version does not agree across VERSION.txt, the plugin log and Wire.h (expected 61)." }
-if (-not $buildAgree)  { $script:Problems += "the build stamp does not agree between VERSION.txt and the plugin's own log." }
+if ($buildCrossChecked -and -not $buildAgree) { $script:Problems += "the build stamp does not agree between VERSION.txt and the plugin's own log." }
+if (-not $buildCrossChecked) { Write-Host "  NOTE: the build stamp was read from ONE source only; it is reported, NOT cross-checked." }
 if ($infoExit -ne 0)   { $script:Problems += "install_coop.ps1 -Info exited $infoExit." }
 if ((Sha256File $deployedDll) -ne $deployedSha) { $script:Problems += "the installed DLL changed on disk between install and read-back." }
 
@@ -558,7 +577,16 @@ $script:Result["notObserved"] = @(
 if ($NoLaunch) {
     $script:Result["notObserved"] += "The plugin's load banner: -NoLaunch was passed, so the game was never started from this install."
 }
-$script:Result["repoHeadSha"] = (& git -C $repoRoot rev-parse HEAD 2>$null)
+# git writes to stderr on a bad invocation and $ErrorActionPreference = "Stop"
+# turns that into a terminating NativeCommandError - which would kill the run
+# AFTER every measurement was taken but BEFORE result.json was written. The
+# record is the deliverable; nothing this late may be allowed to lose it.
+$head = ""
+try {
+    $ErrorActionPreference = "Continue"
+    $head = (& git -C $repoRoot rev-parse HEAD 2>$null)
+} catch { $head = "" } finally { $ErrorActionPreference = "Stop" }
+$script:Result["repoHeadSha"] = "$head"
 
 Write-Result
 Write-Host ""
