@@ -278,7 +278,14 @@ function Resolve-KenshiDir([string]$given) {
         }
         $abs = [System.IO.Path]::GetFullPath($given).TrimEnd('\', '/')
     } else {
-        $found = Find-KenshiInstalls
+        # @(...) is load-bearing: PowerShell unwraps a single-element array on
+        # return, so with exactly ONE install found $found became a bare string.
+        # A string has .Count = 1, so both guards below still passed, and
+        # $found[0] then yielded its first CHARACTER ("C") - which GetFullPath
+        # resolved against the current directory as "<cwd>\C". Reported from a
+        # real player's machine, where one install is the normal case; this rig
+        # has several clones, so auto-detect always took the >1 branch here.
+        $found = @(Find-KenshiInstalls)
         if ($found.Count -eq 0) {
             Refuse "no Kenshi installation was found automatically. Pass -KenshiDir with the folder that holds kenshi_x64.exe (for example: -KenshiDir `"C:\Program Files (x86)\Steam\steamapps\common\Kenshi`")."
         }
