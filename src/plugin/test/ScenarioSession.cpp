@@ -1606,6 +1606,24 @@ private:
         }
 
         if (!waiting_ && issued_ >= count()) {
+            // In `both` mode the two sides INTERLEAVE one recovery budget apart,
+            // so this side's last slot is NOT the run's last slot: the host owns
+            // the even slots and the designated join the odd ones, and the join's
+            // final relink lands a full budget AFTER the host's. Finishing the
+            // moment this side is done ends the scenario, which exits the
+            // process - and a host that leaves takes the joins' remaining
+            // boundaries with it.
+            //
+            // This never showed before WINDOWS #19 was fixed only because the
+            // defect hid it: the host's second recovery used to time out on the
+            // full 60 s budget (recoveredMs=60000 ok=0), which happened to keep
+            // the host alive exactly long enough. Now it recovers in ~94 ms and
+            // the host would otherwise leave 60 s early. Measured:
+            // tools/test-runs/20260912_184538_N3_relink - host "SCENARIO RESULT
+            // PASS" 18:48:59.550, both joins "disconnected from host" 18:49:08.995
+            // and never reconnecting. Hold to the shared window instead; it is
+            // the same clock the observing side already backstops on.
+            if (role() == 2 && ctx.elapsedMs < windowEndMs()) return false;
             setPassed(anyIssued_ && allRecovered_);
             done_ = true;
             return true;
@@ -1649,6 +1667,26 @@ private:
         // window is still the backstop, and it FAILS on no drop rather than
         // passing vacuously.
         bool complete = (cycles_ >= count());
+        // `both` mode: hold to the shared window for the same reason tickRelink
+        // does. This side's cycles are the HOST boundaries - the ones that drop
+        // this client's own link - and the last of those is not the run's last
+        // slot. Leaving early removes this client from the host's roster while
+        // the host still has a boundary to recover, and the host's own
+        // relink-post predicate then never sees the id set it discarded.
+        //
+        // Note what this side can and cannot witness now. A host boundary
+        // empties this client's roster and is always visible. The relinking
+        // JOIN's boundary is NOT, by design: since the clean-disconnect fix its
+        // leave and re-admit land in one main-thread drain, and Plugin.cpp
+        // deliberately skips a leave superseded by a same-drain re-admit, so
+        // g_connectedPeers never dips - there is no transition to sample.
+        // Counting it would make this side's verdict a poll-timing race
+        // (measured: 2 of 4 such edges caught in
+        // tools/test-runs/20260912_185407_N3_relink, 3 of 4 in ...184538...).
+        // The relinking join proves its own recovery from its own log; this
+        // side's job is the independent second observation of the HOST
+        // boundaries, which is exactly count().
+        if (role() == 2 && ctx.elapsedMs < windowEndMs()) return false;
         if (!complete && ctx.elapsedMs < windowEndMs()) return false;
         char b[176];
         _snprintf(b, sizeof(b) - 1,
