@@ -404,6 +404,103 @@ Check "C3b the unmutated runner still HAS the byte-identity assertion it removes
 $c4text = $freshText.Replace('if ($kitSha -ne $relSha0) {', 'if ($false) {')
 Check "C4a the payload-freshness mutation applied" ($c4text -ne $freshText)
 
+# ======================================================================= D ===
+# The release gate. A gate that can only ever say one thing is not a gate, so
+# the verdict is driven against synthetic blockers files in BOTH states.
+Write-Host ""
+Write-Host "-- GROUP D: the release gate (docs\RELEASE_BLOCKERS.md -> PROVENANCE.json) --"
+
+$blockersDoc = Join-Path $repoRoot "docs\RELEASE_BLOCKERS.md"
+$kitScript   = Join-Path $scriptsRoot "make_mod_kit.ps1"
+$tracked = $false
+try {
+    $ErrorActionPreference = "Continue"
+    $tracked = (@(& git -C $repoRoot ls-files -- "docs/RELEASE_BLOCKERS.md" 2>$null).Count -gt 0)
+} catch { $tracked = $false } finally { $ErrorActionPreference = "Stop" }
+Check "D1 docs\RELEASE_BLOCKERS.md exists and is TRACKED (docs\PHASE_*_GATE.md is not)" `
+    ((Test-Path $blockersDoc) -and $tracked)
+
+function Get-Verdict([string]$file) {
+    $ErrorActionPreference = "Continue"
+    $out = @(& powershell -NoProfile -ExecutionPolicy Bypass -File $kitScript -VerdictOnly -BlockersFile $file 2>&1 | ForEach-Object { "$_" })
+    $txt = ($out -join "`n")
+    try { return ($txt | ConvertFrom-Json) } catch { return $null }
+}
+
+$vReal = Get-Verdict $blockersDoc
+Check "D2 make_mod_kit.ps1 derives a verdict from the blockers file" ($vReal -ne $null)
+Check "D3 at least one blocker is OPEN today, so this build is not shippable" `
+    ($vReal -ne $null -and @($vReal.releaseBlockers).Count -ge 1 -and $vReal.shippable -eq $false)
+Check "D4 WINDOWS-19 is among the open ids (the reconnect slot leak gates publication)" `
+    ($vReal -ne $null -and @($vReal.releaseBlockers) -contains "WINDOWS-19")
+
+# Synthetic blockers files: the verdict must flip BOTH ways.
+$synOpen   = Join-Path $fixRoot "BLOCKERS_open.md"
+$synClosed = Join-Path $fixRoot "BLOCKERS_closed.md"
+WriteText $synOpen @'
+# Release Blockers
+
+## Open blockers
+
+| ID | Ledger | Player-facing consequence | Evidence | Status |
+|----|--------|---------------------------|----------|--------|
+| SYNTH-1 | n/a | a synthetic open row | none | open |
+
+## Recently closed
+
+| ID | Closed by | Evidence |
+|----|-----------|----------|
+| SYNTH-0 | n/a | n/a |
+'@
+WriteText $synClosed @'
+# Release Blockers
+
+## Open blockers
+
+| ID | Ledger | Player-facing consequence | Evidence | Status |
+|----|--------|---------------------------|----------|--------|
+
+## Recently closed
+
+| ID | Closed by | Evidence |
+|----|-----------|----------|
+| SYNTH-1 | a synthetic fix | a synthetic run record |
+'@
+
+$vOpen = Get-Verdict $synOpen
+Check "D5 with ONE open row the verdict is false and names that row" `
+    ($vOpen -ne $null -and $vOpen.shippable -eq $false -and (@($vOpen.releaseBlockers) -contains "SYNTH-1"))
+$vClosed = Get-Verdict $synClosed
+Check "D6 with NO open row the verdict flips to TRUE (the gate can say both things)" `
+    ($vClosed -ne $null -and $vClosed.shippable -eq $true -and @($vClosed.releaseBlockers).Count -eq 0)
+Check "D7 a CLOSED row is not miscounted as open (the closed table is not parsed)" `
+    ($vClosed -ne $null -and -not (@($vClosed.releaseBlockers) -contains "SYNTH-1"))
+
+$vMissing = Get-Verdict (Join-Path $fixRoot "no_such_blockers_file.md")
+Check "D8 a MISSING blockers file is not an empty one: shippable stays false" `
+    ($vMissing -ne $null -and $vMissing.shippable -eq $false -and $vMissing.blockersFound -eq $false)
+
+$kitText = [System.IO.File]::ReadAllText($kitScript)
+Check "D9 shippable is DERIVED, never a literal in make_mod_kit.ps1" `
+    ($kitText.Contains('$shippable = [bool]($gate.found -and $releaseBlockers.Count -eq 0)') -and
+     -not ($kitText -match 'shippable\s*=\s*\$(true|false)'))
+
+# The kit's own PROVENANCE.json, if a kit has been packaged.
+$prov = Join-Path $repoRoot "dist\mod-kit\PROVENANCE.json"
+if (Test-Path $prov) {
+    $pj = Get-Content -Raw $prov | ConvertFrom-Json
+    Check "D10 dist\mod-kit\PROVENANCE.json carries shippable and releaseBlockers" `
+        (($pj.PSObject.Properties.Name -contains "shippable") -and ($pj.PSObject.Properties.Name -contains "releaseBlockers"))
+    Check "D11 the packaged verdict agrees with the blockers file" `
+        ($vReal -ne $null -and $pj.shippable -eq $vReal.shippable -and
+         (@($pj.releaseBlockers) -join ",") -eq (@($vReal.releaseBlockers) -join ","))
+    $kitReadme = Join-Path $repoRoot "dist\mod-kit\README.txt"
+    Check "D12 README.txt warns a player about the reconnect symptom in player language" `
+        ((Test-Path $kitReadme) -and ((Get-Content -Raw $kitReadme) -match "(?s)KNOWN ISSUES.*slots full"))
+} else {
+    Check "D10 a kit has been packaged so its PROVENANCE.json can be checked" $false
+}
+
 Write-Host ""
 foreach ($m in $script:MutantFiles) {
     try { Remove-Item -LiteralPath $m -Force -ErrorAction SilentlyContinue } catch { }

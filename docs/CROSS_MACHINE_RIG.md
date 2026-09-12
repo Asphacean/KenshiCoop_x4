@@ -215,15 +215,33 @@ by KWin/Wayland; `xdotool key --clearmodifiers Return` gets through. Export
 `DISPLAY=:0`, `XDG_RUNTIME_DIR=/run/user/1000` and an `XAUTHORITY` pointing at
 `/run/user/1000/xauth_*` before calling `xdotool`.
 
-### Run it from an ATTACHED ssh session
+### Launch it as a user unit, so it survives the ssh session
 
 ```
-ssh -o ServerAliveInterval=20 deck@<deck-tailnet-name> '$HOME/rekit/launch_auto.sh'
+ssh deck@<deck-tailnet-name>   'systemd-run --user --unit=kenshicoop --collect --setenv=DISPLAY=:0      --setenv=XDG_RUNTIME_DIR=/run/user/1000 $HOME/rekit/launch_auto.sh'
 ```
 
-A fully detached launch (`setsid`, `nohup`, `&` + immediate disconnect) **dies
-with the session**. Keep the ssh connection open for the whole run; background
-the *local* command instead if your tooling needs the shell back.
+`setsid`, `nohup` and `&` + immediate disconnect all **die with the ssh
+session** — systemd-logind reaps the session scope when the connection closes,
+and the orphaned children go with it. `tmux new-session -d` does **not** work
+either: it tears the session down as soon as its command returns and takes the
+children with it.
+
+A **user unit** is the thing that survives, because it lives in the user
+manager rather than in the ssh session's scope. Verified 2026-09-12: a client
+started this way kept running across ssh disconnection and reconnection for a
+whole co-op session. Inspect and stop it with:
+
+```
+ssh deck@<deck-tailnet-name> 'systemctl --user status kenshicoop'
+ssh deck@<deck-tailnet-name> 'systemctl --user stop   kenshicoop'
+```
+
+`--collect` makes the unit disappear once it exits, so the same `--unit` name
+can be reused on the next run without a `reset-failed`. An attached ssh session
+(`ssh -o ServerAliveInterval=20 deck@… '$HOME/rekit/launch_auto.sh'`) still
+works and is fine for a short run you intend to watch, but it ties the run's
+lifetime to a network connection for no benefit.
 
 **Put the environment in a small per-run wrapper on the Deck, not on the ssh
 command line.** Write `~/rekit/<run>_launch.sh` containing the exports below
