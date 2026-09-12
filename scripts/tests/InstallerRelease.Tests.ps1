@@ -187,6 +187,153 @@ Check "R6b with the @() reverted, the single-install case NO LONGER resolves cor
 Check "R6c the mutated run reproduces the player's symptom (a one-character tail)" `
     ($r6.text -match '\\[A-Za-z]''? is not a Kenshi installation' -or $r6.text -match 'RESOLVED=.*\\[A-Za-z]$')
 
+# ======================================================================= S ===
+# The candidate PRODUCER. Group R stubs Find-KenshiInstalls to test its
+# consumer; that left the WALK ITSELF - the thing that actually has to survive
+# a stranger's disk layout - unmeasured, which is the whole of RELEASE_BLOCKERS
+# row INST-AUTODETECT.
+#
+# Nothing here is stubbed. The shipped Find-KenshiInstalls is dot-sourced and
+# run against REAL directories: %ProgramFiles% / %ProgramFiles(x86)% are
+# redirected at synthetic roots, and a virtual drive (subst) supplies a genuine
+# ready drive whose layout is NOT this rig's, so the DriveInfo::GetDrives()
+# branch is exercised rather than argued about. S7/S8 delete one root form at a
+# time and require exactly the matching candidate to disappear.
+Write-Host ""
+Write-Host "-- GROUP S: the candidate producer's own root enumeration --"
+
+$prodRoot = Join-Path $fixRoot "producer"
+New-Item -ItemType Directory -Force -Path $prodRoot | Out-Null
+
+# A Kenshi install at <root>\Steam\steamapps\common\Kenshi, with or without the
+# executable that makes it count as one.
+function New-SteamLayout([string]$root, [string]$middle, [bool]$WithExe) {
+    $dir = Join-Path $root ($middle + "\steamapps\common\Kenshi")
+    New-Item -ItemType Directory -Force -Path $dir | Out-Null
+    if ($WithExe) { WriteText (Join-Path $dir "kenshi_x64.exe") "not a real exe" }
+    return $dir
+}
+
+$pfGood    = Join-Path $prodRoot "ProgramFiles"
+$pfx86Good = Join-Path $prodRoot "ProgramFilesX86"
+$pfNoExe   = Join-Path $prodRoot "ProgramFilesEmpty"
+$pfGoodHit    = New-SteamLayout $pfGood    "Steam" $true
+$pfx86GoodHit = New-SteamLayout $pfx86Good "Steam" $true
+$pfNoExeHit   = New-SteamLayout $pfNoExe   "Steam" $false
+
+# A real, ready drive letter that is not this rig's, via subst. Mapped to a
+# temp directory - no Steam library on this machine is read or written.
+$substDir = Join-Path $prodRoot "virtualdrive"
+New-Item -ItemType Directory -Force -Path $substDir | Out-Null
+$used = @([System.IO.DriveInfo]::GetDrives() | ForEach-Object { $_.Name.Substring(0, 1).ToUpperInvariant() })
+$substLetter = ""
+foreach ($L in @("W", "V", "U", "T", "S", "R", "Q", "P", "N", "M")) {
+    if ($used -notcontains $L) { $substLetter = $L; break }
+}
+$substOk = $false
+if ($substLetter) {
+    & cmd.exe /c "subst $substLetter`: `"$substDir`"" 2>&1 | Out-Null
+    $substOk = (Test-Path -LiteralPath ($substLetter + ":\"))
+}
+Check "S0 a virtual drive was created, so the drive walk is exercised for real" $substOk
+
+$substLibHit   = ""
+$substSteamHit = ""
+if ($substOk) {
+    $substLibHit   = New-SteamLayout ($substLetter + ":\") "SteamLibrary" $true
+    $substSteamHit = New-SteamLayout ($substLetter + ":\") "Steam"        $true
+}
+
+$findDriver = Join-Path $prodRoot "drive_find.ps1"
+WriteText $findDriver @'
+param([string]$Prefix, [string]$PF = "NONE", [string]$PFX86 = "NONE")
+$ErrorActionPreference = "Stop"
+# "NONE" is the no-root sentinel, for the same -File argument-binding reason
+# Group R's driver documents.
+if ($PF    -eq "NONE") { $PF    = "" }
+if ($PFX86 -eq "NONE") { $PFX86 = "" }
+$env:ProgramFiles        = $PF
+${env:ProgramFiles(x86)} = $PFX86
+# The SHIPPED text, cut at the dispatch marker. Find-KenshiInstalls is NOT
+# stubbed here - the walk under test is the real one.
+. $Prefix
+$found = @(Find-KenshiInstalls)
+foreach ($c in $found) { Write-Host ("FOUND=" + $c) }
+Write-Host ("COUNT=" + $found.Count)
+exit 0
+'@
+
+function Run-Find([string]$prefixPath, [string]$pf, [string]$pfx86) {
+    $ErrorActionPreference = "Continue"
+    if (-not $pf)    { $pf    = "NONE" }
+    if (-not $pfx86) { $pfx86 = "NONE" }
+    $out = @(& powershell -NoProfile -ExecutionPolicy Bypass -File $findDriver -Prefix $prefixPath -PF $pf -PFX86 $pfx86 2>&1 | ForEach-Object { "$_" })
+    $hits = @()
+    foreach ($line in $out) {
+        $m = [regex]::Match($line, '^FOUND=(.+)$')
+        if ($m.Success) { $hits += $m.Groups[1].Value.TrimEnd('\', '/') }
+    }
+    return @{ exit = $LASTEXITCODE; text = ($out -join "`n"); hits = @($hits) }
+}
+function HitCount($res, [string]$path) {
+    if (-not $path) { return 0 }
+    $want = $path.TrimEnd('\', '/')
+    return @($res.hits | Where-Object { $_ -eq $want }).Count
+}
+
+# S-A: a good %ProgramFiles% root and a %ProgramFiles(x86)% root whose Kenshi
+# folder exists but holds no executable.
+$sa = Run-Find $prefixGood $pfGood $pfNoExe
+Check "S1 the REAL walk finds a Kenshi under %ProgramFiles%" `
+    ($sa.exit -eq 0 -and (HitCount $sa $pfGoodHit) -eq 1)
+Check "S5 a Kenshi-shaped folder with NO kenshi_x64.exe is not a candidate" `
+    ((HitCount $sa $pfNoExeHit) -eq 0)
+Check "S3 the walk finds <drive>\SteamLibrary\steamapps\common\Kenshi on a real ready drive" `
+    ($substOk -and (HitCount $sa $substLibHit) -eq 1)
+Check "S4 the walk finds <drive>\Steam\steamapps\common\Kenshi on that same drive" `
+    ($substOk -and (HitCount $sa $substSteamHit) -eq 1)
+
+# S-B: only the x86 root carries an install.
+$sb = Run-Find $prefixGood "" $pfx86Good
+Check "S2 the REAL walk finds a Kenshi under %ProgramFiles(x86)%" `
+    ($sb.exit -eq 0 -and (HitCount $sb $pfx86GoodHit) -eq 1)
+Check "S2b with no %ProgramFiles% set, that root contributes nothing (no crash, no empty-path hit)" `
+    ((HitCount $sb $pfGoodHit) -eq 0 -and $sb.text -notmatch "FOUND=$")
+
+# S-C: the SAME install reachable through both roots must be returned once.
+$sc = Run-Find $prefixGood $pfGood $pfGood
+Check "S6 an install reachable through two roots is de-duplicated to one candidate" `
+    ($sc.exit -eq 0 -and (HitCount $sc $pfGoodHit) -eq 1)
+
+# S7/S8 - mutations. One root form removed at a time; the matching candidate
+# must vanish while the others stay, so the check is attributable.
+function New-ProducerMutant([string]$name, [string]$needle) {
+    $path = Join-Path $prodRoot $name
+    $body = $instText.Substring(0, [Math]::Max($cut, 0))
+    $lines = @($body -split "`r?`n" | Where-Object { $_ -notmatch [regex]::Escape($needle) })
+    WriteText $path ($lines -join "`r`n")
+    return $path
+}
+$mutNoPf = New-ProducerMutant "prefix_no_programfiles.ps1" '$roots += (Join-Path $env:ProgramFiles "Steam\steamapps\common\Kenshi")'
+$s7 = Run-Find $mutNoPf $pfGood $pfNoExe
+Check "S7 removing the %ProgramFiles% root drops exactly that candidate" `
+    ((HitCount $s7 $pfGoodHit) -eq 0)
+Check "S7b and leaves the drive-walk candidates untouched (the mutation is targeted)" `
+    ($substOk -and (HitCount $s7 $substLibHit) -eq 1 -and (HitCount $s7 $substSteamHit) -eq 1)
+
+$mutNoLib = New-ProducerMutant "prefix_no_steamlibrary.ps1" '$roots += (Join-Path $d.Name "SteamLibrary\steamapps\common\Kenshi")'
+$s8 = Run-Find $mutNoLib $pfGood $pfNoExe
+Check "S8 removing the SteamLibrary drive root drops exactly that candidate" `
+    ($substOk -and (HitCount $s8 $substLibHit) -eq 0)
+Check "S8b and leaves <drive>\Steam and the %ProgramFiles% candidate untouched" `
+    ($substOk -and (HitCount $s8 $substSteamHit) -eq 1 -and (HitCount $s8 $pfGoodHit) -eq 1)
+
+if ($substOk) {
+    & cmd.exe /c "subst $substLetter`: /D" 2>&1 | Out-Null
+    Check "S9 the virtual drive was removed again (the machine is left as found)" `
+        (-not (Test-Path -LiteralPath ($substLetter + ":\")))
+}
+
 # ======================================================================= A ===
 Write-Host ""
 Write-Host "-- GROUP A: freshinstall_check.ps1's refusals --"
@@ -429,24 +576,45 @@ function Get-Verdict([string]$file) {
 
 $vReal = Get-Verdict $blockersDoc
 Check "D2 make_mod_kit.ps1 derives a verdict from the blockers file" ($vReal -ne $null)
-Check "D3 at least one blocker is OPEN today, so this build is not shippable" `
-    ($vReal -ne $null -and @($vReal.releaseBlockers).Count -ge 1 -and $vReal.shippable -eq $false)
+# D3 used to require that at least one blocker be open. That froze the gate at
+# one of its two verdicts: closing the last row would have turned a genuine
+# CLOSURE into a test failure, exactly the way D4 once froze WINDOWS-19 open.
+# The property worth asserting is that shippable TRACKS the file - computed here
+# from this suite's own independent parse of the open table, so agreement means
+# two readers agreed rather than one reader repeating itself.
+# (D5-D8 keep proving the verdict flips both ways on synthetic files.)
+$openTableIds = @()
+$inOpen = $false
+foreach ($line in (Get-Content -Path $blockersDoc)) {
+    if ($line -match '^\s*##\s') { $inOpen = ($line -match '(?i)open blockers') }
+    if (-not $inOpen) { continue }
+    if ($line -notmatch '^\|\s*([A-Z][A-Z0-9-]+)\s*\|') { continue }
+    # The HEADER row is not a blocker. It matched the id pattern, and while D4
+    # only asked "is every reported id in the file" that was harmless; asserting
+    # set EQUALITY exposes it, and a parser that counts "ID" as an open row can
+    # never see an empty table. The shipped parser skips it the same way.
+    if ($Matches[1] -eq "ID") { continue }
+    $openTableIds += $Matches[1]
+}
+Check ("D3 shippable tracks the open table, independently parsed (open rows here: " + `
+       $(if (@($openTableIds).Count -eq 0) { "none" } else { @($openTableIds) -join ',' }) + ")") `
+    ($vReal -ne $null -and $vReal.shippable -eq (@($openTableIds).Count -eq 0))
 # D4 used to pin WINDOWS-19 into the open set. That made a genuine FIX read as a
 # test failure, which is backwards: this check exists to prove the id list is
 # READ OUT of the file rather than invented, not to freeze which ids are open.
 # Assert the property instead - every id the verdict reports must actually appear
 # in the blockers document's open table.
-$openTableIds = @()
-foreach ($line in (Get-Content -Path $blockersDoc)) {
-    if ($line -match '^\s*##\s') { $inOpen = ($line -match '(?i)open blockers') }
-    if ($inOpen -and $line -match '^\|\s*([A-Z][A-Z0-9-]+)\s*\|') { $openTableIds += $Matches[1] }
-}
 $derived = $true
 if ($vReal -eq $null) { $derived = $false }
-else { foreach ($id in @($vReal.releaseBlockers)) { if ($openTableIds -notcontains $id) { $derived = $false } } }
-Check ("D4 every reported open id is read out of the blockers file (reported: " + `
-       ((@($vReal.releaseBlockers)) -join ',') + ")") `
-    ($derived -and @($vReal.releaseBlockers).Count -ge 1)
+else {
+    # Set equality, both directions: no reported id may be absent from the
+    # document, and no open row in the document may be missing from the report.
+    foreach ($id in @($vReal.releaseBlockers)) { if ($openTableIds -notcontains $id) { $derived = $false } }
+    foreach ($id in @($openTableIds)) { if (@($vReal.releaseBlockers) -notcontains $id) { $derived = $false } }
+}
+Check ("D4 the reported open set EQUALS the blockers file's open table (reported: " + `
+       $(if (@($vReal.releaseBlockers).Count -eq 0) { "none" } else { (@($vReal.releaseBlockers)) -join ',' }) + ")") `
+    $derived
 # WINDOWS-19/-22 closed on 2026-09-12 (tools/test-runs/windows19_relink_fix.json).
 # Pin the direction that matters now: a CLOSED row must not be reported open.
 Check "D4b WINDOWS-19 is NOT reported open (it was fixed and measured closed)" `
