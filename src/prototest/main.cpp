@@ -47,6 +47,7 @@
 #include "../plugin/sync/SpeedVote.h"    // Phase 9 Plan 02 (CONS-02): N-player speed min-vote reduce
 #include "../plugin/sync/SaveCoord.h"    // Phase 10 Plan 01 (SAVE-01): per-client save coordinator
 #include "../plugin/sync/LoadCoord.h"    // Phase 10 Plan 01 (SAVE-02/SAVE-03): per-client load coordinator + arbiter
+#include "../plugin/sync/ExistenceVerdict.h" // Phase 12 Plan 03 (CENSUS-02/CENSUS-04): census existence/cull decision
 
 #include <map>
 #include <set>
@@ -4816,6 +4817,427 @@ static void testCellMap() {
     }
 }
 
+// ---- Phase 12 Plan 03 (CENSUS-02/CENSUS-04): census existence/cull decision --
+//
+// Under test: coop::existenceVerdict (src/plugin/sync/ExistenceVerdict.h), the
+// rule Replicator::enforceHostAuthority applies - in BOTH its near and its wide
+// existence pass - to every local body the host's census does not name.
+//
+// Every figure below was MEASURED by plan 12-02 in
+// tools/test-runs/20260912_055705_N3_repro (instrumented N=3 reproducer run,
+// three local Windows clones on loopback, both joins undeferred, no netsim).
+// They are not invented scenarios:
+//
+//   attnR    = 1000 u    attentionRadius_ - the radius the dormancy escape used
+//                        to ask, and the whole defect
+//   censusR  = 2000 u    censusRadius_ - the reach the host's census actually
+//                        claims (it publishes out to censusR * 1.25 = 2500 u)
+//   debounce = 75 frames SUPPRESS_AFTER_FRAMES
+//   DECIDE (cull skipped): n=528, dAttn 1004-2031 u, unstreak ALWAYS 0/75
+//   DROP   (cull taken):   n=5,   dAttn   72- 990 u, unstreak ALWAYS 75/75
+//     -> disjoint at exactly attnR = 1000
+//   the violating key hand=2,330200192,1,38,2395874048 ('Garru'): 316 decision
+//     samples, dAttn 1004-1941 u, vouchOwner=-1, censusRows=31, fresh=1,
+//     streamed=0, driven=0, unstreak=0/75 on every single one
+//   its herd-mate hand=1,780639680,1,38,2395874048 at dAttn=990: culled and
+//     converged. 14 u of anchor distance separated a reconciled body from a
+//     permanent census divergence.
+//
+// The census_convergence oracle judges out to censusRadius_ * 0.8 = 1600 u,
+// which is INSIDE the 1000-2500 u cull-free annulus - which is why the defect
+// is visible to it at all.
+//
+// Check groups below are kept visibly apart, and every check name carries its
+// group, so the mutation proof (plan 12-03 Task 3, docs/PHASE_12_GATE.md) can
+// count the decisive failures apart from the ones that must never move.
+
+static const float        EV_ATTN_R   = 1000.0f;  // attentionRadius_
+static const float        EV_CENSUS_R = 2000.0f;  // censusRadius_
+static const unsigned int EV_SUPPRESS = 75u;      // SUPPRESS_AFTER_FRAMES
+
+// The inputs as enforceHostAuthority hands them over for a census-absent,
+// unstreamed, undriven body standing on ground a fresh census covers.
+static coop::ExistenceInputs evBase() {
+    coop::ExistenceInputs in;
+    in.censusFresh   = true;
+    in.censusHasAny  = false;
+    in.streamed      = false;
+    in.driven        = false;
+    in.observedAttn  = false;
+    in.dClaimAnchor  = 0.0f;
+    in.censusRadius  = EV_CENSUS_R;
+    in.unstreamed    = 0u;
+    in.suppressAfter = EV_SUPPRESS;
+    in.suppressed    = false;
+    return in;
+}
+
+// One body in one join's local world, as the geometry hands it to the decision.
+// dAnchor answers BOTH the attention question and the claim-reach question from
+// the same anchor set, because that is what the measured runs did: anchors=4/4
+// on all 1925 diagnostic lines, i.e. the zone veto dropped nothing, so
+// attentionAnchors and interestAnchors were the same four points.
+struct EvBody {
+    const char* name;
+    float       dAnchor;
+    bool        vouched;   // a fresh census slice names this body
+};
+
+// A faithful miniature of enforceHostAuthority's per-body bookkeeping: one
+// streak per body, reset by KEEP and by DORMANT, advanced by COUNT and CULL,
+// and a culled body stays suppressed. observedAt is consulted only when the
+// body is not otherwise corroborated - the same ordering the production call
+// site keeps, because observedAt latches per-key hysteresis.
+static void evRunWorld(const EvBody* bodies, unsigned int n, unsigned int ticks,
+                       bool* outCulled) {
+    const unsigned int EV_MAX = 8u;
+    unsigned int streak[EV_MAX];
+    bool         supp[EV_MAX];
+    if (n > EV_MAX) n = EV_MAX;
+    for (unsigned int i = 0; i < n; ++i) {
+        streak[i] = 0u; supp[i] = false; outCulled[i] = false;
+    }
+    for (unsigned int t = 0; t < ticks; ++t) {
+        for (unsigned int i = 0; i < n; ++i) {
+            coop::ExistenceInputs in = evBase();
+            in.censusHasAny = bodies[i].vouched;
+            in.dClaimAnchor = bodies[i].dAnchor;
+            in.unstreamed   = streak[i];
+            in.suppressed   = supp[i];
+            in.observedAttn = false;
+            if (!coop::existenceHolds(in))
+                in.observedAttn = (bodies[i].dAnchor <= EV_ATTN_R);
+            coop::ExistenceOutcome ev = coop::existenceVerdict(in);
+            if (ev == coop::EXIST_KEEP || ev == coop::EXIST_DORMANT) streak[i] = 0u;
+            else if (streak[i] < 1000000u) ++streak[i];
+            if (ev == coop::EXIST_CULL) { supp[i] = true; outCulled[i] = true; }
+        }
+    }
+}
+
+static void testExistenceVerdict() {
+    std::printf("\n== census existence/cull decision (Phase 12 Plan 03, "
+                "CENSUS-02/CENSUS-04) ==\n");
+
+    // The interleaving plan 12-02 measured. The host's census is complete and
+    // fresh on BOTH joins (censusOwners=1/1, censusRows=31,
+    // oldestOwnerAgeMs<1 s); what differs is that ONE join's local world holds
+    // a wandering herd member inside the 1000-2500 u annulus that the host's
+    // world does not - the "never shared" path, where the host pushes a
+    // distinct save snapshot per connect (distinct fingerprints in 7 of 7 runs)
+    // and a squad present in one join's loaded world walks into the annulus.
+    const EvBody worldAnnulus[3] = {
+        { "garru-annulus",  1004.0f, false },  // the violating key
+        { "garru-herdmate",  990.0f, false },  // 14 u away, culled pre-fix too
+        { "town-npc",        420.0f, true  }   // vouched, must stay
+    };
+    const EvBody worldClean[3] = {
+        { "town-npc",        420.0f, true  },
+        { "guard",           180.0f, true  },
+        { "far-wanderer",   2600.0f, false }   // beyond the claim reach entirely
+    };
+
+    // ======================= DECISIVE GROUP ==================================
+    // These must FAIL against the pre-fix decision and PASS with the fix. They
+    // are the CENSUS-04 claim: not "tests added and passing" but "these checks
+    // fail against pre-fix behavior, and here is the number".
+
+    {   // The observed violating key, at both ends of its measured range.
+        coop::ExistenceInputs in = evBase();
+        in.dClaimAnchor = 1004.0f;          // 4 u outside attnR, deep inside censusR
+        in.observedAttn = false;            // observedAt said no: dAttn > attnR
+        CHECK("census-existence decisive: the observed violating key "
+              "(dAttn=1004, census-absent, fresh census) is NOT dormant",
+              coop::existenceVerdict(in) != coop::EXIST_DORMANT);
+
+        in.dClaimAnchor = 1941.0f;          // the far end of that key's range
+        CHECK("census-existence decisive: the far end of the observed annulus "
+              "(dAttn=1941) is NOT dormant",
+              coop::existenceVerdict(in) != coop::EXIST_DORMANT);
+    }
+
+    {   // The debounce must be REACHABLE in the annulus, not merely advanced.
+        coop::ExistenceInputs in = evBase();
+        in.dClaimAnchor = 1004.0f;
+        in.observedAttn = false;
+        in.unstreamed   = EV_SUPPRESS - 1u;  // the 75th consecutive absent tick
+        CHECK("census-existence decisive: the annulus body culls on the "
+              "debounce tick (unstreak 74 -> 75/75)",
+              coop::existenceVerdict(in) == coop::EXIST_CULL);
+    }
+
+    {   // 75 ticks of the real loop, not a single-shot verdict. Pre-fix the
+        // escape reset the streak every tick, so this can never arrive.
+        bool culled[3];
+        evRunWorld(worldAnnulus, 3u, EV_SUPPRESS, culled);
+        CHECK("census-existence decisive: 75 ticks in the annulus reach the "
+              "cull (the debounce advances instead of resetting every tick)",
+              culled[0]);
+        CHECK("census-existence decisive: the 14 u Garru pair converge "
+              "TOGETHER (dAttn=990 and dAttn=1004 both cull)",
+              culled[0] && culled[1]);
+    }
+
+    {   // The claim boundary itself: a body at exactly censusRadius_ is on
+        // ground the publisher spoke for.
+        coop::ExistenceInputs in = evBase();
+        in.dClaimAnchor = EV_CENSUS_R;       // 2000 u
+        in.observedAttn = false;
+        CHECK("census-existence decisive: a body at exactly censusRadius "
+              "(2000 u) is inside the claim and is NOT dormant",
+              coop::existenceVerdict(in) != coop::EXIST_DORMANT);
+    }
+
+    {   // SYMMETRY - the pair flip encoded as a test. The predicate names no
+        // join identity, so whichever join's world holds the annulus body must
+        // be the one that culls it. Four FAIL runs showed victims join2, join1,
+        // join1, join1; a fix that rescues only one join fails here.
+        bool a1[3], a2[3], b1[3], b2[3];
+        evRunWorld(worldAnnulus, 3u, EV_SUPPRESS, a1);   // orientation A: join1 holds it
+        evRunWorld(worldClean,   3u, EV_SUPPRESS, a2);
+        evRunWorld(worldClean,   3u, EV_SUPPRESS, b1);   // orientation B: worlds exchanged
+        evRunWorld(worldAnnulus, 3u, EV_SUPPRESS, b2);
+        CHECK("census-existence decisive: symmetry orientation A - join1 holds "
+              "the annulus body and culls it, join2 culls nothing",
+              a1[0] && !a2[0] && !a2[1] && !a2[2]);
+        CHECK("census-existence decisive: symmetry orientation B - the two "
+              "joins' worlds exchanged, join2 culls it, join1 culls nothing",
+              b2[0] && !b1[0] && !b1[1] && !b1[2]);
+    }
+
+    {   // ORDERING-INDEPENDENCE - within one window the outcome must not depend
+        // on which body the implementation happened to reach first.
+        const EvBody fwd[3] = { worldAnnulus[0], worldAnnulus[1], worldAnnulus[2] };
+        const EvBody rev[3] = { worldAnnulus[2], worldAnnulus[1], worldAnnulus[0] };
+        bool cf[3], cr[3];
+        evRunWorld(fwd, 3u, EV_SUPPRESS, cf);
+        evRunWorld(rev, 3u, EV_SUPPRESS, cr);
+        CHECK("census-existence decisive: order-independence - forward body "
+              "order reaches the cull",
+              cf[0] && cf[1] && !cf[2]);
+        CHECK("census-existence decisive: order-independence - reversed body "
+              "order reaches the same cull",
+              cr[2] && cr[1] && !cr[0]);
+    }
+
+    // ==================== NO-REGRESSION GROUP ================================
+    // These must PASS both before and after the fix. They pin what the fix is
+    // NOT allowed to change: who may be culled, and the fail-open behavior that
+    // keeps census silence from being read as a claim (threats T-12-07/T-12-08).
+
+    {
+        coop::ExistenceInputs in = evBase();
+        in.streamed = true; in.dClaimAnchor = 1500.0f;
+        CHECK("census-existence no-regression: a streamed body is kept",
+              coop::existenceVerdict(in) == coop::EXIST_KEEP);
+
+        in = evBase(); in.driven = true; in.dClaimAnchor = 1500.0f;
+        CHECK("census-existence no-regression: a driven body is kept",
+              coop::existenceVerdict(in) == coop::EXIST_KEEP);
+
+        in = evBase(); in.censusHasAny = true; in.dClaimAnchor = 2014.0f;
+        CHECK("census-existence no-regression: a fresh census vouch keeps the "
+              "body (the measured KEEP at dAttn=2014, vouchOwner=0)",
+              coop::existenceVerdict(in) == coop::EXIST_KEEP);
+    }
+
+    {   // The single-join case and the legacy near-pass cull.
+        coop::ExistenceInputs in = evBase();
+        in.dClaimAnchor = 500.0f; in.observedAttn = true;
+        in.unstreamed   = EV_SUPPRESS - 1u;
+        CHECK("census-existence no-regression: single join - an ATTENDED "
+              "census-absent body still culls after the debounce",
+              coop::existenceVerdict(in) == coop::EXIST_CULL);
+
+        in = evBase();
+        in.censusFresh = false; in.observedAttn = true;
+        in.dClaimAnchor = 500.0f; in.unstreamed = EV_SUPPRESS - 1u;
+        CHECK("census-existence no-regression: with NO fresh census the legacy "
+              "streamed-only cull is still reachable inside attention",
+              coop::existenceVerdict(in) == coop::EXIST_CULL);
+    }
+
+    {   // Sequential, well-separated arrival: bodies genuinely beyond the
+        // publisher's claim stay dormant. This is the property that stops the
+        // fix from being a blanket "cull everything the census omits".
+        coop::ExistenceInputs in = evBase();
+        in.dClaimAnchor = 2600.0f; in.observedAttn = false;
+        CHECK("census-existence no-regression: a body beyond the claim reach "
+              "(2600 u) stays dormant - census silence there is a gap, not a "
+              "statement",
+              coop::existenceVerdict(in) == coop::EXIST_DORMANT);
+
+        in.dClaimAnchor = EV_CENSUS_R + 1.0f;
+        CHECK("census-existence no-regression: one unit past censusRadius is "
+              "already outside the claim",
+              coop::existenceVerdict(in) == coop::EXIST_DORMANT);
+    }
+
+    {   // DEPARTED OWNER. A peer that leaves stops refreshing its slice; its
+        // silence must never become a cull order (T-12-07, T-12-08).
+        coop::ExistenceInputs in = evBase();
+        in.censusFresh = false; in.dClaimAnchor = 1500.0f; in.observedAttn = false;
+        CHECK("census-existence no-regression: departed owner - no fresh census "
+              "leaves an unattended body dormant (fail open)",
+              coop::existenceVerdict(in) == coop::EXIST_DORMANT);
+
+        in = evBase();
+        in.censusFresh = false; in.censusHasAny = true;   // a STALE vouch
+        in.observedAttn = true; in.dClaimAnchor = 500.0f;
+        in.unstreamed = EV_SUPPRESS - 1u;
+        CHECK("census-existence no-regression: departed owner - a STALE vouch "
+              "cannot keep a body alive (an unfresh claim vouches for nothing)",
+              coop::existenceVerdict(in) != coop::EXIST_KEEP);
+    }
+
+    {   // Degenerate inputs the caller can genuinely produce.
+        coop::ExistenceInputs in = evBase();
+        in.dClaimAnchor = -1.0f; in.observedAttn = false;   // startup: no anchors yet
+        CHECK("census-existence no-regression: with no anchors resolved the "
+              "world is not declared cullable (startup fail-open)",
+              coop::existenceVerdict(in) == coop::EXIST_DORMANT);
+
+        in = evBase();
+        in.censusRadius = 0.0f; in.dClaimAnchor = 500.0f; in.observedAttn = false;
+        CHECK("census-existence no-regression: census disabled (radius 0) "
+              "leaves the unattended body dormant",
+              coop::existenceVerdict(in) == coop::EXIST_DORMANT);
+
+        in = evBase();
+        in.suppressed = true; in.observedAttn = true;
+        in.dClaimAnchor = 500.0f; in.unstreamed = 1000u;
+        CHECK("census-existence no-regression: an already-suppressed body "
+              "never re-culls",
+              coop::existenceVerdict(in) == coop::EXIST_COUNT);
+
+        bool none[1]; none[0] = true;   // poisoned: a no-op must not write it
+        evRunWorld(worldClean, 0u, EV_SUPPRESS, none);
+        CHECK("census-existence no-regression: an empty world is a no-op "
+              "(no body judged, no output written)", none[0]);
+    }
+
+    {   // The symmetry and ordering properties as pure EQUALITIES - these hold
+        // before the fix too (the pre-fix rule is identity-free and
+        // order-free), so they belong here, not in the decisive group. Their
+        // decisive counterparts above assert the OUTCOME, which is what a
+        // one-sided fix would break.
+        bool a1[3], b2[3], cf[3], cr[3];
+        evRunWorld(worldAnnulus, 3u, EV_SUPPRESS, a1);
+        evRunWorld(worldAnnulus, 3u, EV_SUPPRESS, b2);
+        CHECK("census-existence no-regression: exchanging the two joins' "
+              "worlds mirrors the outcome vector exactly",
+              a1[0] == b2[0] && a1[1] == b2[1] && a1[2] == b2[2]);
+
+        const EvBody rev[3] = { worldAnnulus[2], worldAnnulus[1], worldAnnulus[0] };
+        evRunWorld(worldAnnulus, 3u, EV_SUPPRESS, cf);
+        evRunWorld(rev,          3u, EV_SUPPRESS, cr);
+        CHECK("census-existence no-regression: forward and reversed iteration "
+              "give per-key identical outcomes",
+              cf[0] == cr[2] && cf[1] == cr[1] && cf[2] == cr[0]);
+    }
+
+    // ======================== BOUNDS GROUP ===================================
+    // Totality and safety. The decision is handed inputs from a remote peer's
+    // traffic (T-12-07) and gates local culling (T-12-08), so it must return a
+    // defined outcome for everything it can be handed, allocate nothing, and
+    // never widen who may be culled.
+
+    {
+        coop::ExistenceInputs in = evBase();
+        in.suppressAfter = 0u; in.observedAttn = true; in.unstreamed = 0u;
+        CHECK("census-existence bounds: a zero debounce threshold culls "
+              "immediately and does not underflow",
+              coop::existenceVerdict(in) == coop::EXIST_CULL);
+
+        in = evBase();
+        in.observedAttn = true; in.unstreamed = 1000000u;
+        CHECK("census-existence bounds: a saturated streak (1000000) still "
+              "culls rather than wrapping past the threshold",
+              coop::existenceVerdict(in) == coop::EXIST_CULL);
+    }
+
+    {
+        coop::ExistenceInputs in = evBase();
+        in.dClaimAnchor = EV_CENSUS_R;
+        CHECK("census-existence bounds: the claim boundary is inclusive at "
+              "exactly censusRadius", coop::claimCovers(in));
+        in.dClaimAnchor = EV_CENSUS_R + 0.01f;
+        CHECK("census-existence bounds: one hundredth of a unit past "
+              "censusRadius is outside the claim", !coop::claimCovers(in));
+
+        in = evBase(); in.censusRadius = -1.0f; in.dClaimAnchor = 10.0f;
+        bool negR = !coop::claimCovers(in);
+        in = evBase(); in.dClaimAnchor = -5.0f;
+        bool negD = !coop::claimCovers(in);
+        CHECK("census-existence bounds: a negative radius and a negative "
+              "anchor distance both fail OPEN", negR && negD);
+    }
+
+    {   // Duplicate keys in one batch: the decision is pure, so the same inputs
+        // twice give the same answer (a batch full of repeats cannot drive
+        // divergent work - T-12-09).
+        coop::ExistenceInputs in = evBase();
+        in.dClaimAnchor = 1004.0f; in.unstreamed = 30u;
+        coop::ExistenceOutcome first  = coop::existenceVerdict(in);
+        coop::ExistenceOutcome second = coop::existenceVerdict(in);
+        coop::ExistenceInputs copy = in;
+        coop::ExistenceOutcome third = coop::existenceVerdict(copy);
+        CHECK("census-existence bounds: duplicate rows get byte-identical "
+              "verdicts (the decision is pure)",
+              first == second && second == third);
+    }
+
+    {   // Exhaustive totality over everything the decision reads: 6 booleans x
+        // 8 anchor distances (including the negative sentinel and both sides of
+        // both radii) x 3 radii x 3 streaks x 2 thresholds = 9216 evaluations.
+        const float dists[8] = { -1.0f, 0.0f, 999.0f, 1000.0f,
+                                 1500.0f, 2000.0f, 2001.0f, 2600.0f };
+        const float radii[3] = { -1.0f, 0.0f, 2000.0f };
+        const unsigned int streaks[3] = { 0u, 74u, 1000000u };
+        const unsigned int thresholds[2] = { 0u, 75u };
+        bool allDefined = true, neverCullSuppressed = true, keepNeverCulled = true;
+        unsigned int evaluated = 0u;
+        for (unsigned int bits = 0u; bits < 64u; ++bits) {
+            for (unsigned int di = 0; di < 8u; ++di) {
+                for (unsigned int ri = 0; ri < 3u; ++ri) {
+                    for (unsigned int si = 0; si < 3u; ++si) {
+                        for (unsigned int ti = 0; ti < 2u; ++ti) {
+                            coop::ExistenceInputs in;
+                            in.censusFresh   = (bits & 1u)  != 0u;
+                            in.censusHasAny  = (bits & 2u)  != 0u;
+                            in.streamed      = (bits & 4u)  != 0u;
+                            in.driven        = (bits & 8u)  != 0u;
+                            in.observedAttn  = (bits & 16u) != 0u;
+                            in.suppressed    = (bits & 32u) != 0u;
+                            in.dClaimAnchor  = dists[di];
+                            in.censusRadius  = radii[ri];
+                            in.unstreamed    = streaks[si];
+                            in.suppressAfter = thresholds[ti];
+                            coop::ExistenceOutcome ev = coop::existenceVerdict(in);
+                            ++evaluated;
+                            if (ev != coop::EXIST_KEEP && ev != coop::EXIST_DORMANT &&
+                                ev != coop::EXIST_COUNT && ev != coop::EXIST_CULL)
+                                allDefined = false;
+                            if (in.suppressed && ev == coop::EXIST_CULL)
+                                neverCullSuppressed = false;
+                            if (coop::existenceHolds(in) && ev != coop::EXIST_KEEP)
+                                keepNeverCulled = false;
+                        }
+                    }
+                }
+            }
+        }
+        CHECK_EQ("census-existence bounds: totality sweep evaluated every "
+                 "input combination", evaluated, 9216u);
+        CHECK("census-existence bounds: totality - every combination returns "
+              "one of the four defined outcomes", allDefined);
+        CHECK("census-existence bounds: totality - an already-suppressed body "
+              "is never culled, for any input", neverCullSuppressed);
+        CHECK("census-existence bounds: totality - a corroborated body is "
+              "never culled, for any geometry", keepNeverCulled);
+    }
+}
+
 int main() {
     std::printf("prototest: KenshiCoop wire/hash/interp unit layer (protocol v%u)\n",
                 (unsigned)PROTOCOL_VERSION);
@@ -4830,6 +5252,7 @@ int main() {
     testXferCommit();
     testClaimArbiter();
     testCellMap();
+    testExistenceVerdict();
     testMoneyFold();
     testSaveCoord();
     testLoadCoord();
