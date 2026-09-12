@@ -192,14 +192,18 @@ inline bool claimCovers(const ExistenceInputs& in) {
 inline ExistenceOutcome existenceVerdict(const ExistenceInputs& in) {
     if (existenceHolds(in)) return EXIST_KEEP;
 
-    // --- PRE-FIX SEMANTICS (Phase 12 Plan 03 Task 1 RED baseline) ------------
-    // This is the branch as it shipped before this plan, modelled faithfully so
-    // prototest can be shown to FAIL against it: the dormancy escape asks ONLY
-    // the attention gate, so every census-absent body outside attentionRadius_
-    // escapes the cull and has its debounce reset, forever. Task 2 replaces
-    // this single line with the claim-reach conjunct.
-    if (!in.observedAttn) return EXIST_DORMANT;
-    // ------------------------------------------------------------------------
+    // THE DORMANCY ESCAPE, FIXED. Silence only means "this body does not
+    // exist" on ground somebody is speaking for. Two independent ways to be
+    // spoken for, and it takes BOTH being absent to make a body dormant:
+    // somebody local is ATTENDING it (observedAttn, attentionRadius_), or the
+    // publisher's census CLAIM reaches it (claimCovers, censusRadius_).
+    //
+    // The pre-Phase-12 line was `if (!in.observedAttn) return EXIST_DORMANT;`
+    // - the claim-reach conjunct is the entire fix, and reverting exactly this
+    // line is the mutation recorded in docs/PHASE_12_GATE.md. It flips the
+    // 1000 u < d <= 2000 u annulus from permanently cull-free (debounce reset
+    // every tick, cull unreachable) to ordinarily judged.
+    if (!in.observedAttn && !claimCovers(in)) return EXIST_DORMANT;
 
     // Already hidden: keep counting the absence (so the restore dwell has a
     // symmetric streak to work against) but never re-issue the cull.

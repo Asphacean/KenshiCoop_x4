@@ -34,6 +34,7 @@
 #include "CellMap.h"      // Phase 8 Plan 02 (WORLD-03): host-side cell-claim-map reduce
 #include "MoneyFold.h"    // Phase 9 Plan 01 (CONS-01): shared-money-pool arbiter
 #include "SpeedVote.h"    // Phase 9 Plan 02 (CONS-02): N-player speed min-vote reduce
+#include "ExistenceVerdict.h" // Phase 12 Plan 03 (CENSUS-02): census existence/cull decision
 
 class GameWorld;
 class Character;
@@ -2979,13 +2980,19 @@ private:
     //
     // `verdict` is one of the greppable words DECIDE (judged, cull skipped),
     // DROP (culled) or KEEP (host vouches, body kept); `pass` is near or wide.
+    //
+    // Phase 12 plan 03 appended dClaimAnchor - the distance to the nearest RAW
+    // interest anchor, which is the half of the dormancy verdict censusR is now
+    // compared against. Pass -1 where the caller did not compute it (the
+    // corroborated paths never ask the dormancy question). It prints LAST, so
+    // every field position plan 02's trace already emitted is unchanged.
     void logCensusDecision(const char* verdict, const char* pass,
                            const Key& k, Character* c, const EntityState& st,
                            bool censusFresh, bool streamed, bool driven,
                            bool exists, bool observed,
                            const float* attnAnch, unsigned int nAttnAnch,
                            unsigned int nRawAnch, unsigned int unstreak,
-                           unsigned int suppressAfter);
+                           unsigned int suppressAfter, float dClaimAnchor);
     // Where the PEER is: one center per squad tab we do NOT own, plus their
     // camera hint. No zone veto - the veto asks "can I enumerate here", and by
     // the time this is consulted we have already enumerated the body. Writes up

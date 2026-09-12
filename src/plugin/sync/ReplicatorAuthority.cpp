@@ -27,6 +27,30 @@ bool censusDbgOn() {
     }
     return on == 1;
 }
+
+// Distance from a body to the NEAREST raw interest anchor, or -1 when no
+// anchor resolved. These are engine::interestAnchors' points, which ARE
+// engine::interestCenters' points (interestAnchors is a thin float-array
+// wrapper around it), and interestCenters is what publishNpcCensus enumerates
+// its census from - so this distance, compared against censusRadius_, is the
+// receiver's honest answer to "is this ground the publisher speaks for?".
+// Deliberately NOT the attention-anchor set: attentionAnchors drops anchors
+// whose zone this client has not loaded, which is the right filter for "is
+// anyone here looking" and the wrong one for "did the publisher enumerate
+// here" - the publisher's reach does not shrink because the receiver has not
+// loaded a zone. At most 4 anchors, no allocation, called only on the
+// non-corroborated path (Phase 12 T-12-09).
+float nearestAnchorDist(const float* anchors, unsigned int nAnchor,
+                        float x, float y, float z) {
+    if (!anchors || nAnchor == 0) return -1.0f;
+    float best = -1.0f;
+    for (unsigned int a = 0; a < nAnchor; ++a) {
+        float d = dist3(x, y, z, anchors[a * 3 + 0], anchors[a * 3 + 1],
+                        anchors[a * 3 + 2]);
+        if (best < 0.0f || d < best) best = d;
+    }
+    return best;
+}
 } // namespace
 
 // See the declaration doc comment in Replicator.h. DIAGNOSTIC ONLY: this
@@ -39,7 +63,8 @@ void Replicator::logCensusDecision(const char* verdict, const char* pass,
                                    bool observed, const float* attnAnch,
                                    unsigned int nAttnAnch, unsigned int nRawAnch,
                                    unsigned int unstreak,
-                                   unsigned int suppressAfter) {
+                                   unsigned int suppressAfter,
+                                   float dClaimAnchor) {
     // Per-verdict budget. enforceHostAuthority walks up to NPC_CENSUS_MAX
     // bodies EVERY tick, so a flat cap shared across verdicts would let the
     // common KEEP case starve the DECIDE rows this trace exists to capture.
@@ -85,19 +110,25 @@ void Replicator::logCensusDecision(const char* verdict, const char* pass,
         if (dAttn < 0.0f || d < dAttn) dAttn = d;
     }
     char nm[40]; engine::charName(c, nm, sizeof(nm));
-    char b[400];
+    char b[432];
+    // dClaim is the OTHER half of the dormancy verdict as of Phase 12 plan 03:
+    // distance to the nearest RAW interest anchor, which is what censusR is now
+    // compared against. -1 means the caller did not compute it on this path
+    // (the body was corroborated, so the dormancy question was never asked).
+    // Appended at the END so every field position plan 02's trace already
+    // printed is byte-unchanged.
     _snprintf(b, sizeof(b) - 1,
               "[census] %s pass=%s hand=%u,%u,%u,%u,%u name='%s' "
               "pos=%.0f,%.0f,%.0f vouchOwner=%ld censusOwners=%u/%u "
               "censusRows=%u fresh=%d oldestOwnerAgeMs=%lu streamed=%d "
               "driven=%d exists=%d observed=%d dAttn=%.0f attnR=%.0f "
-              "anchors=%u/%u unstreak=%u/%u censusR=%.0f",
+              "anchors=%u/%u unstreak=%u/%u censusR=%.0f dClaim=%.0f",
               verdict, pass, k.i, k.s, k.t, k.c, k.cs, nm,
               st.x, st.y, st.z, vouchOwner, ownersFresh,
               (unsigned)census_.size(), ownerRows, censusFresh ? 1 : 0,
               oldestAge, streamed ? 1 : 0, driven ? 1 : 0, exists ? 1 : 0,
               observed ? 1 : 0, dAttn, attentionRadius_, nAttnAnch, nRawAnch,
-              unstreak, suppressAfter, censusRadius_);
+              unstreak, suppressAfter, censusRadius_, dClaimAnchor);
     b[sizeof(b) - 1] = '\0'; coop::logLine(b);
 }
 
@@ -559,29 +590,51 @@ void Replicator::enforceHostAuthority(GameWorld* gw, u32 localId) {
         // may drift, but it EXISTS; only census-absent ghosts get hidden. With
         // no fresh census (hatch off / host lagging) the legacy streamed-only
         // behavior stands.
-        bool exists = streamed ||
-                      (censusFresh && censusHasAny(k));
         std::map<Key, Character*>::iterator s = suppressed_.find(k);
         AuthCount& ac = authCount_[k];
-        // Dormant and census-absent: neither client is speaking for this
-        // region, so there is nothing to judge. Hold the debounce at zero
-        // rather than letting it climb silently - when attention does arrive,
-        // the body gets a full SUPPRESS_AFTER_FRAMES to be corroborated
-        // instead of being hidden on the first frame someone looks at it.
-        // observedAt latches per-key hysteresis and counts attach flips, so it
-        // must still be called exactly once and ONLY when !exists - the
-        // short-circuit below is the original condition, split so the verdict
-        // can be traced without asking the predicate twice.
+        // The existence/cull rule itself lives in ExistenceVerdict.h and is
+        // CALLED from here, never copied: prototest's testExistenceVerdict
+        // covers that header exhaustively, and a second copy of the rule beside
+        // it would make every one of those checks vacuous (Phase 12 plan 03).
+        // Dormant and census-absent: NEITHER the local attention gate NOR the
+        // publisher's census claim reaches this body, so nobody is speaking for
+        // the region and there is nothing to judge. Hold the debounce at zero
+        // rather than letting it climb silently - when attention or the claim
+        // does arrive, the body gets a full SUPPRESS_AFTER_FRAMES to be
+        // corroborated instead of being hidden on the first frame someone looks
+        // at it. observedAt latches per-key hysteresis and counts attach flips,
+        // so it must still be called exactly once and ONLY when the body is
+        // otherwise uncorroborated - hence existenceHolds() first, then the
+        // latch, then the verdict, which is the order the predicate had before
+        // the rule moved out.
+        ExistenceInputs ein;
+        ein.censusFresh   = censusFresh;
+        ein.censusHasAny  = censusFresh && censusHasAny(k);
+        ein.streamed      = streamed;   // the near pass folds drive into this
+        ein.driven        = false;
+        ein.observedAttn  = false;
+        ein.dClaimAnchor  = -1.0f;
+        ein.censusRadius  = censusRadius_;
+        ein.unstreamed    = ac.unstreamed;
+        ein.suppressAfter = SUPPRESS_AFTER_FRAMES;
+        ein.suppressed    = (s != suppressed_.end());
+        const bool exists = existenceHolds(ein);
         bool observedNear = false;
-        if (!exists)
-            observedNear = observedAt(k, attnAnch, nAttnAnch,
-                                      states[i].x, states[i].y, states[i].z);
-        if (!exists && !observedNear) {
+        if (!exists) {
+            observedNear     = observedAt(k, attnAnch, nAttnAnch,
+                                          states[i].x, states[i].y, states[i].z);
+            ein.observedAttn = observedNear;
+            ein.dClaimAnchor = nearestAnchorDist(rawAnch, nRawAnch, states[i].x,
+                                                 states[i].y, states[i].z);
+        }
+        const ExistenceOutcome ev = existenceVerdict(ein);
+        if (ev == EXIST_DORMANT) {
             if (censusDbgOn())
                 logCensusDecision("DECIDE", "near", k, chars[i], states[i],
                                   censusFresh, streamed, false, exists,
                                   observedNear, attnAnch, nAttnAnch, nRawAnch,
-                                  ac.unstreamed, SUPPRESS_AFTER_FRAMES);
+                                  ac.unstreamed, SUPPRESS_AFTER_FRAMES,
+                                  ein.dClaimAnchor);
             ac.unstreamed = 0;
             continue;
         }
@@ -633,8 +686,10 @@ void Replicator::enforceHostAuthority(GameWorld* gw, u32 localId) {
         } else {
             // Host neither streams nor lists it (census-absent ghost): after
             // the debounce, hide + freeze so the local AI can't run a divergent
-            // copy on top of the host-driven world.
-            if (s == suppressed_.end() && ac.unstreamed >= SUPPRESS_AFTER_FRAMES) {
+            // copy on top of the host-driven world. EXIST_CULL is the header's
+            // answer to exactly "not suppressed already, and this tick's
+            // increment reaches SUPPRESS_AFTER_FRAMES".
+            if (ev == EXIST_CULL) {
                 // Phase 2 hardening: only RECORD the suppression when the engine
                 // call actually landed. A faulted hide used to be booked as done,
                 // leaving the body visible forever with no evidence - the silent
@@ -647,7 +702,8 @@ void Replicator::enforceHostAuthority(GameWorld* gw, u32 localId) {
                                           censusFresh, streamed, false, exists,
                                           observedNear, attnAnch, nAttnAnch,
                                           nRawAnch, ac.unstreamed,
-                                          SUPPRESS_AFTER_FRAMES);
+                                          SUPPRESS_AFTER_FRAMES,
+                                          ein.dClaimAnchor);
                     suppressed_[k] = chars[i];
                     ++authSuppresses_;
                     lifeSet(k, LIFE_CULLED, "suppress");
@@ -710,28 +766,49 @@ void Replicator::enforceHostAuthority(GameWorld* gw, u32 localId) {
                 continue;
             }
             if (driven && suppressed_.find(k) == suppressed_.end()) continue;
-            bool exists = censusHasAny(k) ||
-                          keep.find(k) != keep.end() || driven;
             std::map<Key, Character*>::iterator s = suppressed_.find(k);
             AuthCount& ac = authCount_[k];
-            // Dormancy, same as the near pass - and this is where it matters
-            // most. The wide pass reaches out to censusRadius_ (2000 u), far
-            // past anywhere either player is looking, so most of what it used
-            // to cull sat in regions nobody was watching at all.
-            // Same split as the near pass: one observedAt call, only when
-            // !exists, so the latch and the flip counter see exactly what they
-            // saw before the trace existed.
+            // Dormancy, same rule and the same header call as the near pass -
+            // and this is where it mattered. The wide pass reaches out to
+            // censusRadius_ (2000 u), far past anywhere either player is
+            // looking, and asking the ATTENTION radius (1000 u) here made the
+            // whole 1000-2500 u annulus permanently cull-free: every body there
+            // was skipped AND had its debounce reset, every tick, forever. That
+            // is the Phase 12 defect; ExistenceVerdict.h now asks the claim
+            // reach as well, which is what the publisher actually speaks for.
+            // Same split as the near pass: one observedAt call, only when the
+            // body is otherwise uncorroborated, so the latch and the flip
+            // counter see exactly what they saw before the trace existed.
+            ExistenceInputs ein;
+            ein.censusFresh   = censusFresh;   // true for the whole wide loop
+            ein.censusHasAny  = censusHasAny(k);
+            ein.streamed      = keep.find(k) != keep.end();
+            ein.driven        = driven;
+            ein.observedAttn  = false;
+            ein.dClaimAnchor  = -1.0f;
+            ein.censusRadius  = censusRadius_;
+            ein.unstreamed    = ac.unstreamed;
+            ein.suppressAfter = SUPPRESS_AFTER_FRAMES;
+            ein.suppressed    = (s != suppressed_.end());
+            const bool exists = existenceHolds(ein);
             bool observedWide = false;
-            if (!exists)
-                observedWide = observedAt(k, attnAnch, nAttnAnch,
-                                          wStates[i].x, wStates[i].y, wStates[i].z);
-            if (!exists && !observedWide) {
+            if (!exists) {
+                observedWide     = observedAt(k, attnAnch, nAttnAnch,
+                                              wStates[i].x, wStates[i].y,
+                                              wStates[i].z);
+                ein.observedAttn = observedWide;
+                ein.dClaimAnchor = nearestAnchorDist(rawAnch, nRawAnch,
+                                                     wStates[i].x, wStates[i].y,
+                                                     wStates[i].z);
+            }
+            const ExistenceOutcome ev = existenceVerdict(ein);
+            if (ev == EXIST_DORMANT) {
                 if (censusDbgOn())
                     logCensusDecision("DECIDE", "wide", k, wChars[i], wStates[i],
-                                      censusFresh, keep.find(k) != keep.end(),
+                                      censusFresh, ein.streamed,
                                       driven, exists, observedWide, attnAnch,
                                       nAttnAnch, nRawAnch, ac.unstreamed,
-                                      SUPPRESS_AFTER_FRAMES);
+                                      SUPPRESS_AFTER_FRAMES, ein.dClaimAnchor);
                 ac.unstreamed = 0;
                 continue;
             }
@@ -759,10 +836,11 @@ void Replicator::enforceHostAuthority(GameWorld* gw, u32 localId) {
                 if (s == suppressed_.end() && !driven) {
                     if (censusDbgOn())
                         logCensusDecision("KEEP", "wide", k, wChars[i], wStates[i],
-                                          censusFresh, keep.find(k) != keep.end(),
+                                          censusFresh, ein.streamed,
                                           driven, exists, /*observed*/ false,
                                           attnAnch, nAttnAnch, nRawAnch,
-                                          ac.unstreamed, SUPPRESS_AFTER_FRAMES);
+                                          ac.unstreamed, SUPPRESS_AFTER_FRAMES,
+                                          ein.dClaimAnchor);
                     lifeSet(k, LIFE_PARKED, "census-wide");
                     float drift = parkDivergedCopy(wChars[i], wStates[i], k);
                     // Census-band AI freeze: quiesce a diverging body's local AI
@@ -771,14 +849,15 @@ void Replicator::enforceHostAuthority(GameWorld* gw, u32 localId) {
                     if (censusFreezeAi_ && drift >= 0.0f)
                         censusFreezeDivergedAi(wChars[i], k, drift);
                 }
-            } else if (s == suppressed_.end() && ac.unstreamed >= SUPPRESS_AFTER_FRAMES) {
+            } else if (ev == EXIST_CULL) {
                 if (engine::suppressNpc(gw, wChars[i])) {
                     if (censusDbgOn())
                         logCensusDecision("DROP", "wide", k, wChars[i], wStates[i],
-                                          censusFresh, keep.find(k) != keep.end(),
+                                          censusFresh, ein.streamed,
                                           driven, exists, /*observed*/ true,
                                           attnAnch, nAttnAnch, nRawAnch,
-                                          ac.unstreamed, SUPPRESS_AFTER_FRAMES);
+                                          ac.unstreamed, SUPPRESS_AFTER_FRAMES,
+                                          ein.dClaimAnchor);
                     suppressed_[k] = wChars[i];
                     ++authSuppresses_;
                     ++censusCulls_;
