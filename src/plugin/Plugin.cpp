@@ -477,6 +477,7 @@ void rejectCoordRequest(coop::u32 requesterId, coop::u32 reqId, int kind) {
 // OWN reload edge, and the synchronous-swap backstop reuses it, so the reset
 // order (repl maps, then inbound queues) is defined in exactly one place.
 void sessionResetForWorldReload() {
+    coop::engine::datapanelListProbe("world-reload");
     g_repl.resetSession();
     g_inbound.flushWorldState();
     g_net.bumpSessionEpoch(); // v44: post-reload batches supersede the old session
@@ -676,6 +677,7 @@ void processNetEvents(GameWorld* gw) {
         _snprintf(b, sizeof(b) - 1, "handshake: peer left id=%u", (unsigned)*it);
         b[sizeof(b) - 1] = '\0';
         coopLog(b);
+        coop::engine::datapanelListProbe("peer-leave");
         // Phase 3 Plan 03: mirror of notePeerConnected above.
         g_repl.notePeerLeft(*it);
         // Carried-body sync (protocol 18) + furniture occupancy (protocol 19):
@@ -2986,6 +2988,7 @@ void startNetworking() {
 // path (NetLink cleanly supports stop() then start again; Steam is re-armed and
 // the Replicator/Inbound session state is reset for a clean handshake).
 void coopUiConnect(bool isHost, bool useSteam, unsigned long long peerId) {
+    coop::engine::datapanelListProbe("connect");
     if (g_net.isRunning()) g_net.stop();
     coop::steamp2p::shutdown();
     // World is live here (reconnect from within a running game): despawn minted
@@ -3033,6 +3036,7 @@ void coopUiConnect(bool isHost, bool useSteam, unsigned long long peerId) {
 
 void coopUiDisconnect() {
     coopLog("[coop-ui] disconnect");
+    coop::engine::datapanelListProbe("disconnect");
     if (g_net.isRunning()) g_net.stop();
     coop::steaminvite::reset(); // leave any Steam lobby
     coop::steamp2p::shutdown();

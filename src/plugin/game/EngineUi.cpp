@@ -24,6 +24,7 @@
 #include <windows.h>
 
 #include "../core/SteamId.h" // parseSteamId64 (paste button) + maskSteamId64 (id rows)
+#include "DatapanelList.h"   // pure (stuff,count) predicates over guiDatapanels
 
 namespace coop {
 namespace engine {
@@ -368,14 +369,79 @@ void dbgColourSeh(DataPanelLine* line, bool yellow) {
     } __except (EXCEPTION_EXECUTE_HANDLER) {}
 }
 
-// Arm a freshly-minted panel: register it for ForgottenGUI's per-frame refresh
-// AND make it visible. createDatapanel returns a built-but-hidden window; without
-// this pair the F2 toggle logs open/close yet nothing ever draws (the render bug
-// in the reconstruction). PODs only, so the whole thing sits in one SEH frame.
-bool uiPanelArmSeh(ForgottenGUI* g, DatapanelGUI* p) {
+// ---- guiDatapanels observability -------------------------------------------
+// Read ForgottenGUI's datapanel update list and report where a given panel sits
+// in it. This exists because that list is the crash surface: shutDown() walks
+// every index calling each entry's deleting destructor without erasing as it
+// goes, so a pointer present twice is deleted twice. See DatapanelList.h.
+//
+// The lektor members are read through the vendored header (guiDatapanels.count /
+// .stuff), never through hard-coded offsets, and the walk itself lives in the
+// pure helper so the shipped predicate is the one prototest exercises. Same
+// unlocked-but-fail-safe discipline as labelListHas above.
+bool datapanelSnapshotSeh(ForgottenGUI* g, const void* needle,
+                          DatapanelListScan* out) {
+    __try {
+        const lektor<DatapanelGUI*>* v = &g->guiDatapanels;
+        datapanelListScan((const void* const*)v->stuff, v->count, needle, out);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+// One log line per rare UI/session edge - never per tick. `panel` is used ONLY
+// as a comparison needle and is never dereferenced, so it is safe to pass a
+// pointer that has just been freed (which is exactly the "is the dead panel
+// still listed?" question the close path needs answered).
+void datapanelProbeLog(const char* where, ForgottenGUI* g, const void* panel) {
+    DatapanelListScan s;
+    datapanelScanInit(&s);
+    bool read = (g != 0) && datapanelSnapshotSeh(g, panel, &s);
+    char b[224];
+    _snprintf(b, sizeof(b) - 1,
+              "[coop-ui] datapanels %s: read=%d sane=%d count=%u panel=%p "
+              "occurrences=%u firstIdx=%u dupPointers=%u",
+              where ? where : "?", read ? 1 : 0, s.sane ? 1 : 0, s.count,
+              panel, s.occurrences, s.firstIndex, s.dupPointers);
+    b[sizeof(b) - 1] = '\0';
+    // A duplicate is the defect this probe exists to catch, so it goes to the
+    // error stream where a log scan cannot miss it.
+    if (s.occurrences > 1u || s.dupPointers > 0u) coop::logErrLine(b);
+    else                                          coop::logLine(b);
+}
+
+// Arm a freshly-minted panel: make sure it is registered for ForgottenGUI's
+// per-frame refresh, and make it visible. createDatapanel returns a
+// built-but-hidden window; without the show the F2 toggle logs open/close yet
+// nothing ever draws (the render bug in the reconstruction).
+//
+// THE REGISTRATION IS GUARDED, and that guard is a crash fix, not a
+// micro-optimisation. ForgottenGUI::createDatapanel ALREADY appends the panel to
+// guiDatapanels itself, and addDatapanelToUpdateList is an unconditional
+// push_back with no dedupe, so the unguarded pair put one pointer in two
+// adjacent slots. Nothing heals that while the panel stays open: no destructor
+// unregisters, and ForgottenGUI::shutDown() - reached from ~ForgottenGUI during
+// exit() at process quit - walks every index calling each entry's deleting
+// destructor without erasing as it goes. The panel was therefore deleted at its
+// first slot and dereferenced again at its second, faulting on the freed vptr.
+// Measured on this machine, one process, title screen: panel left open at quit
+// => 0xc0000005 at kenshi_x64.exe+0x6ea9ab with rdi=3 (the duplicate slot) and
+// rcx = the panel - the same RVA and the same frames as the two field crashes.
+//
+// datapanelShouldRegister keeps the call rather than deleting it so that a
+// future Kenshi build which stops self-registering still gets the panel
+// registered; see DatapanelList.h for why an unreadable list fails toward NOT
+// registering. `outAdded` reports the branch taken so the caller can log it
+// without doing string work inside the SEH frame.
+// PODs only, so the whole thing sits in one SEH frame.
+bool uiPanelArmSeh(ForgottenGUI* g, DatapanelGUI* p, bool* outAdded) {
+    if (outAdded) *outAdded = false;
     if (!g || !p) return false;
     __try {
-        g->addDatapanelToUpdateList(p);
+        const lektor<DatapanelGUI*>* v = &g->guiDatapanels;
+        if (datapanelShouldRegister((const void* const*)v->stuff, v->count, p)) {
+            g->addDatapanelToUpdateList(p);
+            if (outAdded) *outAdded = true;
+        }
         p->_NV_show(true);
         return true;
     } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
@@ -392,6 +458,12 @@ void panelDestroySeh(ForgottenGUI* g, DatapanelGUI* p) {
 }
 
 } // namespace
+
+void datapanelListProbe(const char* where) {
+    ForgottenGUI* g = ::gui; // KenshiLib data export (spike 46)
+    if (!g) return;
+    datapanelProbeLog(where, g, g_panel.panel);
+}
 
 void coopPanelTick(const CoopPanelState* st, CoopConnectFn onConnect,
                    CoopDisconnectFn onDisconnect) {
@@ -426,7 +498,13 @@ void coopPanelTick(const CoopPanelState* st, CoopConnectFn onConnect,
             g_panel.needsRebuild = true;
             coop::logLine("[coop-ui] panel opened");
         } else {
+            datapanelProbeLog("f2-close-before", g, g_panel.panel);
             panelDestroySeh(g, g_panel.panel);
+            // g_panel.panel is FREED from here on. It is passed to the probe as
+            // a comparison needle only (never dereferenced) to answer the one
+            // question the close path must get right: is the dead panel - in
+            // either of its slots - gone from guiDatapanels?
+            datapanelProbeLog("f2-close-after", g, g_panel.panel);
             g_panel.panel = 0; g_panel.built = false;
             g_roleBtn = 0; g_transBtn = 0; g_connBtn = 0; g_copyIdBtn = 0;
             g_pasteIdBtn = 0;
@@ -469,8 +547,20 @@ void coopPanelTick(const CoopPanelState* st, CoopConnectFn onConnect,
         g_panel.built = false;
         if (!g_panel.panel) {
             coop::logErrLine("[coop-ui] createDatapanel FAILED");
-        } else if (!uiPanelArmSeh(g, g_panel.panel)) {
-            coop::logErrLine("[coop-ui] panel arm (update-list/show) FAILED");
+        } else {
+            // The decisive pair. createDatapanel is believed to register the
+            // panel in guiDatapanels itself, so "after-create" should already
+            // report occurrences=1; if the arm step then appends it again,
+            // "after-arm" reports occurrences=2 and the list is primed to
+            // double-delete at exit-time teardown.
+            datapanelProbeLog("after-create", g, g_panel.panel);
+            bool armAdded = false;
+            if (!uiPanelArmSeh(g, g_panel.panel, &armAdded))
+                coop::logErrLine("[coop-ui] panel arm (update-list/show) FAILED");
+            coop::logLine(armAdded
+                ? "[coop-ui] panel arm: registered in guiDatapanels"
+                : "[coop-ui] panel arm: already listed by createDatapanel - add skipped");
+            datapanelProbeLog("after-arm", g, g_panel.panel);
         }
     }
 

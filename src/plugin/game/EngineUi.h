@@ -46,6 +46,18 @@ typedef void (*CoopDisconnectFn)();
 void coopPanelTick(const CoopPanelState* st, CoopConnectFn onConnect,
                    CoopDisconnectFn onDisconnect);
 
+// Log one line describing ForgottenGUI's datapanel update list (guiDatapanels):
+// its count, where the co-op panel sits in it, and whether ANY pointer in it is
+// duplicated. That list is a crash surface - ForgottenGUI::shutDown(), reached
+// from ~ForgottenGUI during exit() at process quit, walks every index calling
+// each entry's deleting destructor WITHOUT erasing as it goes, so a pointer
+// present twice is deleted twice and the second delete reads a freed vptr.
+// `where` is a short free-form tag naming the edge ("connect", "peer-leave",
+// ...) and appears verbatim in the log. Call only on rare session/UI edges,
+// never per tick. Safe with no panel open and safe before ::gui exists (it is a
+// no-op then). Main-thread only; SEH-guarded.
+void datapanelListProbe(const char* where);
+
 // Persistent co-op connection-status banner: a single screen-space label fixed 10
 // px in from the top-left corner (a createFloatingLabel MyGUI::Window on the
 // spike-48 screenshot-proven "Info" layer) whose caption shows the live session

@@ -33,6 +33,7 @@
 #include "../plugin/core/Inbound.h" // Phase 0 queue-lifecycle fixes (header-only)
 #include "../plugin/core/PeerRoster.h" // leave-queue OWNER_ID_ALL expansion (host-link drop)
 #include "../plugin/test/PauseSchedule.h" // pause_stress repro-driver cycle schedule (pure)
+#include "../plugin/game/DatapanelList.h" // guiDatapanels dedupe: the F2-panel double-add fix
 #include "../plugin/game/EngineFaults.h" // Phase 5c: fault throttle (pure inline)
 #include "../plugin/game/EngineCaps.h"   // Phase 5d: capability registry (pure inline)
 #include "../plugin/sync/ChangeGate.h"   // Phase 6: change-gated send/accept policy
@@ -1891,6 +1892,195 @@ static void testPauseSchedule() {
               coop::pausePhaseAt(allHold, 0).wantPaused &&
               coop::pausePhaseAt(allHold, 4999).wantPaused &&
               coop::pausePhaseAt(allHold, 5000).wantPaused);
+    }
+}
+
+// ---- 6b. guiDatapanels dedupe (game/DatapanelList.h) ---------------------------
+// Guards the fix for the exit-time access violation at kenshi_x64.exe+0x6ea9ab.
+//
+// The defect, measured live on one title-screen Kenshi: ForgottenGUI::
+// createDatapanel already appends the new panel to guiDatapanels, and the F2
+// arm path then called addDatapanelToUpdateList - an unconditional push_back
+// with no dedupe - so the SAME pointer occupied two adjacent slots
+// (probe: "after-create ... count=3 occurrences=1" then "after-arm ... count=4
+// occurrences=2"). Nothing unregisters a panel when it dies, and
+// ForgottenGUI::shutDown() - reached from ~ForgottenGUI during exit() at
+// process quit - walks every index calling each entry's deleting destructor
+// without erasing as it goes. The panel was deleted at slot 2 and dereferenced
+// again at slot 3 (the crash register file shows rdi=3, rcx=<the panel>), so
+// the indirect call went through a freed vptr.
+//
+// These checks exercise the SHIPPED predicates, not a paraphrase: EngineUi.cpp's
+// uiPanelArmSeh calls datapanelShouldRegister, which is the same function this
+// test calls (the discipline PeerRoster.h / PauseSchedule.h already set - a test
+// against restated logic proves nothing about what ships).
+static void testDatapanelList() {
+    std::printf("== guiDatapanels dedupe (game/DatapanelList.h) ==\n");
+
+    const void* a = (const void*)0x1000;
+    const void* b = (const void*)0x2000;
+    const void* c = (const void*)0x3000;
+
+    // ---- THE DEFECT, as a state machine over the real list ------------------
+    // Model the engine's own list behaviour exactly: createDatapanel appends,
+    // then the arm path decides whether to append again.
+    {
+        const void* list[8];
+        unsigned int n = 0;
+        list[n++] = a; list[n++] = b;      // two panels the engine owns already
+
+        // createDatapanel appends the new panel itself.
+        const void* panel = c;
+        list[n++] = panel;
+        CHECK("after create: the panel is listed exactly once",
+              !coop::engine::datapanelListHas(list, 2, panel) &&
+              coop::engine::datapanelListHas(list, n, panel));
+
+        // THE FIX: the arm path must decline to register it a second time.
+        CHECK("arm declines to register a panel createDatapanel already listed",
+              !coop::engine::datapanelShouldRegister(list, n, panel));
+
+        // The post-condition that actually matters - one slot, never two.
+        coop::engine::DatapanelListScan s;
+        coop::engine::datapanelListScan(list, n, panel, &s);
+        CHECK_EQ("after arm: occurrences is 1, not 2", (int)s.occurrences, 1);
+        CHECK_EQ("after arm: no duplicated pointer anywhere in the list",
+                 (int)s.dupPointers, 0);
+        CHECK_EQ("after arm: count is unchanged by the declined add", (int)n, 3);
+    }
+
+    // ---- The pre-fix behaviour is exactly what shutDown() double-deletes ----
+    {
+        const void* list[4];
+        list[0] = a; list[1] = b; list[2] = c; list[3] = c; // the unguarded add
+        coop::engine::DatapanelListScan s;
+        coop::engine::datapanelListScan(list, 4, c, &s);
+        CHECK_EQ("unguarded add leaves the panel in TWO slots",
+                 (int)s.occurrences, 2);
+        CHECK_EQ("...which the scan reports as one duplicated pointer",
+                 (int)s.dupPointers, 1);
+        CHECK_EQ("...first occurrence is the slot shutDown deletes at",
+                 (int)s.firstIndex, 2);
+    }
+
+    // ---- datapanelShouldRegister: the whole truth table ---------------------
+    {
+        const void* list[3];
+        list[0] = a; list[1] = b; list[2] = c;
+        CHECK("absent panel IS registered (a future engine that stops "
+              "self-registering must still get the add)",
+              coop::engine::datapanelShouldRegister(list, 3,
+                                                    (const void*)0x9999));
+        CHECK("present panel is NOT registered",
+              !coop::engine::datapanelShouldRegister(list, 3, a));
+        CHECK("present-at-last-slot panel is NOT registered",
+              !coop::engine::datapanelShouldRegister(list, 3, c));
+        CHECK("null panel is never registered",
+              !coop::engine::datapanelShouldRegister(list, 3, 0));
+        // An unreadable list fails toward NOT registering: skipping a redundant
+        // add costs nothing, adding a second copy is the double free.
+        CHECK("null array fails toward NOT registering",
+              !coop::engine::datapanelShouldRegister(0, 3, a));
+        CHECK("implausible count fails toward NOT registering",
+              !coop::engine::datapanelShouldRegister(
+                  list, coop::engine::DATAPANEL_LIST_MAX + 1u, (const void*)0x9999));
+    }
+
+    // ---- Boundary neighbours around the count bound -------------------------
+    {
+        const void* list[2];
+        list[0] = a; list[1] = b;
+        coop::engine::DatapanelListScan s;
+
+        coop::engine::datapanelListScan(list, 0, a, &s);
+        CHECK("empty list: sane, nothing found, firstIndex == count",
+              s.sane && s.occurrences == 0u && s.count == 0u &&
+              s.firstIndex == 0u && s.dupPointers == 0u);
+        CHECK("empty list registers an absent panel",
+              coop::engine::datapanelShouldRegister(list, 0, a));
+
+        coop::engine::datapanelListScan(list, 1, a, &s);
+        CHECK("singleton list holding the needle",
+              s.sane && s.occurrences == 1u && s.firstIndex == 0u);
+
+        coop::engine::datapanelListScan(list, 2, (const void*)0x9999, &s);
+        CHECK("needle absent: firstIndex reports count, not 0",
+              s.sane && s.occurrences == 0u && s.firstIndex == 2u);
+
+        // Exactly at the bound is still sane; one past it is not. (The array is
+        // never walked in the insane case, so a short array is safe here.)
+        coop::engine::datapanelListScan(0, coop::engine::DATAPANEL_LIST_MAX, a, &s);
+        CHECK("null data is insane at any count", !s.sane);
+        coop::engine::datapanelListScan(list, coop::engine::DATAPANEL_LIST_MAX + 1u,
+                                        a, &s);
+        CHECK("count one past DATAPANEL_LIST_MAX is refused", !s.sane);
+        CHECK("...and the refused count is still reported for the log",
+              s.count == coop::engine::DATAPANEL_LIST_MAX + 1u);
+    }
+
+    // ---- Duplicate accounting: distinct offenders, not extra slots ----------
+    {
+        const void* list[6];
+        list[0] = a; list[1] = a; list[2] = a; list[3] = b; list[4] = b;
+        list[5] = c;
+        coop::engine::DatapanelListScan s;
+        coop::engine::datapanelListScan(list, 6, a, &s);
+        CHECK_EQ("a appears three times", (int)s.occurrences, 3);
+        CHECK_EQ("two DISTINCT pointers are duplicated (a and b), not four "
+                 "extra slots", (int)s.dupPointers, 2);
+        CHECK_EQ("first occurrence index", (int)s.firstIndex, 0);
+
+        // Non-adjacent duplicates count too - shutDown walks every index, so the
+        // spacing between the copies is irrelevant to the double delete.
+        const void* split[5];
+        split[0] = c; split[1] = a; split[2] = b; split[3] = a; split[4] = b;
+        coop::engine::datapanelListScan(split, 5, a, &s);
+        CHECK_EQ("non-adjacent duplicate still reports 2 occurrences",
+                 (int)s.occurrences, 2);
+        CHECK_EQ("non-adjacent duplicates: a and b both flagged",
+                 (int)s.dupPointers, 2);
+        CHECK("a non-adjacent duplicate is still refused registration",
+              !coop::engine::datapanelShouldRegister(split, 5, a));
+    }
+
+    // ---- Nulls inside the list are not "duplicates" -------------------------
+    {
+        const void* list[4];
+        list[0] = 0; list[1] = 0; list[2] = a; list[3] = 0;
+        coop::engine::DatapanelListScan s;
+        coop::engine::datapanelListScan(list, 4, a, &s);
+        CHECK_EQ("repeated NULL slots are not counted as a duplicated pointer",
+                 (int)s.dupPointers, 0);
+        CHECK_EQ("the real panel is still found once", (int)s.occurrences, 1);
+        CHECK("a null needle is never 'present'",
+              !coop::engine::datapanelListHas(list, 4, 0));
+    }
+
+    // ---- The close path's arithmetic, which is why an F2 close was harmless -
+    // removeDatapanelFromUpdateList erases exactly ONE occurrence (decoded from
+    // the loaded image: it breaks out of its search on the first hit, shifts the
+    // tail down, decrements count, returns) and destroy(DatapanelGUI*) erases
+    // one more before deleting. Two erases clear a duplicate of two, which is
+    // why the field host's completed open->close cycles never faulted.
+    {
+        const void* list[4];
+        list[0] = a; list[1] = b; list[2] = c; list[3] = c;
+        unsigned int n = 4;
+        // erase-one, twice (the shift-down the engine does)
+        for (int pass = 0; pass < 2; ++pass) {
+            coop::engine::DatapanelListScan s;
+            coop::engine::datapanelListScan(list, n, c, &s);
+            if (s.occurrences == 0u) break;
+            for (unsigned int i = s.firstIndex; i + 1u < n; ++i)
+                list[i] = list[i + 1u];
+            --n;
+        }
+        coop::engine::DatapanelListScan s;
+        coop::engine::datapanelListScan(list, n, c, &s);
+        CHECK_EQ("two erase-one passes clear BOTH copies", (int)s.occurrences, 0);
+        CHECK_EQ("...leaving the other panels intact", (int)n, 2);
+        CHECK("...and the survivors are the untouched entries",
+              list[0] == a && list[1] == b);
     }
 }
 
@@ -4656,6 +4846,7 @@ int main() {
     testOwnRanks();
     testLeaveExpansion();
     testPauseSchedule();
+    testDatapanelList();
     testSteamIdParse();
     testWorkPoseMatch();
     testTaskClear();
