@@ -275,6 +275,12 @@ DataPanelLine*          g_debugLine    = 0; // white connection-status debug row
 DataPanelLine*          g_peerLine     = 0; // white "Friend's Steam ID" row
 DataPanelLine*          g_selfLine     = 0; // white "Your Steam ID" row
 DataPanelLine*          g_addrLine     = 0; // white "Server address" row (UDP)
+DataPanelLine*          g_sessLine     = 0; // "Session" row (red/amber/green by state)
+DataPanelLine*          g_armedLine    = 0; // white "On Connect" armed-selection row
+// Last session state the panel actually DISPLAYED, so the transition is logged
+// once per change and never per tick. -1 = nothing shown yet (also reset on
+// close, so reopening the panel re-states the current value exactly once).
+int                     g_lastSessLogged = -1;
 std::string             g_selfIdStr;   // self SteamID as digits (set each tick; "" = none)
 
 // Friend's SteamID pasted in-panel this session (0 = none). Per-session by
@@ -394,6 +400,7 @@ struct PanelStrings {
     const std::string *peerKey, *peerVal, *pasteKey, *pasteCap;
     const std::string *selfKey, *selfVal, *copyKey, *copyCap;
     const std::string *addrKey, *addrVal, *pasteAddrKey, *pasteAddrCap;
+    const std::string *sessKey, *sessVal, *armedKey, *armedVal;
     const std::string *empty;
     bool steam;
 };
@@ -413,10 +420,19 @@ void panelBuildSeh(DatapanelGUI* p, const PanelStrings* s) {
         p->_NV_clear();
         g_peerLine = 0; g_pasteIdBtn = 0; g_selfLine = 0; g_copyIdBtn = 0;
         g_addrLine = 0; g_pasteAddrBtn = 0;
+        g_sessLine = 0; g_armedLine = 0;
         p->setCaption(*s->title);
         g_roleBtn  = p->setLineButton(*s->roleKey,  *s->roleCap,  0);
         g_transBtn = p->setLineButton(*s->transKey, *s->transCap, 0);
         g_connBtn  = p->setLineButton(*s->connKey,  *s->connCap,  0);
+        p->addSpace(0, 0.35f);
+        // Live session state in ONE word, coloured red/amber/green below. The
+        // Connection button above stays a two-position switch over a DESIRED
+        // state - giving a switch three captions makes the switch itself
+        // ambiguous. The panel SHOWS three states; the toggle ARMS two.
+        g_sessLine = p->setLine(*s->sessKey, *s->sessVal, *s->empty, 0, false, true);
+        // What Connect will actually use, so it can be read back before pressing it.
+        g_armedLine = p->setLine(*s->armedKey, *s->armedVal, *s->empty, 0, false, true);
         p->addSpace(0, 0.35f);
         // Connection-status debug line (coloured white below, outside SEH).
         g_debugLine = p->setLine(*s->dbgKey, *s->dbgVal, *s->empty, 0, false, true);
@@ -438,18 +454,37 @@ void panelBuildSeh(DatapanelGUI* p, const PanelStrings* s) {
     } __except (EXCEPTION_EXECUTE_HANDLER) {}
 }
 
+// Map a live session state (0 offline / 1 waiting / 2 connected) onto
+// markerColour's id space. Shared by the F2 panel's Session row and the
+// status overlay below - ONE colour vocabulary in this file, so the panel and
+// the banner cannot disagree about what "waiting" looks like while a player
+// is staring at both of them at once.
+int sessionColourId(int state) { return state == 2 ? 0 : (state == 1 ? 2 : 1); }
+
+// Value-column colour ids for a panel row. Non-negative ids are markerColour's
+// (and therefore sessionColourId's) - green/red/amber. kRowWhite is the plain
+// white every static row uses; it is NOT markerColour's default (a 0.8 grey),
+// because these rows are read as text, not scanned as status.
+const int kRowWhite = -1;
+const int kRowAmber = 2; // markerColour's "local-only" yellow
+
 // Colour a line's key + value TextBoxes for readability. Runs AFTER
 // panelBuildSeh's _NV_update (the w1/w2 widgets exist by then). MyGUI::Colour is a
-// trivial 4-float struct (no destructor), so it may live in the SEH frame.
-// yellow=true tints the value column amber - used for the join's live
-// "Streaming host world..." transfer line so it reads as in-progress activity.
-void dbgColourSeh(DataPanelLine* line, bool yellow) {
+// trivial 4-float struct (no destructor), so it may live in the SEH frame, and
+// markerColour constructs nothing unwindable of its own.
+//
+// Takes the same colour id markerColour/sessionColourId understand rather than
+// the white/amber boolean it used to: the Session row needs three colours, and
+// two colour vocabularies in one file is how the amber that means "streaming"
+// drifts away from the amber that means "waiting".
+void dbgColourSeh(DataPanelLine* line, int colourId) {
     if (!line) return;
     __try {
         MyGUI::Colour white(1.0f, 1.0f, 1.0f, 1.0f);
-        MyGUI::Colour amber(1.0f, 0.82f, 0.20f, 1.0f);
+        MyGUI::Colour val(1.0f, 1.0f, 1.0f, 1.0f);
+        if (colourId >= 0) markerColour(colourId, &val);
         if (line->w1) line->w1->setTextColour(white);
-        if (line->w2) line->w2->setTextColour(yellow ? amber : white);
+        if (line->w2) line->w2->setTextColour(val);
     } __except (EXCEPTION_EXECUTE_HANDLER) {}
 }
 
@@ -593,6 +628,8 @@ void coopPanelTick(const CoopPanelState* st, CoopConnectFn onConnect,
             g_roleBtn = 0; g_transBtn = 0; g_connBtn = 0; g_copyIdBtn = 0;
             g_pasteIdBtn = 0; g_pasteAddrBtn = 0;
             g_debugLine = 0; g_peerLine = 0; g_selfLine = 0; g_addrLine = 0;
+            g_sessLine = 0; g_armedLine = 0;
+            g_lastSessLogged = -1; // re-log the state once on the next open
             g_panel.open = false;
             coop::logLine("[coop-ui] panel closed");
         }
@@ -609,6 +646,24 @@ void coopPanelTick(const CoopPanelState* st, CoopConnectFn onConnect,
         g_panel.lastConnected = st->running;
         g_panel.connectedFlag = st->running;
         g_panel.lastChkVal    = st->running;
+        g_panel.needsRebuild = true;
+    }
+
+    // One line per DISPLAYED session-state transition, never per tick, so a live
+    // run is judgeable from the log instead of from a screenshot. This cannot
+    // contaminate a harness or control run: coopPanelDrive returns immediately
+    // whenever a scenario or KENSHICOOP_TEST_SECONDS is set, so this whole path -
+    // including this line - is structurally unreachable there. Phase 14's
+    // MAINTID nuisance happened because a diagnostic was added OUTSIDE that gate;
+    // every line this phase adds stays inside it.
+    if (st->sessionState != g_lastSessLogged) {
+        g_lastSessLogged = st->sessionState;
+        const char* word = (st->sessionState == 2) ? "CONNECTED"
+                         : (st->sessionState == 1) ? "WAITING" : "OFFLINE";
+        char b[64];
+        _snprintf(b, sizeof(b) - 1, "[coop-ui] session state -> %s", word);
+        b[sizeof(b) - 1] = '\0';
+        coop::logLine(b);
         g_panel.needsRebuild = true;
     }
 
@@ -722,6 +777,40 @@ void coopPanelTick(const CoopPanelState* st, CoopConnectFn onConnect,
         std::string pasteAddrKey = "pasteaddr";
         std::string pasteAddrCap = "Paste server address";
 
+        // Session: the live state in ONE word, from the value coopPanelDrive
+        // already computed for the overlay. WAITING is a real state, not a
+        // cosmetic third option - NetLink retries the client connect every 2 s
+        // until a host exists, so this is exactly where a player sits while
+        // their friend is still loading, and the moment they most need to be
+        // told nothing is broken.
+        std::string sessKey = "Session";
+        std::string sessVal;
+        if (st->sessionState == 2)      sessVal = "CONNECTED";
+        else if (st->sessionState == 1) sessVal = "WAITING";
+        else                            sessVal = "OFFLINE";
+
+        // On Connect: role, transport and the peer target Connect will actually
+        // use, picked by the ARMED transport (not the running one). A HOST needs
+        // no peer address at all - it binds and listens - so it is never asked
+        // for one; telling a host to paste a server address would be teaching
+        // the wrong thing just as surely as showing a Steam row to a UDP player.
+        std::string armedKey = "On Connect";
+        std::string armedVal = std::string(g_panel.hostFlag ? "HOST" : "JOIN") +
+                               " over " + (g_panel.steamFlag ? "STEAM" : "UDP");
+        if (g_panel.hostFlag) {
+            armedVal += g_panel.steamFlag ? " - share your Steam ID"
+                                          : " - players connect to you";
+        } else if (g_panel.steamFlag) {
+            armedVal += " -> ";
+            armedVal += (peerShown != 0) ? coop::maskSteamId64(peerShown)
+                                         : std::string("(click Paste friend's Steam ID)");
+        } else {
+            armedVal += " -> ";
+            armedVal += !g_pastedAddr.empty()
+                            ? g_pastedAddr
+                            : std::string("(click Paste server address, or coop_config.json)");
+        }
+
         std::string empty    = "";
 
         PanelStrings ps;
@@ -735,6 +824,8 @@ void coopPanelTick(const CoopPanelState* st, CoopConnectFn onConnect,
         ps.copyKey = &copyKey; ps.copyCap = &copyCap;
         ps.addrKey = &addrKey; ps.addrVal = &addrVal;
         ps.pasteAddrKey = &pasteAddrKey; ps.pasteAddrCap = &pasteAddrCap;
+        ps.sessKey = &sessKey; ps.sessVal = &sessVal;
+        ps.armedKey = &armedKey; ps.armedVal = &armedVal;
         ps.empty = &empty;
         ps.steam = g_panel.steamFlag;
         panelBuildSeh(g_panel.panel, &ps);
@@ -748,10 +839,14 @@ void coopPanelTick(const CoopPanelState* st, CoopConnectFn onConnect,
         if (g_copyIdBtn)  g_copyIdBtn->callback  = MyGUI::newDelegate(&onCopyIdBtn);
         if (g_pasteIdBtn) g_pasteIdBtn->callback = MyGUI::newDelegate(&onPasteIdBtn);
         if (g_pasteAddrBtn) g_pasteAddrBtn->callback = MyGUI::newDelegate(&onPasteAddrBtn);
-        dbgColourSeh(g_debugLine, !transfer.empty()); // amber while streaming
-        dbgColourSeh(g_peerLine, false);
-        dbgColourSeh(g_selfLine, false);
-        dbgColourSeh(g_addrLine, false);
+        // The Session row carries the same red/amber/green the status overlay
+        // shows, so a glance at either answers the same question the same way.
+        dbgColourSeh(g_sessLine, sessionColourId(st->sessionState));
+        dbgColourSeh(g_debugLine, transfer.empty() ? kRowWhite : kRowAmber);
+        dbgColourSeh(g_armedLine, kRowWhite);
+        dbgColourSeh(g_peerLine, kRowWhite);
+        dbgColourSeh(g_selfLine, kRowWhite);
+        dbgColourSeh(g_addrLine, kRowWhite);
 
         g_panel.built = true;
         g_panel.needsRebuild = false;
@@ -819,8 +914,6 @@ MyGUI::Window*  g_overlayBox   = 0; // container: geometry + layer attachment
 MyGUI::TextBox* g_overlay      = 0; // the label that actually draws the text
 int             g_overlayState = -1;
 std::string     g_overlayText;
-
-int overlayColorId(int state) { return state == 2 ? 0 : (state == 1 ? 2 : 1); }
 
 // Put the freshly-minted container in its pixel box and mint the label inside it.
 // createLabelAbs takes its text by const-ref and MyGUI::Align is a trivial int
@@ -901,7 +994,7 @@ void coopOverlayTick(const char* text, int state, bool show) {
     }
 
     if (t != g_overlayText || state != g_overlayState) {
-        MyGUI::Colour col; markerColour(overlayColorId(state), &col);
+        MyGUI::Colour col; markerColour(sessionColourId(state), &col);
         MyGUI::UString u(t.c_str());
         if (overlayUpdateSeh(g_overlay, &u, &col)) {
             g_overlayText = t; g_overlayState = state;
