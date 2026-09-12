@@ -1368,6 +1368,7 @@ const char* const MoneyPersistScenario::SAVE_NAME = "coopresume";
 //   KENSHICOOP_RELINK_RECOVER_MS per-relink recovery budget     (default 60000)
 //   KENSHICOOP_RELINK_COUNT      relinks to issue               (default 1)
 //   KENSHICOOP_RELINK_ROLE       host | join | both             (default host)
+//   KENSHICOOP_RELINK_JOIN_ID    WHICH join relinks at N>=3     (default 1)
 //
 // The role knob is not optional scope: ROADMAP criterion 1 says a CLIENT must
 // reconnect, while the roster evidence for 9011527 is host-side (registry_ only
@@ -1389,7 +1390,7 @@ public:
           issued_(0), waiting_(false), issuedAtMs_(0), budgetEndMs_(0),
           preN_(0), anyIssued_(false), allRecovered_(true), done_(false),
           obsKnown_(false), obsN_(0), obsPeakN_(0),
-          dropOpen_(false), sawDrop_(false), cycles_(0) {
+          dropOpen_(false), sawDrop_(false), cycles_(0), side_(-1) {
         memset(preIds_, 0, sizeof(preIds_));
     }
 
@@ -1401,17 +1402,22 @@ public:
     // distinct because ctx.elapsedMs here is the GAMEPLAY clock, not the armed
     // one, and the two must never be read as the same series.
     virtual void onGameplay(const ScenarioContext& ctx) {
-        if (iRelink(ctx.isHost)) return; // never relink before the armed clock exists
+        if (iRelink(ctx)) return; // never relink before the armed clock exists
         observeRoster(ctx, "prearm");
     }
 
     virtual void onStart(const ScenarioContext& ctx) {
+        // Latch the side ONCE, at arm. computeSide reads ctx.localId, which is 0
+        // on a join until WELCOME lands and could in principle move across a
+        // relink; a side that flipped mid-run would silently switch this process
+        // from producing relink evidence to producing observer evidence.
+        side_ = computeSide(ctx) ? 1 : 0;
         char b[224];
         _snprintf(b, sizeof(b) - 1,
                   "SCENARIO relink start host=%d localId=%u side=%s role=%s "
                   "atMs=%lu recoverMs=%lu count=%u adapter=%d",
                   ctx.isHost ? 1 : 0, (unsigned)ctx.localId,
-                  iRelink(ctx.isHost) ? "relink" : "observe", roleName(),
+                  (side_ == 1) ? "relink" : "observe", roleName(),
                   atMs(), recoverMs(), count(),
                   ctx.relinkSession ? 1 : 0);
         b[sizeof(b) - 1] = '\0'; coop::logLine(b);
@@ -1419,7 +1425,7 @@ public:
 
     virtual bool onTick(const ScenarioContext& ctx) {
         if (done_) return true;
-        return iRelink(ctx.isHost) ? tickRelink(ctx) : tickObserve(ctx);
+        return iRelink(ctx) ? tickRelink(ctx) : tickObserve(ctx);
     }
 
 private:
@@ -1467,10 +1473,31 @@ private:
         int r = role();
         return (r == 1) ? "join" : ((r == 2) ? "both" : "host");
     }
-    bool iRelink(bool isHost) const {
-        int r = role();
-        if (r == 2) return true;            // both: every side relinks, in its own slot
-        return (r == 0) ? isHost : !isHost;
+    // Which JOIN relinks in 'join'/'both' mode (default 1, the lowest join slot).
+    static unsigned int relinkJoinId() {
+        static int v = -1;
+        if (v < 0) {
+            const char* e = ::getenv("KENSHICOOP_RELINK_JOIN_ID");
+            v = e ? ::atoi(e) : 1;
+            if (v < 1) v = 1;
+        }
+        return (unsigned int)v;
+    }
+    // EXACTLY ONE process relinks per scheduled slot; everybody else observes.
+    // At N=2 "!isHost" said that and nothing more was needed. At N>=3 a bare
+    // "!isHost" makes EVERY join relink at the same offset - which is a
+    // simultaneous-rejoin shape (a different mechanism from a single in-process
+    // relink, and explicitly out of Phase 14's scope), and which additionally
+    // leaves NOBODY on the observing side, so the independent second-log
+    // evidence this scenario's own header promises would not exist. Pick the
+    // designated join by localId instead.
+    bool computeSide(const ScenarioContext& ctx) const {
+        const int r = role();
+        if (ctx.isHost) return (r == 0 || r == 2);
+        return (r == 1 || r == 2) && ctx.localId == relinkJoinId();
+    }
+    bool iRelink(const ScenarioContext& ctx) const {
+        return (side_ >= 0) ? (side_ == 1) : computeSide(ctx);
     }
 
     // Scheduled offset (from ARM) of this process's i-th relink. Single-role:
@@ -1648,6 +1675,8 @@ private:
     unsigned int  obsN_, obsPeakN_;
     bool          dropOpen_, sawDrop_;
     unsigned int  cycles_;
+    // -1 = not yet latched (pre-arm), 0 = observe, 1 = relink. See onStart.
+    int           side_;
 };
 
 } // namespace
