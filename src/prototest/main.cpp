@@ -28,6 +28,7 @@
 #include "../plugin/sync/Interp.h"
 #include "../plugin/core/OwnRanks.h"
 #include "../plugin/core/SteamId.h"
+#include "../plugin/core/NetEndpoint.h"
 #include "../plugin/core/WorkPose.h"
 #include "../plugin/core/DeathLatch.h"
 #include "../plugin/core/Inbound.h" // Phase 0 queue-lifecycle fixes (header-only)
@@ -2128,6 +2129,114 @@ static void testSteamIdParse() {
     // Not real ids, but steamPeer from the config is never length-checked.
     CHECK("short value masked, not padded", coop::maskSteamId64(42ull) == "****42");
     CHECK("zero masked", coop::maskSteamId64(0ull) == "****0");
+}
+
+// ---- 7b. UDP endpoint parse (NetEndpoint.h) -------------------------------------
+// The F2 panel's "Paste server address" button is the only in-game way to point a
+// UDP client at a host (before this, the endpoint came only from coop_config.json),
+// so the same clipboard noise the SteamID parse tolerates applies here: stray
+// whitespace, a trailing newline, or a "Server: 10.0.0.4:27800" wrapper.
+//
+// Rejection is the load-bearing half. A silent default port, or a half-written
+// host left behind by a failed parse, would send a player at the WRONG endpoint
+// with a plausible-looking value on screen - the exact stale-endpoint hazard the
+// relink rig already refuses to run over. So every rejection must leave the
+// caller's host AND port untouched, and a portless address must never acquire a
+// default.
+
+static void testEndpointParse() {
+    std::printf("== UDP endpoint parse (NetEndpoint.h) ==\n");
+    std::string host;
+    int port = 0;
+
+    host = ""; port = 0;
+    CHECK("clean ip:port accepted",
+          coop::parseHostPort("127.0.0.1:27800", host, port) &&
+          host == "127.0.0.1" && port == 27800);
+
+    host = ""; port = 0;
+    CHECK("surrounding whitespace/newline stripped",
+          coop::parseHostPort("  192.168.1.50:27800 \r\n", host, port) &&
+          host == "192.168.1.50" && port == 27800);
+
+    host = ""; port = 0;
+    CHECK("wrapper text 'Server: <addr>' stripped",
+          coop::parseHostPort("Server: 10.0.0.4:27800", host, port) &&
+          host == "10.0.0.4" && port == 27800);
+
+    host = ""; port = 0;
+    CHECK("tailscale address accepted (the cross-machine rig's real shape)",
+          coop::parseHostPort("100.72.14.3:27800", host, port) &&
+          host == "100.72.14.3" && port == 27800);
+
+    host = ""; port = 0;
+    CHECK("hostname accepted (ENet resolves names)",
+          coop::parseHostPort("coop.example.com:27800", host, port) &&
+          host == "coop.example.com" && port == 27800);
+
+    host = ""; port = 0;
+    CHECK("port 1 accepted (low bound)",
+          coop::parseHostPort("127.0.0.1:1", host, port) && port == 1);
+    host = ""; port = 0;
+    CHECK("port 65535 accepted (high bound)",
+          coop::parseHostPort("127.0.0.1:65535", host, port) && port == 65535);
+
+    // Rejections leave BOTH caller values untouched - a failed paste must not
+    // half-overwrite an address that was already armed. Each case RE-SEEDS the
+    // guard values first so the checks stay independent: without the re-seed the
+    // first clobbering rejection poisons every later one and the whole block
+    // fails as a block, which cannot tell one defect from another (measured -
+    // "accept port 0" and "write host before validating the port" produced
+    // byte-identical failure sets until this was split).
+#define SEED_GUARD() do { host = "keep.me"; port = 4242; } while (0)
+#define GUARD_INTACT (host == "keep.me" && port == 4242)
+
+    SEED_GUARD();
+    CHECK("portless address rejected (no silent default port)",
+          !coop::parseHostPort("127.0.0.1", host, port) && GUARD_INTACT);
+    SEED_GUARD();
+    CHECK("port 0 rejected",
+          !coop::parseHostPort("127.0.0.1:0", host, port) && GUARD_INTACT);
+    SEED_GUARD();
+    CHECK("port 65536 rejected (above range)",
+          !coop::parseHostPort("127.0.0.1:65536", host, port) && GUARD_INTACT);
+    SEED_GUARD();
+    CHECK("negative port rejected",
+          !coop::parseHostPort("127.0.0.1:-1", host, port) && GUARD_INTACT);
+    SEED_GUARD();
+    CHECK("non-numeric port rejected, host untouched",
+          !coop::parseHostPort("127.0.0.1:abc", host, port) && GUARD_INTACT);
+    SEED_GUARD();
+    CHECK("empty string rejected",
+          !coop::parseHostPort("", host, port) && GUARD_INTACT);
+    SEED_GUARD();
+    CHECK("non-address text rejected",
+          !coop::parseHostPort("not an address", host, port) && GUARD_INTACT);
+    SEED_GUARD();
+    CHECK("empty host rejected",
+          !coop::parseHostPort(":27800", host, port) && GUARD_INTACT);
+    SEED_GUARD();
+    CHECK("trailing colon rejected",
+          !coop::parseHostPort("127.0.0.1:", host, port) && GUARD_INTACT);
+
+    // IPv6 is out of scope: it must be REJECTED, never mis-split on its colons
+    // into a plausible host/port pair.
+    SEED_GUARD();
+    CHECK("IPv6 literal rejected, not mis-split",
+          !coop::parseHostPort("fe80::1", host, port) && GUARD_INTACT);
+    SEED_GUARD();
+    CHECK("IPv6 with trailing :port rejected, not mis-split",
+          !coop::parseHostPort("2001:db8::1:27800", host, port) && GUARD_INTACT);
+    SEED_GUARD();
+    CHECK("bracketed IPv6 rejected",
+          !coop::parseHostPort("[::1]:27800", host, port) && GUARD_INTACT);
+#undef SEED_GUARD
+#undef GUARD_INTACT
+    // Display half: what the panel's armed row shows back to the player.
+    CHECK("formatEndpoint round-trips the parsed pair",
+          coop::formatEndpoint("127.0.0.1", 27800) == "127.0.0.1:27800");
+    CHECK("formatEndpoint renders a hostname",
+          coop::formatEndpoint("coop.example.com", 1) == "coop.example.com:1");
 }
 
 // ---- 8. Pose-fixture acceptance (WorkPose.h) ------------------------------------
@@ -5271,6 +5380,7 @@ int main() {
     testPauseSchedule();
     testDatapanelList();
     testSteamIdParse();
+    testEndpointParse();
     testWorkPoseMatch();
     testTaskClear();
     testDeathRekey();
