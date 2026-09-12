@@ -1489,6 +1489,37 @@
             Tier = 'full'; WanVariant = $false
         }
 
+        # connect_relink (Phase 14 plan 01, UI-06): the scenario re-runs the F2
+        # panel's Connect handler through a ScenarioContext adapter, so the
+        # NetLink session boundary (stop() + start again on the reused g_net
+        # singleton) is exercised with NO keyboard and NO panel on screen. One
+        # side relinks, the other watches its roster drop and come back.
+        #
+        # PrimaryGate = 'panel_config' is the honest gate, not a placeholder: it
+        # already exists and already parses the '[coop-ui] connect:' contract
+        # (role/transport/peer/ownRanks/src), but it has only ever returned SKIP
+        # in a harness run, because the panel was hand-driven and no automated
+        # run could produce a single connect line. This scenario is the first
+        # thing that can make panel_config actually judge.
+        #
+        # Tier='none' ON PURPOSE: keeping it out of regress.ps1's smoke/full
+        # sweeps means no existing tiered run changes shape, which is Phase 14's
+        # criterion 4 (a run that never invokes the lever is indistinguishable
+        # from a pre-phase run). Drive it explicitly via run_test.ps1 -Scenario.
+        #
+        # KENSHICOOP_SAVE_SYNC='0' isolates what is under test. With save sync
+        # ON, every reconnect re-arms the host's connect-push, so the run would
+        # be measuring the bootstrap save-transfer pipeline instead of the roster
+        # boundary - and would take far longer to do it.
+        connect_relink = @{
+            DiagEnv = @{ KENSHICOOP_SAVE_SYNC = '0' }
+            Save = 'squad1'; Setup = ''; Tolerance = 3.0
+            PrimaryGate = 'panel_config'
+            Gating   = @('panel_config')
+            Advisory = @('clock_sync')
+            Tier = 'none'; WanVariant = $false
+        }
+
         # bootstrap_stream: the missing-save "seamless join" proof (protocol
         # 31/32). NOT a run_test tier member and NOT run_test-drivable - it needs
         # the join-from-MENU launch (join has NO save, goes ONLINE, host bakes +

@@ -57,6 +57,21 @@ struct ScenarioContext {
     // (same discipline as pickMintedProxy/connectedPeers) - always check
     // before calling.
     unsigned int (*cellOwnerAt)(float x, float z, int* outCx, int* outCz);
+    // connect_relink (Phase 14 plan 01, UI-06): re-runs the SAME in-game panel
+    // Connect handler the F2 button runs - coopUiConnect - so a scenario can
+    // exercise the NetLink session boundary (stop() + start again on the reused
+    // g_net singleton) with NO keyboard, NO mouse and no panel on screen. The
+    // scenario layer must not reach into Plugin.cpp or NetLink directly, so
+    // Plugin.cpp supplies the adapter (the pickMintedProxy/connectedPeers/
+    // cellOwnerAt precedent above). The FUNCTION POINTER itself is 0 when
+    // Plugin.cpp has not supplied it - ALWAYS check before calling, same
+    // discipline as the three adapters above. Returns false when the plugin
+    // declined to issue the relink.
+    //
+    // THREADING: called from the scenario tick, i.e. the GAME thread - the only
+    // thread the panel handler may run on (it touches live game state and joins
+    // the net thread inside NetLink::stop()). Never call it from anywhere else.
+    bool         (*relinkSession)(void);
 };
 
 class Scenario {

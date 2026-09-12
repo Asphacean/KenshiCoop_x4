@@ -1,6 +1,7 @@
 // ScenarioSession.cpp - session lifecycle scenarios (monolith split from
 // Scenario.cpp, 2026-07-12): latejoin_probe/latejoin_sync, save_probe,
-// save_sync/save_stage1, resume_check, load_probe, load_sync, money_persist. Classes are
+// save_sync/save_stage1, resume_check, load_probe, load_sync, money_persist,
+// connect_relink. Classes are
 // TU-private (anonymous namespace); only makeSessionScenario
 // (ScenarioSupport.h) is exported.
 // Must NOT: change any SCENARIO log string (oracle API, resources/CODE_MAP.md).
@@ -1338,6 +1339,285 @@ private:
 };
 const char* const MoneyPersistScenario::SAVE_NAME = "coopresume";
 
+
+// connect_relink (Phase 14 plan 01, UI-06): the first automated trigger for the
+// F2 panel's Connect action. The panel button has been its ONLY live trigger, so
+// commit 9011527 - which clears the host join-slot roster at every transport
+// session boundary - has never been confirmed in a running game - two attempts to drive
+// the panel with synthetic input (keybd_event VK_F2, synthetic mouse_event
+// clicks) produced zero [coop-ui] lines because RE_Kenshi's own menu intercepts
+// F2. This scenario reaches the SAME handler programmatically, through
+// ScenarioContext::relinkSession, which Plugin.cpp wires straight to
+// coopUiConnect. No keyboard, no mouse, no panel on screen.
+//
+// One side RELINKS (the role knob picks it) and the others OBSERVE:
+//   relinking side - snapshots its connected roster, calls the adapter, then
+//     polls until the pre-relink id set is fully back or the recovery budget
+//     expires. PASS = issued AND every id returned inside budget.
+//   observing side - passive; logs every roster-count transition, so a second
+//     log independently shows the peer go and come back. PASS = it saw a DROP
+//     and a RETURN; never saw a drop is a FAIL, not a vacuous pass.
+//
+// Knobs are read with ::getenv IN THIS TU and are deliberately NOT Config
+// fields (the ScenarioCombat KENSHICOOP_BATTLE_N precedent): a Config field
+// would change the `effective cfg` banner describeConfig prints, and Phase 14's
+// criterion 4 is that a run which never invokes this lever stays byte-identical
+// to a pre-phase run. Read-once statics, main-thread only, the shape the
+// KENSHICOOP_DEBUG_CENSUS gate uses.
+//   KENSHICOOP_RELINK_AT_MS      first relink offset from ARM  (default 40000)
+//   KENSHICOOP_RELINK_RECOVER_MS per-relink recovery budget     (default 60000)
+//   KENSHICOOP_RELINK_COUNT      relinks to issue               (default 1)
+//   KENSHICOOP_RELINK_ROLE       host | join | both             (default host)
+//
+// The role knob is not optional scope: ROADMAP criterion 1 says a CLIENT must
+// reconnect, while the roster evidence for 9011527 is host-side (registry_ only
+// exists on the host), so one side alone cannot close both criteria. The adapter
+// is role-agnostic by construction - it hands the panel handler the process's
+// OWN current role - so supporting both sides is a branch here, not a second
+// mechanism.
+//
+// A JOIN relinking mid-session is walking into a known interaction: a join whose
+// networking is already running never auto-loads its own save (titleUpdate_hook
+// early-returns) and reaches gameplay only via the host's push, retrying connect
+// every 2 s. Mid-session that early-return does not apply - the join is already
+// in gameplay and only the link dropped - so the 2 s retry alone should carry it
+// back. If it does not, that is the finding; do NOT widen the budget to hide it.
+class ConnectRelinkScenario : public TimedScenario {
+public:
+    ConnectRelinkScenario()
+        : TimedScenario("connect_relink", 0), // no periodic-evidence gate: this scenario logs on transitions
+          issued_(0), waiting_(false), issuedAtMs_(0), budgetEndMs_(0),
+          preN_(0), anyIssued_(false), allRecovered_(true), done_(false),
+          obsKnown_(false), obsN_(0), obsPeakN_(0),
+          sawDrop_(false), sawReturn_(false) {
+        memset(preIds_, 0, sizeof(preIds_));
+    }
+
+    virtual void onStart(const ScenarioContext& ctx) {
+        char b[224];
+        _snprintf(b, sizeof(b) - 1,
+                  "SCENARIO relink start host=%d localId=%u side=%s role=%s "
+                  "atMs=%lu recoverMs=%lu count=%u adapter=%d",
+                  ctx.isHost ? 1 : 0, (unsigned)ctx.localId,
+                  iRelink(ctx.isHost) ? "relink" : "observe", roleName(),
+                  atMs(), recoverMs(), count(),
+                  ctx.relinkSession ? 1 : 0);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+
+    virtual bool onTick(const ScenarioContext& ctx) {
+        if (done_) return true;
+        return iRelink(ctx.isHost) ? tickRelink(ctx) : tickObserve(ctx);
+    }
+
+private:
+    // ---- knobs (read-once statics; main thread only) ------------------------
+    static unsigned long atMs() {
+        static long v = -1;
+        if (v < 0) {
+            const char* e = ::getenv("KENSHICOOP_RELINK_AT_MS");
+            v = e ? (long)::atoi(e) : 40000;
+            if (v < 0) v = 0;
+        }
+        return (unsigned long)v;
+    }
+    static unsigned long recoverMs() {
+        static long v = -1;
+        if (v < 0) {
+            const char* e = ::getenv("KENSHICOOP_RELINK_RECOVER_MS");
+            v = e ? (long)::atoi(e) : 60000;
+            if (v < 1000) v = 1000; // a budget below one connect-retry is unjudgeable
+        }
+        return (unsigned long)v;
+    }
+    static unsigned int count() {
+        static int v = -1;
+        if (v < 0) {
+            const char* e = ::getenv("KENSHICOOP_RELINK_COUNT");
+            v = e ? ::atoi(e) : 1;
+            if (v < 1) v = 1;
+            if (v > (int)MAX_RELINKS) v = (int)MAX_RELINKS;
+        }
+        return (unsigned int)v;
+    }
+    // 0 = host relinks, 1 = join relinks, 2 = both. First letter only, so
+    // 'host'/'join'/'both' and their initials all resolve; anything else is host.
+    static int role() {
+        static int v = -1;
+        if (v < 0) {
+            const char* e = ::getenv("KENSHICOOP_RELINK_ROLE");
+            char c = (e && e[0]) ? e[0] : 'h';
+            v = (c == 'j' || c == 'J') ? 1 : ((c == 'b' || c == 'B') ? 2 : 0);
+        }
+        return v;
+    }
+    static const char* roleName() {
+        int r = role();
+        return (r == 1) ? "join" : ((r == 2) ? "both" : "host");
+    }
+    bool iRelink(bool isHost) const {
+        int r = role();
+        if (r == 2) return true;            // both: every side relinks, in its own slot
+        return (r == 0) ? isHost : !isHost;
+    }
+
+    // Scheduled offset (from ARM) of this process's i-th relink. Single-role:
+    // at + i*recover. In `both` mode the sides INTERLEAVE one recovery budget
+    // apart - host on the even slots, join on the odd ones - so no two session
+    // boundaries ever overlap and each one is separately attributable.
+    unsigned long slotMs(unsigned int i, bool isHost) const {
+        const unsigned long at = atMs(), rec = recoverMs();
+        if (role() == 2) return at + (unsigned long)(2u * i + (isHost ? 0u : 1u)) * rec;
+        return at + (unsigned long)i * rec;
+    }
+    // When the whole schedule (either side) has certainly finished - the observer's
+    // own end-of-run, so it logs a RESULT instead of ticking forever.
+    unsigned long windowEndMs() const {
+        const unsigned long rec = recoverMs();
+        const unsigned int  n   = count();
+        unsigned long last = (role() == 2)
+            ? atMs() + (unsigned long)(2u * (n - 1u) + 1u) * rec
+            : atMs() + (unsigned long)(n - 1u) * rec;
+        return last + rec;
+    }
+
+    // ---- roster helpers -----------------------------------------------------
+    static unsigned int snapshot(const ScenarioContext& ctx, unsigned int* out) {
+        if (!ctx.connectedPeers) return 0;
+        return ctx.connectedPeers(out, MAX_PLAYERS);
+    }
+    static void idsCsv(const unsigned int* ids, unsigned int n, char* out, unsigned int cap) {
+        out[0] = '\0';
+        unsigned int used = 0;
+        for (unsigned int i = 0; i < n && i < MAX_PLAYERS; ++i) {
+            char one[16];
+            _snprintf(one, sizeof(one) - 1, (i == 0) ? "%u" : ",%u", (unsigned)ids[i]);
+            one[sizeof(one) - 1] = '\0';
+            unsigned int len = (unsigned int)strlen(one);
+            if (used + len + 1 >= cap) break;
+            memcpy(out + used, one, len);
+            used += len;
+            out[used] = '\0';
+        }
+    }
+    static bool containsAll(const unsigned int* have, unsigned int nHave,
+                            const unsigned int* want, unsigned int nWant) {
+        for (unsigned int i = 0; i < nWant; ++i) {
+            bool found = false;
+            for (unsigned int j = 0; j < nHave && !found; ++j)
+                if (have[j] == want[i]) found = true;
+            if (!found) return false;
+        }
+        return true;
+    }
+
+    // ---- the relinking side -------------------------------------------------
+    bool tickRelink(const ScenarioContext& ctx) {
+        char ids[80], b[224];
+
+        if (!waiting_ && issued_ < count() && ctx.elapsedMs >= slotMs(issued_, ctx.isHost)) {
+            // Snapshot BEFORE the relink: coopUiConnect's sessionResetForUi()
+            // clears the connected roster outright, so this set is the thing the
+            // reconnect has to rebuild.
+            preN_ = snapshot(ctx, preIds_);
+            idsCsv(preIds_, preN_, ids, sizeof(ids));
+            _snprintf(b, sizeof(b) - 1, "SCENARIO relink pre t=%lu peers=%u ids={%s}",
+                      ctx.elapsedMs, preN_, ids);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+
+            if (!ctx.relinkSession) {
+                // Same discipline as the other three adapters: the pointer is 0
+                // when Plugin.cpp did not supply it. Nothing to measure - fail
+                // loudly rather than idle to a vacuous pass.
+                _snprintf(b, sizeof(b) - 1,
+                          "SCENARIO relink skip t=%lu reason=no-adapter", ctx.elapsedMs);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+                setPassed(false);
+                done_ = true;
+                return true;
+            }
+
+            ++issued_;
+            anyIssued_ = true;
+            waiting_     = true;
+            issuedAtMs_  = ctx.elapsedMs;
+            budgetEndMs_ = ctx.elapsedMs + recoverMs();
+            // Emitted BEFORE the call so the evidence exists even if the session
+            // boundary itself faults (the use-after-free 9011527 fixed lives here).
+            _snprintf(b, sizeof(b) - 1, "SCENARIO relink issued t=%lu n=%u",
+                      ctx.elapsedMs, issued_);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            ctx.relinkSession();
+            return false;
+        }
+
+        if (waiting_) {
+            unsigned int cur[MAX_PLAYERS];
+            unsigned int n    = snapshot(ctx, cur);
+            bool         back = (preN_ > 0) && containsAll(cur, n, preIds_, preN_);
+            if (!back && ctx.elapsedMs < budgetEndMs_) return false;
+            waiting_ = false;
+            if (!back) allRecovered_ = false;
+            idsCsv(cur, n, ids, sizeof(ids));
+            _snprintf(b, sizeof(b) - 1,
+                      "SCENARIO relink post t=%lu peers=%u ids={%s} recoveredMs=%lu ok=%d",
+                      ctx.elapsedMs, n, ids,
+                      (unsigned long)(ctx.elapsedMs - issuedAtMs_), back ? 1 : 0);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        }
+
+        if (!waiting_ && issued_ >= count()) {
+            setPassed(anyIssued_ && allRecovered_);
+            done_ = true;
+            return true;
+        }
+        return false;
+    }
+
+    // ---- the observing side -------------------------------------------------
+    bool tickObserve(const ScenarioContext& ctx) {
+        unsigned int cur[MAX_PLAYERS];
+        unsigned int n = snapshot(ctx, cur);
+        if (!obsKnown_ || n != obsN_) {
+            char ids[80], b[224];
+            idsCsv(cur, n, ids, sizeof(ids));
+            _snprintf(b, sizeof(b) - 1, "SCENARIO relink peer t=%lu peers=%u ids={%s}",
+                      ctx.elapsedMs, n, ids);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            if (n < obsPeakN_)                     sawDrop_   = true;
+            else if (sawDrop_ && n >= obsPeakN_)   sawReturn_ = true;
+            if (n > obsPeakN_) obsPeakN_ = n;
+            obsKnown_ = true;
+            obsN_     = n;
+        }
+        if (ctx.elapsedMs >= windowEndMs()) {
+            char b[160];
+            _snprintf(b, sizeof(b) - 1,
+                      "SCENARIO relink observed t=%lu drop=%d return=%d peak=%u",
+                      ctx.elapsedMs, sawDrop_ ? 1 : 0, sawReturn_ ? 1 : 0, obsPeakN_);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            setPassed(sawDrop_ && sawReturn_);
+            done_ = true;
+            return true;
+        }
+        return false;
+    }
+
+    static const unsigned int MAX_RELINKS = 8;
+
+    // relinking side
+    unsigned int  issued_;
+    bool          waiting_;
+    unsigned long issuedAtMs_, budgetEndMs_;
+    unsigned int  preIds_[MAX_PLAYERS];
+    unsigned int  preN_;
+    bool          anyIssued_, allRecovered_, done_;
+    // observing side
+    bool          obsKnown_;
+    unsigned int  obsN_, obsPeakN_;
+    bool          sawDrop_, sawReturn_;
+};
+
 } // namespace
 
 Scenario* makeSessionScenario(const std::string& name) {
@@ -1350,6 +1630,7 @@ Scenario* makeSessionScenario(const std::string& name) {
     if (name == "load_probe")     return new LoadProbeScenario();
     if (name == "load_sync")      return new LoadSyncScenario();
     if (name == "money_persist")  return new MoneyPersistScenario();
+    if (name == "connect_relink") return new ConnectRelinkScenario();
     return 0;
 }
 

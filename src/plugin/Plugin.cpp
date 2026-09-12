@@ -346,6 +346,43 @@ void coopUiDisconnect();
 void coopLog(const char* msg) { coop::logLine(msg);    DebugLog(msg); }
 void coopErr(const char* msg) { coop::logErrLine(msg); ErrorLog(msg); }
 
+#ifdef KENSHICOOP_HARNESS
+// connect_relink's programmatic Connect (ScenarioContext::relinkSession, Phase 14
+// plan 01, UI-06). Placed here - after the coopUiConnect forward declaration
+// above and after coopLog - because it CALLS the panel handler.
+//
+// It calls coopUiConnect and NOTHING else. That is the whole point, not an
+// implementation shortcut: the F2 panel button has been the only live trigger for
+// this path, so commit 9011527 (clear the host join-slot roster at every NetLink
+// session boundary) has never been confirmed in a running game, and Phase 15 is
+// about to modify coopUiConnect itself. A copy of its sequence - stop(),
+// steamp2p::shutdown(), sessionResetForUi(), config re-arm, resolveOwnRanks,
+// startNetworking() - would run the same calls in the same order and prove
+// nothing about the function the panel actually reaches. coopUiConnect is already
+// a standalone free function taking exactly the panel's three choices, so calling
+// it verbatim IS the shared routine; do NOT "helpfully" inline or re-factor it,
+// and do NOT add any teardown, config re-arm or networking start of our own here.
+//
+// Arguments mirror the process's CURRENT state rather than imposing new ones:
+// the running role, the running transport, and peer id 0 so the existing config
+// value stands (coopUiConnect only overrides steamPeer when peerId != 0).
+//
+// THREADING (14-CONTEXT decision 4): the scenario tick runs on the GAME thread,
+// which is the thread coopUiConnect requires - it touches live game state and
+// NetLink::stop() joins the net thread. The logged tid is the evidence for that,
+// not decoration: plan 14-02 adds the matching game-thread id line so the pair
+// becomes an equality check.
+static bool coopScenarioRelinkSession() {
+    char b[96];
+    _snprintf(b, sizeof(b) - 1, "[coop-ui] RELINK src=scenario tid=%lu",
+              (unsigned long)::GetCurrentThreadId());
+    b[sizeof(b) - 1] = '\0';
+    coopLog(b);
+    coopUiConnect(g_cfg.isHost, g_cfg.transport == "steam", 0ULL);
+    return true;
+}
+#endif // KENSHICOOP_HARNESS
+
 // Blank-portraits diagnostic (protocol 36): loading a save folder without its
 // portrait atlas blanks the squad-tab avatars until the next portrait rebuild.
 // Warn at every coordinated-load issue point so a session log pinpoints WHICH
@@ -2350,6 +2387,7 @@ void tickScenarioStart(GameWorld* gw) {
             pctx.pickMintedProxy = &coopScenarioPickMintedProxy;
             pctx.connectedPeers = &coopScenarioConnectedPeers;
             pctx.cellOwnerAt = &coopScenarioCellOwnerAt;
+            pctx.relinkSession = &coopScenarioRelinkSession;
             g_scenario->onGameplay(pctx);
         }
         if (peerReady || fallback) {
@@ -2362,6 +2400,7 @@ void tickScenarioStart(GameWorld* gw) {
             ctx.pickMintedProxy = &coopScenarioPickMintedProxy;
             ctx.connectedPeers = &coopScenarioConnectedPeers;
             ctx.cellOwnerAt = &coopScenarioCellOwnerAt;
+            ctx.relinkSession = &coopScenarioRelinkSession;
             char m[200];
             _snprintf(m, sizeof(m) - 1, "SCENARIO arm trigger=%s waitedMs=%lu",
                       peerReady ? "peer-ready" : "timeout", (unsigned long)waitedMs);
@@ -2575,6 +2614,7 @@ void tickScenarioTick(GameWorld* gw) {
         ctx.pickMintedProxy = &coopScenarioPickMintedProxy;
         ctx.connectedPeers = &coopScenarioConnectedPeers;
         ctx.cellOwnerAt = &coopScenarioCellOwnerAt;
+        ctx.relinkSession = &coopScenarioRelinkSession;
         if (g_scenario->onTick(ctx)) {
             // Stage 2: the receiver emits its interpolation smoothness summary
             // alongside the verdict so the runner can assert per-frame gliding.
