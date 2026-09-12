@@ -433,7 +433,12 @@ $panelExit = -1
 $panelOut  = @()
 if ($collected.Count -gt 0) {
     Write-Host ""
-    $panelOut = & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $scriptDir "check_panel_log.ps1") -Log $collected 2>&1
+    # -Command with an explicit array literal, NOT -File: powershell.exe -File
+    # flattens "-Log a b" into positional arguments and check_panel_log.ps1 then
+    # refuses the second log with "a positional parameter cannot be found".
+    $quoted = ($collected | ForEach-Object { "'" + ($_ -replace "'", "''") + "'" }) -join ","
+    $cmd = "& '" + (Join-Path $scriptDir "check_panel_log.ps1") + "' -Log @(" + $quoted + "); exit `$LASTEXITCODE"
+    $panelOut = & powershell -NoProfile -ExecutionPolicy Bypass -Command $cmd 2>&1
     $panelExit = $LASTEXITCODE
     $panelOut | ForEach-Object { Write-Host "  $_" }
 } else {
@@ -459,4 +464,8 @@ $result = [ordered]@{
 $result | ConvertTo-Json -Depth 7 | Set-Content -LiteralPath (Join-Path $OutDir "result.json") -Encoding UTF8
 Write-Host ""
 Write-Host ("  result: {0}" -f (Join-Path $OutDir "result.json"))
+# Propagate the panel oracle's own verdict rather than always exiting 0: a SKIP
+# (exit 2, "no panel connects found") is what an UNDRIVEN run produces, and it
+# must not be reported to a caller as a green run.
+if ($collected.Count -gt 0) { exit $panelExit }
 exit 0
