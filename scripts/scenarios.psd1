@@ -1507,17 +1507,34 @@
         # criterion 4 (a run that never invokes the lever is indistinguishable
         # from a pre-phase run). Drive it explicitly via run_test.ps1 -Scenario.
         #
-        # KENSHICOOP_SAVE_SYNC='0' isolates what is under test. With save sync
-        # ON, every reconnect re-arms the host's connect-push, so the run would
-        # be measuring the bootstrap save-transfer pipeline instead of the roster
-        # boundary - and would take far longer to do it.
+        # NO DiagEnv, and specifically NOT KENSHICOOP_SAVE_SYNC='0' - MEASURED,
+        # run 2026-09-12 10:14 (tools\test-runs\phase14_tracer, first attempt).
+        # Turning save sync off looks right (it stops the host re-arming a
+        # connect-push on every reconnect, which would otherwise put the
+        # bootstrap save pipeline in the middle of a roster measurement) but it
+        # deadlocks the join before the scenario ever starts: titleUpdate_hook
+        # early-returns for `g_net.isRunning() && !isHost && !g_gameStarted`, so
+        # an online join NEVER auto-loads its own save and reaches gameplay only
+        # via the host's push - which is itself gated on saveSync. With it off
+        # the join sat at the title screen for the whole 220 s run
+        # ("[boot] title-tick running=1 host=0 started=0 saveEmpty=0", then
+        # nothing), health_join FAILed "never reached gameplay", and the
+        # observing half produced no evidence at all. Save sync stays at its
+        # default ON; the observing side instead finishes on the witnessed
+        # drop->return cycle, so its RESULT is on disk before the re-push lands.
         connect_relink = @{
-            DiagEnv = @{ KENSHICOOP_SAVE_SYNC = '0' }
             Save = 'squad1'; Setup = ''; Tolerance = 3.0
             PrimaryGate = 'panel_config'
             Gating   = @('panel_config')
             Advisory = @('clock_sync')
             Tier = 'none'; WanVariant = $false
+            # Seconds/KillGraceSec follow the house idiom and outlive the
+            # scenario's own window, which is 100 s FROM ARM at the defaults
+            # (KENSHICOOP_RELINK_AT_MS=40000 + RECOVER_MS=60000) - the self-exit
+            # clock runs from GAMEPLAY start, so the ~45 s peer-ready arming wait
+            # sits on top of that and the profile's 150 s default would cut the
+            # run off mid-recovery. Raise both together if RELINK_COUNT is raised.
+            Seconds = 220; KillGraceSec = 190
         }
 
         # bootstrap_stream: the missing-save "seamless join" proof (protocol

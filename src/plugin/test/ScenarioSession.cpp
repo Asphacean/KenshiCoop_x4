@@ -1389,8 +1389,20 @@ public:
           issued_(0), waiting_(false), issuedAtMs_(0), budgetEndMs_(0),
           preN_(0), anyIssued_(false), allRecovered_(true), done_(false),
           obsKnown_(false), obsN_(0), obsPeakN_(0),
-          sawDrop_(false), sawReturn_(false) {
+          dropOpen_(false), sawDrop_(false), cycles_(0) {
         memset(preIds_, 0, sizeof(preIds_));
+    }
+
+    // PRE-ARM roster watch, observing side only. The relinking side's schedule
+    // runs off the ARMED clock, and the two sides do not arm together (the host
+    // can arm on its 45 s peer-ready timeout while the join is still loading),
+    // so an observer that only started looking at its own arm could miss the
+    // drop entirely. Watching from gameplay start removes that race; the tag is
+    // distinct because ctx.elapsedMs here is the GAMEPLAY clock, not the armed
+    // one, and the two must never be read as the same series.
+    virtual void onGameplay(const ScenarioContext& ctx) {
+        if (iRelink(ctx.isHost)) return; // never relink before the armed clock exists
+        observeRoster(ctx, "prearm");
     }
 
     virtual void onStart(const ScenarioContext& ctx) {
@@ -1575,32 +1587,51 @@ private:
     }
 
     // ---- the observing side -------------------------------------------------
-    bool tickObserve(const ScenarioContext& ctx) {
+    // One roster sample. Emits only on a COUNT TRANSITION and counts completed
+    // drop->return cycles. `tag` names the clock ctx.elapsedMs is on: "peer" for
+    // the armed clock, "prearm" for the gameplay clock (onGameplay).
+    void observeRoster(const ScenarioContext& ctx, const char* tag) {
         unsigned int cur[MAX_PLAYERS];
         unsigned int n = snapshot(ctx, cur);
-        if (!obsKnown_ || n != obsN_) {
-            char ids[80], b[224];
-            idsCsv(cur, n, ids, sizeof(ids));
-            _snprintf(b, sizeof(b) - 1, "SCENARIO relink peer t=%lu peers=%u ids={%s}",
-                      ctx.elapsedMs, n, ids);
-            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
-            if (n < obsPeakN_)                     sawDrop_   = true;
-            else if (sawDrop_ && n >= obsPeakN_)   sawReturn_ = true;
-            if (n > obsPeakN_) obsPeakN_ = n;
-            obsKnown_ = true;
-            obsN_     = n;
+        if (obsKnown_ && n == obsN_) return;
+        char ids[80], b[224];
+        idsCsv(cur, n, ids, sizeof(ids));
+        _snprintf(b, sizeof(b) - 1, "SCENARIO relink %s t=%lu peers=%u ids={%s}",
+                  tag, ctx.elapsedMs, n, ids);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        if (n < obsPeakN_) {
+            dropOpen_ = true;
+            sawDrop_  = true;
+        } else if (dropOpen_ && n >= obsPeakN_) {
+            dropOpen_ = false;
+            ++cycles_;   // one full drop -> return observed
         }
-        if (ctx.elapsedMs >= windowEndMs()) {
-            char b[160];
-            _snprintf(b, sizeof(b) - 1,
-                      "SCENARIO relink observed t=%lu drop=%d return=%d peak=%u",
-                      ctx.elapsedMs, sawDrop_ ? 1 : 0, sawReturn_ ? 1 : 0, obsPeakN_);
-            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
-            setPassed(sawDrop_ && sawReturn_);
-            done_ = true;
-            return true;
-        }
-        return false;
+        if (n > obsPeakN_) obsPeakN_ = n;
+        obsKnown_ = true;
+        obsN_     = n;
+    }
+
+    bool tickObserve(const ScenarioContext& ctx) {
+        observeRoster(ctx, "peer");
+        // Finish as soon as every scheduled relink has been WITNESSED as a full
+        // drop->return, rather than idling to the end of the schedule window.
+        // That is the evidence this side exists to produce, and holding on past
+        // it is not free: with save sync on, the host re-arms a connect-push to
+        // the peer it just re-admitted, so this client may be reloaded shortly
+        // after the return - the RESULT must be on disk before that lands. The
+        // window is still the backstop, and it FAILS on no drop rather than
+        // passing vacuously.
+        bool complete = (cycles_ >= count());
+        if (!complete && ctx.elapsedMs < windowEndMs()) return false;
+        char b[176];
+        _snprintf(b, sizeof(b) - 1,
+                  "SCENARIO relink observed t=%lu drop=%d cycles=%u/%u peak=%u via=%s",
+                  ctx.elapsedMs, sawDrop_ ? 1 : 0, cycles_, count(), obsPeakN_,
+                  complete ? "cycles" : "window");
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        setPassed(complete);
+        done_ = true;
+        return true;
     }
 
     static const unsigned int MAX_RELINKS = 8;
@@ -1615,7 +1646,8 @@ private:
     // observing side
     bool          obsKnown_;
     unsigned int  obsN_, obsPeakN_;
-    bool          sawDrop_, sawReturn_;
+    bool          dropOpen_, sawDrop_;
+    unsigned int  cycles_;
 };
 
 } // namespace
