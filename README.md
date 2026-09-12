@@ -1,6 +1,6 @@
 # KenshiCoop x4
 
-**3–4 player UDP co-op for [Kenshi](https://lofigames.com/)** — an
+**2–4 player UDP co-op for [Kenshi](https://lofigames.com/)** — an
 [RE_Kenshi](https://github.com/BFrizzleFoShizzle/RE_Kenshi) /
 [KenshiLib](https://github.com/BFrizzleFoShizzle/KenshiLib) plugin that extends
 the original two-player co-op mod to **2, 3, or 4 players** over direct
@@ -48,6 +48,88 @@ shared money pool, game speed, game time, coordinated saves, and late-join.
 - **UDP / LAN transport is the target.** (Steam networking is out of scope for the
   expansion; the original two-player Steam path is left intact but not extended.)
 
+## Install
+
+**Every player needs, first:**
+
+1. **Kenshi 1.0.65+ (Steam).**
+2. **[RE_Kenshi 0.3.1+](https://www.nexusmods.com/kenshi/mods/847)** — the free
+   Nexus mod that loads the co-op plugin. Without it the plugin is never loaded
+   and the game just runs vanilla.
+3. **The Microsoft Visual C++ 2010 x64 runtime.** The plugin is built with the
+   VC++ 2010 (v100) toolset, a KenshiLib requirement. On Windows it is usually
+   already installed; under Proton / Steam Deck the installer checks for it and
+   names what is missing.
+
+**Then**, download `KenshiCoop-kit.zip` from the
+[Releases page](https://github.com/Asphacean/KenshiCoop_x4/releases/latest),
+extract it (on Windows: right-click the zip → Properties → Unblock first, if
+shown), and from the extracted folder run:
+
+```
+powershell -ExecutionPolicy Bypass -File install_coop.ps1                       # Windows
+sh ./install_coop.sh --kenshi-dir ~/.local/share/Steam/steamapps/common/Kenshi  # Linux / Steam Deck
+```
+
+The installer checks the prerequisites above, backs up anything it replaces —
+verifying each backup by hash *before* touching the original — and writes the
+mod. On Windows it auto-detects your Kenshi installation and stops rather than
+guessing if it finds more than one; pass `-KenshiDir "<path>"` in that case. The
+Linux script does not auto-detect at all — `--kenshi-dir` is always required.
+Then launch Kenshi and enable **KenshiCoop** in the Mods menu.
+
+`install_coop.ps1 -Info` reports what is installed without changing anything;
+`-Uninstall` reverses the install from the manifest it recorded, restoring the
+backups it verified and leaving alone any file you edited yourself.
+
+> **Everyone must install the same build.** The protocol version is checked at
+> handshake and a mismatch is rejected by design — which, from inside the game,
+> looks like nothing more than "it just won't connect". If that happens, check
+> `<Kenshi>\KenshiCoop_*.log` for `protocol mismatch`, and compare `dllSha256` in
+> the `PROVENANCE.json` that ships in the kit.
+
+## Play (LAN / direct UDP)
+
+The connection is configured **entirely from the in-game F2 panel** — role,
+transport, and the host's address. There is no config file to edit.
+
+1. **Host:** start a new game and pick a co-op start matching your player count
+   (see below), or load an existing save. Press **F2**, set **Transport: UDP** and
+   **Role: HOST**, then toggle **Connection** to **ONLINE**. Tell the others your
+   address and port (default `27800`).
+2. **Each joiner:** press **F2** — this works at the **main menu**, no save needed
+   — set **Transport: UDP** and **Role: JOIN**, paste the host's address into the
+   peer address field, then toggle **Connection** to **ONLINE**.
+3. The host streams its world over on connect and the joiner loads straight into
+   it. The status line and the top-left banner show the transfer. Toggle
+   **Connection** to **OFFLINE** to leave; the others keep playing.
+
+Joiners connect to the **host only**, never to each other. Everyone must be able
+to reach the host over UDP: same LAN, or the host's port forwarded / everyone on a
+VPN (Tailscale, Hamachi) for internet play.
+
+### Good to know
+
+- **One squad tab per player.** The mod bundles `Multiplayer (Wanderer x4)` (four
+  squads), `Multiplayer (Wanderer x2)`, and `Multiplayer+ (Wanderer x2)` (x2 with
+  500,000 shared cats and 50-in-every-stat, to skip the grind). Pick the start that
+  matches your group — **a squad tab beyond the number of connected players is
+  owned by nobody**: every client can move it and its state is not synced. Loading
+  an existing save works too; split units into extra squad tabs in-game, one per
+  player.
+- **Joiners don't need the host's save** — it's streamed on connect; an identical
+  local copy just skips the transfer.
+- **Saving is coordinated.** Any save any player makes becomes one shared save,
+  streamed to everyone. To resume, the host loads it and goes online; the others
+  reconnect from the main menu.
+- **Late join works.** A player can join (or reconnect) after the session is
+  already running — only the newcomer gets the world transfer.
+- **Two players over Steam (optional).** The original two-player Steam P2P path
+  still works (leave Transport on **STEAM**, swap Steam IDs in the F2 panel) but it
+  is **not** extended to 3–4 players — use UDP for three or four.
+- **Known defects are tracked in the open.** `.planning/WINDOWS.md` is the current
+  list; `docs/RELEASE_BLOCKERS.md` is what gates publication.
+
 ## How it works
 
 - `KenshiCoop.dll` is loaded into the game by RE_Kenshi. It hooks the engine via
@@ -65,122 +147,12 @@ src/plugin/       The KenshiCoop plugin (net, sync/replication, engine facade, s
 src/netproto/     Shared wire-protocol headers (plain C++03, compiled by everything)
 src/nettest/      Standalone ENet console app (transport / multi-peer tests)
 src/prototest/    Wire-protocol unit tests
-scripts/          Build, deploy, session, and automated-test tooling (PowerShell)
+scripts/          Build, install, session, and automated-test tooling (PowerShell)
 docs/             Build guide, engine/API reference, protocol history, replication pitfalls
                   (incl. CROSS_MACHINE_RIG.md - the two-machine Windows-host +
                   Steam-Deck-join test rig procedure)
 third_party/      ENet patches, VC10 compat shim (deps are fetched, not committed)
 ```
-
-## Install & play — full 4-player walkthrough (LAN / direct UDP)
-
-This walks through a **4-player** game: **one host + three joiners**. For 2 or 3
-players it's identical — just fewer joiners. Everyone is on their own machine, and
-all three joiners must be able to reach the host over UDP (same LAN, or the host's
-port forwarded / a VPN for internet play). Joiners connect to the **host only**,
-never to each other.
-
-### Step 1 — Prerequisites (all four players)
-
-1. **Kenshi 1.0.65 (Steam).**
-2. **[RE_Kenshi 0.3.1+](https://www.nexusmods.com/kenshi/mods/847)** — the free
-   Nexus mod that loads the co-op plugin.
-
-### Step 2 — Install the mod (all four players)
-
-Get the **`KenshiCoop`** mod folder from the
-[Releases page](https://github.com/Asphacean/KenshiCoop_x4/releases/latest)
-(recommended — same build for everyone), or from
-[`dist/mod-kit/KenshiCoop`](dist/mod-kit/KenshiCoop) in this repository. Copy it
-into your Kenshi `mods` directory so you end up with:
-
-```
-<Kenshi>\mods\KenshiCoop\KenshiCoop.dll
-```
-
-(default Steam path: `C:\Program Files (x86)\Steam\steamapps\common\Kenshi\mods\`).
-Launch Kenshi and enable **KenshiCoop** in the Mods menu. **All four players must
-run the same release** — the protocol version is checked on connect.
-
-### Step 3 — The host shares its address
-
-The host tells the three joiners its **IP and port** (default port `27800`):
-
-- **Same LAN:** the host's local IPv4 (e.g. `192.168.1.10` — find it with
-  `ipconfig`).
-- **Over the internet:** the host's public IP, with UDP port `27800` forwarded to
-  the host machine (or everyone on a VPN like Hamachi/Tailscale, using the host's
-  VPN address).
-
-### Step 4 — Each of the three joiners points at the host
-
-Every **joiner** edits `<Kenshi>\mods\KenshiCoop\coop_config.json` (all three use
-the *same* host address):
-
-```jsonc
-{
-  "transport": "udp",
-  "ip": "192.168.1.10",   // the HOST's address (from Step 3)
-  "port": 27800,          // the HOST's port
-  "autoConnect": false
-}
-```
-
-`ip`/`port` are re-read every time you go online, so no restart after an edit. The
-**host** only needs `"transport": "udp"` (its `ip`/`port` are ignored — it listens).
-
-### Step 5 — Host goes online
-
-1. Start a new game and pick **`Multiplayer (Wanderer x4)`** from the start list —
-   a ready-made **four-squad** start, one squad per player, so nobody has to split
-   tabs by hand. (Or load any existing save; see notes below.)
-2. Press **F2**, set **Transport: UDP** and **Role: HOST**, then toggle
-   **Connection** to **ONLINE**. The top-left banner shows the host is listening.
-
-### Step 6 — Each joiner connects (one at a time or together)
-
-Each of the three joiners, on their own machine:
-
-1. At the **main menu** (no save needed), press **F2**.
-2. Set **Transport: UDP** and **Role: JOIN**, then toggle **Connection** to
-   **ONLINE**.
-3. The host streams its world over on connect and the joiner loads straight into
-   it. Watch the top-left banner for the transfer, then the world loads.
-
-Repeat for the second and third joiner. Once all three are in, you have a
-four-player session: host = squad 1, joiners = squads 2, 3, 4. Toggle
-**Connection** to **OFFLINE** to leave; others keep playing.
-
-### Good to know
-
-- **One squad tab per player.** With the **`Multiplayer (Wanderer x4)`** start each
-  of the four players already has their own squad. Everyone's squad is visible and
-  synced on every screen but answers only to its owner. The mod also bundles
-  `Multiplayer (Wanderer x2)` (two squads) and `Multiplayer+ (Wanderer x2)` (x2 with
-  500,000 shared cats and 50-in-every-stat, to skip the grind). Loading an existing
-  save works too — just split units into extra squad tabs in-game, one per player.
-- **Joiners don't need the host's save** — it's streamed on connect; an identical
-  local copy just skips the transfer.
-- **Saving is coordinated.** Any save any player makes becomes one shared save,
-  streamed to everyone. To resume, the host loads it and goes online; the others
-  reconnect from the main menu.
-- **Late join works.** A player can join (or reconnect) after the session is
-  already running — only the newcomer gets the world transfer; the others aren't
-  interrupted.
-- **Two players over Steam (optional).** The original two-player Steam P2P path
-  still works (leave Transport on **STEAM**, swap Steam IDs in the F2 panel) but it
-  is **not** extended to 3–4 players — use UDP for three or four.
-
-### If something goes wrong
-
-- **"The co-op plugin has not started"** — RE_Kenshi didn't load it. Check
-  `<Kenshi>\RE_Kenshi_log.txt` for `KenshiCoop`; reinstalling
-  [RE_Kenshi](https://www.nexusmods.com/kenshi/mods/847) usually fixes it.
-- **No connection (UDP)** — the joiners' `ip`/`port` must match the host, and the
-  host must be reachable over UDP (LAN, or the port forwarded / VPN for internet
-  play). Look for connection lines in `<Kenshi>\KenshiCoop_*.log`.
-- **"protocol mismatch" in the log** — someone has a different build; everyone
-  should reinstall from the same release.
 
 ## Building
 
@@ -202,10 +174,13 @@ Dependencies are fetched, not committed:
   `third_party/enet/enet/` and apply the patches in `third_party/enet/patches/`
   (see `third_party/enet/README.md`)
 
-`scripts/` also holds the automated test harness: headless protocol/transport
-suites (`build_prototest.cmd`, `build_nettest.cmd`) and a scenario-based live
-regression suite that launches host + up to three joins across local installs and
-produces PASS/FAIL verdicts from the logs.
+`scripts/make_mod_kit.ps1` packages the release kit — it builds Release (no
+scenario harness), hash-stamps every packaged file into `PROVENANCE.json`, and
+derives a `shippable` verdict from `docs/RELEASE_BLOCKERS.md`. `scripts/` also
+holds the automated test harness: headless protocol/transport suites
+(`build_prototest.cmd`, `build_nettest.cmd`) and a scenario-based live regression
+suite that launches host + up to three joins across local installs and produces
+PASS/FAIL verdicts from the logs.
 
 ## Credits
 
