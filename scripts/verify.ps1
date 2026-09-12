@@ -147,6 +147,35 @@ if (Test-Path $relinkLever) {
     $overall = $false
 }
 
+# ---- 7. Player installer: round trip, backups, prerequisites (zero game) -------
+# Phase 16 plan 01 (INST-01/03/04/05): the installer writes into someone else's
+# game directory, so its reversal is proved by whole-tree hash rather than by an
+# exit code, and its backups are proved to be content-addressed. Enumerated by
+# GLOB rather than by filename so plans 16-02 and 16-03 add coverage without
+# editing this file again.
+Write-Host ""
+Write-Host "############################################################"
+Write-Host "# verify: player installer guard"
+Write-Host "############################################################"
+$installerTests = @(Get-ChildItem -Path (Join-Path $scriptDir "tests") -Filter "Installer*.Tests.ps1" -File -ErrorAction SilentlyContinue | Sort-Object Name)
+$installerOk = $true
+if ($installerTests.Count -eq 0) {
+    # An empty glob is a FAIL, not a silent skip: a suite that was renamed or
+    # deleted would otherwise turn this guard green by disappearing.
+    Write-Host "INSTALLER GUARD: FAIL - no scripts\tests\Installer*.Tests.ps1 matched the glob"
+    $installerOk = $false
+} else {
+    foreach ($f in $installerTests) {
+        & powershell -NoProfile -ExecutionPolicy Bypass -File $f.FullName
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host ("INSTALLER SUITE $($f.Name): FAIL (exit $LASTEXITCODE)")
+            $installerOk = $false
+        }
+    }
+}
+Write-Host ("INSTALLER GUARD: " + $(if ($installerOk) { "PASS" } else { "FAIL" }))
+if (-not $installerOk) { $overall = $false }
+
 # ---- summary -------------------------------------------------------------------
 Write-Host ""
 Write-Host "================= VERIFY SUMMARY ================="
@@ -156,5 +185,6 @@ Write-Host ("  oracle fixtures:          " + $(if ($oracleOk) { "PASS" } else { 
 Write-Host ("  routing matrix:           " + $(if ($routingOk) { "PASS" } else { "FAIL" }))
 Write-Host ("  census repro guard:       " + $(if ($censusReproOk) { "PASS" } else { "FAIL" }))
 Write-Host ("  relink lever guard:       " + $(if ($relinkLeverOk) { "PASS" } else { "FAIL" }))
+Write-Host ("  installer guard:          " + $(if ($installerOk) { "PASS" } else { "FAIL" }))
 Write-Host ("OVERALL: " + $(if ($overall) { "PASS" } else { "FAIL" }))
 if ($overall) { exit 0 } else { exit 1 }
