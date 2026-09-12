@@ -521,7 +521,14 @@ resolve_payload() {
     if [ -n "$given" ]; then
         candidates="$given"
     else
+        # "$SCRIPT_DIR/KenshiCoop" is the RELEASE KIT's own layout: the kit
+        # produced by scripts/make_mod_kit.ps1 puts this installer beside the
+        # KenshiCoop folder it installs, the same shape install_coop.ps1
+        # already resolves. Without it the shipped kit can only be installed
+        # by passing --source by hand.
         candidates="$SCRIPT_DIR/payload
+$SCRIPT_DIR/KenshiCoop
+$REPO_ROOT/dist/mod-kit/KenshiCoop
 $REPO_ROOT/dist/mod-kit
 $REPO_ROOT/dist/mod-kit/mods/KenshiCoop
 $SCRIPT_DIR"

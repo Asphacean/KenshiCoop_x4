@@ -131,24 +131,32 @@ Copy-Item $dll  (Join-Path $modDir "KenshiCoop.dll")
 Copy-Item $json (Join-Path $modDir "RE_Kenshi.json")
 Copy-Item $mod  (Join-Path $modDir "KenshiCoop.mod")
 
-# coop_config.json (LAN/UDP only; Steam play needs no config). Written fresh so
-# the release always ships a clean default.
-@'
-{
-  // KenshiCoop config. For a normal Steam game you do NOT need to edit this file:
-  // your friend's Steam ID is entered in-game (press F2, click "Copy my Steam ID"
-  // to share yours, then "Paste friend's Steam ID" to enter theirs), and nothing
-  // is written back to disk.
-  //
-  // This file only matters for a LAN / direct-UDP game: set "transport": "udp"
-  // and put the host's address in "ip" (and "port" if you changed it). ip/port are
-  // re-read each time you click Connect, so you can edit them without restarting.
-  "transport": "steam",
-  "ip": "127.0.0.1",
-  "port": 27800,
-  "autoConnect": false
+# The INSTALLERS ship with the kit, beside the KenshiCoop folder - the layout
+# both of them already resolve a payload from. This is what closes
+# RELEASE_BLOCKERS row KIT-PROVENANCE: the only way to hand someone a playable
+# KenshiCoop is now to hand them a kit this script built, which means a stamped
+# PROVENANCE.json travels with it. dist\KenshiCoop-friend-kit.zip existed
+# because the pipeline produced no installable artifact and a hand-made zip
+# filled the gap; an artifact that carries its own installer removes the reason
+# to make one by hand.
+foreach ($inst in @("install_coop.ps1", "install_coop.sh")) {
+    $src = Join-Path $scriptDir $inst
+    if (-not (Test-Path -LiteralPath $src)) { throw "$inst not found at $src" }
+    Copy-Item $src (Join-Path $kitDir $inst)
 }
-'@ | Set-Content (Join-Path $modDir "coop_config.json") -Encoding UTF8
+# install_coop.sh is run by a Linux/Steam Deck player; a CRLF shebang line is
+# "bad interpreter: /bin/sh^M". Normalise it on the way into the kit.
+$shPath = Join-Path $kitDir "install_coop.sh"
+$shText = [System.IO.File]::ReadAllText($shPath) -replace "`r`n", "`n"
+[System.IO.File]::WriteAllText($shPath, $shText, (New-Object System.Text.UTF8Encoding($false)))
+
+# coop_config.json is deliberately NOT packaged. Since Phase 15 the F2 panel
+# arms the endpoint itself, so a fresh install with no config file is a working
+# state - and install_coop.ps1 already refuses to write one for the same
+# reason. A shipped config is an INVISIBLE INPUT: it would sit on disk saying
+# "transport": "steam" while the player sets UDP in the panel, which is a
+# support case with no symptom to read. The kit ships the three payload files
+# and nothing else.
 
 # Top-level README (sibling to the KenshiCoop folder, so it is NOT copied into
 # the game). Plain "copy the folder" instructions - no install script.
@@ -156,50 +164,74 @@ $readmeText = @'
 KenshiCoop x4 - 3-4 player co-op mod
 ====================================
 
-This zip contains the "KenshiCoop" folder (that folder IS the mod), plus this
-README and PROVENANCE.json. Supports 2, 3, or 4 players over direct UDP / LAN.
-Everyone must run this same build.
+This zip contains the "KenshiCoop" folder (that folder IS the mod), an installer
+for Windows and one for Linux/Steam Deck, this README, and PROVENANCE.json.
+Supports 2, 3, or 4 players over direct UDP / LAN. Everyone must run this same
+build: the protocol version is checked when you connect and a mismatch is
+rejected, which from the game looks simply like "it will not connect".
 
-INSTALL (every player)
-----------------------
-  1. Right-click the downloaded zip > Properties > Unblock (if shown), then
-     extract it.
-  2. Copy the "KenshiCoop" folder into your Kenshi mods folder:
-       <Kenshi>\mods\
-     so you end up with:
-       <Kenshi>\mods\KenshiCoop\KenshiCoop.dll   (and the other files)
-     The default Steam path is:
-       C:\Program Files (x86)\Steam\steamapps\common\Kenshi\mods\
-  3. Launch Kenshi and enable "KenshiCoop" in the Mods menu.
+PROVENANCE.json records which build this is - the DLL's SHA-256, the protocol
+version, and a hash of every file in this zip. If you are unsure what someone
+sent you, that file is how you check.
 
 PREREQUISITES (every player)
 ----------------------------
-  1. Kenshi 1.0.65 (Steam).
+  1. Kenshi 1.0.65+ (Steam).
   2. RE_Kenshi 0.3.1+ (free mod that loads the plugin):
      https://www.nexusmods.com/kenshi/mods/847
-  3. The host must be reachable over UDP by every joiner: same LAN, or the
-     host's port forwarded / a VPN for internet play.
+  3. The Microsoft Visual C++ 2010 x64 runtime (the plugin is built with it).
+     On Windows it is usually already present. Under Proton / Steam Deck the
+     installer checks for it and tells you what is missing.
+  4. The host must be reachable over UDP by every joiner: same LAN, or the
+     host's port forwarded / a VPN (Tailscale, Hamachi) for internet play.
+
+INSTALL (every player)
+----------------------
+  Windows:
+    1. Right-click the downloaded zip > Properties > Unblock (if shown), then
+       extract it.
+    2. In the extracted folder, run:
+         powershell -ExecutionPolicy Bypass -File install_coop.ps1
+       It finds your Kenshi installation, backs up anything it replaces
+       (verifying the backup by hash first), and writes the mod. If it finds
+       more than one install it stops and asks which, so pass:
+         powershell -ExecutionPolicy Bypass -File install_coop.ps1 -KenshiDir "<path to Kenshi>"
+    3. Launch Kenshi and enable "KenshiCoop" in the Mods menu.
+
+  Linux / Steam Deck:
+    1. Extract the zip, then in that folder run:
+         sh ./install_coop.sh --kenshi-dir ~/.local/share/Steam/steamapps/common/Kenshi
+       This script does NOT auto-detect: --kenshi-dir is always required, and
+       must point at the folder holding kenshi_x64.exe. Same behaviour
+       otherwise, plus a check for the VC++ 2010 runtime files Proton needs
+       beside kenshi_x64.exe.
+    2. Launch Kenshi and enable "KenshiCoop" in the Mods menu.
+
+  To see what is installed without changing anything:
+      install_coop.ps1 -Info            /  install_coop.sh --kenshi-dir DIR --info
+  To remove it:
+      install_coop.ps1 -Uninstall       /  install_coop.sh --kenshi-dir DIR --uninstall
+  (The uninstall is driven by the manifest written at install time and restores
+  the backups it verified; a file you edited yourself is reported and left
+  alone, not deleted.)
 
 PLAY (LAN / direct UDP)
 -----------------------
-  1. Each JOINER edits <Kenshi>\mods\KenshiCoop\coop_config.json (Notepad):
-       "transport": "udp"
-       "ip":   the HOST's address   (e.g. "192.168.1.10")
-       "port": the HOST's port      (default 27800)
-     ip/port are re-read whenever you go ONLINE, so no restart after an edit.
-     The host only needs "transport": "udp".
-  2. HOST: load a save, or start a new game and pick a co-op start from the list
+  The connection is set up entirely in-game. There is no config file to edit.
+
+  1. HOST: load a save, or start a new game and pick a co-op start from the list
      that matches your player count (see GAME STARTS below). Press F2, set
-     Transport: UDP and Role: HOST, then toggle Connection to ONLINE.
-  3. EACH JOINER: press F2 (works at the MAIN MENU - no save needed), set
-     Transport: UDP and Role: JOIN, then toggle Connection to ONLINE. The host
-     streams its world to you on connect and you load right into it. Joiners
-     connect to the host only, never to each other. (If you already have an
-     identical copy of the host's save on disk it is used as-is instead of
-     transferring.)
-  4. The white status line and the TOP-LEFT banner show live connection/transfer
+     Transport: UDP and Role: HOST, then toggle Connection to ONLINE. Tell the
+     other players your IP address and port (default 27800).
+  2. EACH JOINER: press F2 (works at the MAIN MENU - no save needed), set
+     Transport: UDP and Role: JOIN, paste the host's address into the peer
+     address field, then toggle Connection to ONLINE. The host streams its world
+     to you on connect and you load right into it. Joiners connect to the host
+     only, never to each other. (If you already have an identical copy of the
+     host's save on disk it is used as-is instead of transferring.)
+  3. The white status line and the TOP-LEFT banner show live connection/transfer
      state, at the main menu as well as in-game. Toggle Connection to OFFLINE to
-     leave.
+     leave; the others keep playing.
 
 GAME STARTS (one squad tab per player)
 --------------------------------------
@@ -229,18 +261,34 @@ SAVING
 
 UNINSTALL
 ---------
-  Delete <Kenshi>\mods\KenshiCoop. Nothing else is touched.
+  Run the installer again with -Uninstall (Windows) or --uninstall (Linux). It
+  reverses exactly what it recorded at install time. Removing
+  <Kenshi>\mods\KenshiCoop by hand also works.
+
+KNOWN LIMITATIONS (worth knowing before you start)
+--------------------------------------------------
+  * Take a save sized to your group. A squad tab beyond the number of connected
+    players is owned by NOBODY: every client can move it, and its state is not
+    synced between you. Use the start that matches your player count.
+  * A knocked-out body's resting position can drift apart between clients while
+    it lies there. It is static while down and corrects when the character gets
+    back up.
+  * Three and four players over UDP is the new capability and it is a hobby
+    project. Expect rough edges; the full, current list of known defects is in
+    .planning/WINDOWS.md in the repository.
 
 TROUBLESHOOTING
 ---------------
   * "The co-op plugin has not started": RE_Kenshi didn't load it. Check
     <Kenshi>\RE_Kenshi_log.txt for 'KenshiCoop'; reinstalling RE_Kenshi
     usually fixes it.
-  * No connection (UDP): the joiners' ip/port must match the host, and the host
-    must be reachable over UDP (LAN, or port forwarded / VPN for internet play).
-    Look for connection lines in <Kenshi>\KenshiCoop_*.log.
-  * "protocol mismatch": someone has a different build; everyone should use the
-    same release.
+  * No connection (UDP): the address each joiner pasted into the F2 panel must
+    be the host's, and the host must be reachable over UDP (LAN, or port
+    forwarded / VPN for internet play). Look for connection lines in
+    <Kenshi>\KenshiCoop_*.log.
+  * It just will not connect, with no other symptom: check the log for
+    "protocol mismatch". Someone has a different build. Every player must
+    install the SAME zip - compare dllSha256 in PROVENANCE.json.
 '@
 
 # A player who reconnects and is told 'slots full' deserves to have read
@@ -281,6 +329,16 @@ if ($packagedSha -ne $canonSha) {
 $protoLine = Select-String -Path (Join-Path $repoRoot "src\netproto\Wire.h") `
     -Pattern 'PROTOCOL_VERSION\s*=\s*(\d+)' | Select-Object -First 1
 $proto = if ($protoLine) { $protoLine.Matches[0].Groups[1].Value } else { "?" }
+# Every packaged file, hashed. The DLL hash alone identifies the build but says
+# nothing about the installer that writes it or the config it drops, and those
+# are files a recipient runs. A manifest lets anyone re-hash what they received
+# and compare, which is the whole point of shipping provenance rather than a
+# version string.
+$fileManifest = [ordered]@{}
+foreach ($f in @(Get-ChildItem -Recurse -File -LiteralPath $kitDir | Sort-Object FullName)) {
+    $rel = $f.FullName.Substring($kitDir.Length + 1).Replace("\", "/")
+    $fileManifest[$rel] = (Get-FileHash -Algorithm SHA256 -LiteralPath $f.FullName).Hash
+}
 @{
     dllSha256       = $canonSha
     protocolVersion = $proto
@@ -289,8 +347,27 @@ $proto = if ($protoLine) { $protoLine.Matches[0].Groups[1].Value } else { "?" }
     blockersFile    = "docs/RELEASE_BLOCKERS.md"
     releaseBlockers = @($releaseBlockers)
     shippable       = $shippable
-} | ConvertTo-Json | Set-Content (Join-Path $kitDir "PROVENANCE.json") -Encoding UTF8
+    producedBy      = "scripts/make_mod_kit.ps1"
+    repository      = "https://github.com/Asphacean/KenshiCoop_x4"
+    files           = $fileManifest
+} | ConvertTo-Json -Depth 5 | Set-Content (Join-Path $kitDir "PROVENANCE.json") -Encoding UTF8
 Write-Host "Packaged DLL SHA-256 verified == canonical."
+Write-Host ("Hashed $($fileManifest.Count) packaged files into PROVENANCE.json.")
+
+# The hand-assembled friend kit is retired. It carried no PROVENANCE.json, so a
+# recipient could not tell which build they had - the support case the kit
+# pipeline exists to remove (RELEASE_BLOCKERS row KIT-PROVENANCE). Deleting it
+# here means it cannot quietly reappear beside a stamped kit and get sent to
+# someone by mistake.
+foreach ($stale in @(
+    (Join-Path $repoRoot "dist\KenshiCoop-friend-kit.zip"),
+    (Join-Path $repoRoot "dist\friend-kit")
+)) {
+    if (Test-Path -LiteralPath $stale) {
+        Remove-Item -LiteralPath $stale -Recurse -Force
+        Write-Host ("Removed un-stamped artifact: " + $stale)
+    }
+}
 
 # Zip: the archive contains the KenshiCoop\ folder + README.txt + PROVENANCE.json.
 $zip = Join-Path $repoRoot "dist\KenshiCoop-kit.zip"
