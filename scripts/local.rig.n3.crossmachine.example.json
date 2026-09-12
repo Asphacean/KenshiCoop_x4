@@ -1,0 +1,32 @@
+{
+  "_comment": "Phase 13 plan 01 (CENSUS-05): committed rig TEMPLATE for the WINDOWS HALF of the CROSS-MACHINE N=3 shape - copy to local.rig.n3.crossmachine.json (gitignored, like the other local rigs) and adjust installDir per this machine's layout. IMPORTANT: this file declares only 2 instances on purpose. The third participant is a REMOTE join (join2) on a second physical machine, launched by hand per docs/CROSS_MACHINE_RIG.md - it is deliberately NOT declared here because run_test4.ps1 would try to launch it LOCALLY from an installDir on this machine, which is exactly what must not happen. Run the Windows pair with -ExpectedInstances 2 (that is what this rig launches), then fetch the remote log into the run dir as join2.log and invoke the judge at -ExpectedInstances 3: scripts/analyze_run4.ps1 -RunDir <runDir> -ExpectedInstances 3. The oracle already supports this offline 3-instance shape (verdict.json carries offline:true) - it is how the archived cross-machine FAIL tools/test-runs/20260912_035018_N2 was judged. THIS FILE IS NOT STANDARD N=3 COVERAGE: scripts/local.rig.n3.example.json driven by scripts/repro_census_n3.ps1 is. That reproducer cannot be used for this leg because its structural guard requires a rig declaring exactly 3 instances and launches every one of them locally; nothing about the reproducer or any other pinned file is modified to accommodate this rig.",
+  "save": "wanderer4",
+  "_save_comment": "wanderer4 = the same baked 4-squad start the N=3/N=4 gates use (tools/MultiplayerStartGen). At N=3 only ranks 0/1/2 are ever connected. Both the local instances AND the remote join must load the SAME save fixture, or the census oracle is comparing two different worlds.",
+  "port": 27800,
+  "ip": "127.0.0.1",
+  "_ip_comment": "127.0.0.1 is the address the LOCAL join1 dials. The host binds ENET_HOST_ANY (src/plugin/net/NetLink.cpp), so it accepts the loopback join and the remote join on the same port simultaneously. The REMOTE join dials this machine's routable/tailnet address instead, set as KENSHICOOP_IP in its own environment - see docs/CROSS_MACHINE_RIG.md. Do not put the routable address here: it would only change which address the local join1 dials, and it is machine-identifying data that must not reach a committed file.",
+  "seconds": 320,
+  "_seconds_comment": "320 is the per-machine fallback only. The cross-machine gate run passes -Seconds 210 explicitly, matching the value scripts/repro_census_n3.ps1 uses for the loopback leg, so the two legs are directly comparable. The remote join's KENSHICOOP_TEST_SECONDS must be set to the SAME number.",
+  "instances": [
+    {
+      "role": "host",
+      "installDir": "F:\\KenshiCoop-Clone4",
+      "port": 27800,
+      "logName": "host.log",
+      "env": {},
+      "disconnectAtSec": null,
+      "reconnectAtSec": null,
+      "_comment": "The world authority. Declares no env: a KENSHICOOP_NETSIM_* key here would be one of Phase 12's three forbidden escapes (injected receive-side delay masks the simultaneous-join census race just as a deferred launch does), so env stays empty by construction - same anti-escape rule as scripts/local.rig.n3.example.json."
+    },
+    {
+      "role": "join",
+      "installDir": "F:\\KenshiCoop-Clone1",
+      "port": 27800,
+      "logName": "join1.log",
+      "env": {},
+      "disconnectAtSec": null,
+      "reconnectAtSec": null,
+      "_comment": "The LOCAL join. Undeferred (reconnectAtSec null) - a deferred join is a masking lever that hides the simultaneous-join census race, not standard coverage. Its 'KenshiCoop: effective cfg' log line is the reference the REMOTE join2's must be compared against after the run: the two must be identical from 'scenario=' onward, or the run had one participant on a different configuration and is not a single gate. The known delta to close is KENSHICOOP_CELL_AUTH: scripts/CoopHarness.psm1 pins it to 0 for every locally launched instance, and a remote join launched outside that harness inherits the SHIPPED default instead (the archived cross-machine FAIL logged cellAuth=1 on the remote side against cellAuth=0 locally)."
+    }
+  ]
+}

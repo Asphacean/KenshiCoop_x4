@@ -67,6 +67,8 @@ src/nettest/      Standalone ENet console app (transport / multi-peer tests)
 src/prototest/    Wire-protocol unit tests
 scripts/          Build, deploy, session, and automated-test tooling (PowerShell)
 docs/             Build guide, engine/API reference, protocol history, replication pitfalls
+                  (incl. CROSS_MACHINE_RIG.md - the two-machine Windows-host +
+                  Steam-Deck-join test rig procedure)
 third_party/      ENet patches, VC10 compat shim (deps are fetched, not committed)
 ```
 

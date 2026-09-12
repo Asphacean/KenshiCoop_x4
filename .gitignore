@@ -95,6 +95,12 @@ scripts/local.rig.n3.json
 # machine-local install paths, never committed.
 scripts/local.rig.n3.deferred-join.json
 
+# Machine-local derivative of the cross-machine N=3 variant (Phase 13 plan 01,
+# CENSUS-05): same rationale as the four rigs above - carries machine-local
+# install paths, never committed. Committed template:
+# scripts/local.rig.n3.crossmachine.example.json.
+scripts/local.rig.n3.crossmachine.json
+
 # Local assets / working notes (design docs, spikes, recordings, frames) - kept
 # locally, not tracked in the repo.
 resources/
