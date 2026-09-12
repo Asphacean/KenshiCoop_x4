@@ -2967,6 +2967,25 @@ private:
     bool observedIn(std::map<Key, bool>& obs, bool countFlips, const Key& k,
                     const float* anchors, unsigned int nAnchor,
                     float x, float y, float z);
+    // KENSHICOOP_DEBUG_CENSUS=1 existence-decision trace (Phase 12 plan 02,
+    // DIAGNOSTIC ONLY - reads state, decides nothing). Prints the INPUTS of an
+    // existence verdict, not just its outcome: which census owners were
+    // consulted, whether any of them vouched for this key, how fresh their
+    // slices were, how far the CONSULTED attention anchor set actually reached
+    // toward the body, and what radius that distance was compared against.
+    // Behind the same read-once static env gate publishNpcCensus' per-row dump
+    // uses, and hard-capped per verdict per window so an enabled gate cannot
+    // turn this per-tick loop into a log flood (T-12-05).
+    //
+    // `verdict` is one of the greppable words DECIDE (judged, cull skipped),
+    // DROP (culled) or KEEP (host vouches, body kept); `pass` is near or wide.
+    void logCensusDecision(const char* verdict, const char* pass,
+                           const Key& k, Character* c, const EntityState& st,
+                           bool censusFresh, bool streamed, bool driven,
+                           bool exists, bool observed,
+                           const float* attnAnch, unsigned int nAttnAnch,
+                           unsigned int nRawAnch, unsigned int unstreak,
+                           unsigned int suppressAfter);
     // Where the PEER is: one center per squad tab we do NOT own, plus their
     // camera hint. No zone veto - the veto asks "can I enumerate here", and by
     // the time this is consulted we have already enumerated the body. Writes up
