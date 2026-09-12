@@ -126,6 +126,27 @@ if (Test-Path $censusRepro) {
     $overall = $false
 }
 
+# ---- 6. Connect-relink lever shape + judge sensitivity (zero game) -------------
+# Phase 14 plan 02 (UI-06/UI-07): the harness-drivable connect lever's source
+# shape (adapter wired at every ScenarioContext site, connect sequence still
+# single, lever harness-only, Config/wire pins) plus the five mutation fixtures
+# that prove scripts\analyze_relink.ps1 can FAIL. A judge that cannot fail is
+# not evidence, so its sensitivity belongs in the fast sweep, not in a run log.
+Write-Host ""
+Write-Host "############################################################"
+Write-Host "# verify: connect-relink lever guard"
+Write-Host "############################################################"
+$relinkLever = Join-Path $scriptDir "tests\RelinkLever.Tests.ps1"
+if (Test-Path $relinkLever) {
+    & powershell -NoProfile -ExecutionPolicy Bypass -File $relinkLever
+    $relinkLeverOk = ($LASTEXITCODE -eq 0)
+    Write-Host ("RELINK LEVER GUARD: " + $(if ($relinkLeverOk) { "PASS" } else { "FAIL (exit $LASTEXITCODE)" }))
+    if (-not $relinkLeverOk) { $overall = $false }
+} else {
+    Write-Host "RELINK LEVER GUARD: FAIL - scripts\tests\RelinkLever.Tests.ps1 not found"
+    $overall = $false
+}
+
 # ---- summary -------------------------------------------------------------------
 Write-Host ""
 Write-Host "================= VERIFY SUMMARY ================="
@@ -134,5 +155,6 @@ Write-Host ("  contract fixtures:        " + $(if ($fixOk)  { "PASS" } else { "F
 Write-Host ("  oracle fixtures:          " + $(if ($oracleOk) { "PASS" } else { "FAIL" }))
 Write-Host ("  routing matrix:           " + $(if ($routingOk) { "PASS" } else { "FAIL" }))
 Write-Host ("  census repro guard:       " + $(if ($censusReproOk) { "PASS" } else { "FAIL" }))
+Write-Host ("  relink lever guard:       " + $(if ($relinkLeverOk) { "PASS" } else { "FAIL" }))
 Write-Host ("OVERALL: " + $(if ($overall) { "PASS" } else { "FAIL" }))
 if ($overall) { exit 0 } else { exit 1 }
