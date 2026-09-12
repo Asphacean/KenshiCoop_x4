@@ -1,0 +1,5 @@
+# A carriage return on a shell script's shebang line makes SteamOS report
+# "bad interpreter" (docs/CROSS_MACHINE_RIG.md section 3). core.autocrlf=true on
+# this machine would materialise CRLF in a fresh checkout, so shell scripts are
+# pinned to LF in the working tree as well as in the index.
+*.sh text eol=lf
