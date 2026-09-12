@@ -357,16 +357,21 @@ proton_prefix_for() { # proton_prefix_for KENSHIDIR
     esac
 }
 
+RESOLVED_KENSHI_DIR=""
 resolve_kenshi_dir() {
+    # Sets a GLOBAL rather than printing. Called through $( ), every refusal
+    # below would be captured as the function's output instead of reaching the
+    # player, and the caller would carry on with the refusal text as its path.
     local given="$1"
     [ -n "$given" ] || refuse "no Kenshi folder was given. Pass --kenshi-dir with the folder that holds kenshi_x64.exe (under Proton that is normally \$HOME/.local/share/Steam/steamapps/common/Kenshi)."
     local d
     d="$(norm_dir "$given")"
     [ -n "$d" ] || refuse "there is no directory at '$given'."
     if [ ! -f "$d/kenshi_x64.exe" ]; then
-        refuse "'$d' does not look like a Kenshi install: kenshi_x64.exe is not in it. Point --kenshi-dir at the game folder itself."
+        refuse "'$d' does not look like a Kenshi install: kenshi_x64.exe is not in it. Point --kenshi-dir at the game folder itself (the one holding kenshi_x64.exe)."
     fi
-    printf '%s' "$d"
+    RESOLVED_KENSHI_DIR="$d"
+    return 0
 }
 
 get_kenshi_version() { # -> "found|parsed|version|raw"
@@ -447,8 +452,12 @@ detect_prerequisites() {
     KV_OK=0
     local sv
     for sv in $SUPPORTED_KENSHI_VERSIONS; do
-        [ "$KV_VERSION" = "$sv" ] && KV_OK=1
+        if [ "$KV_VERSION" = "$sv" ]; then KV_OK=1; fi
     done
+    # Explicit: a function whose last command is a false test returns 1, and
+    # under `set -e` the CALLER dies - silently, before the refusal that was
+    # supposed to explain the unsupported version could ever be printed.
+    return 0
 }
 
 show_prerequisites() {
@@ -671,7 +680,12 @@ line_present() { # line_present PATH EREGEX
 
 # ================================================================= INFO ======
 invoke_info() {
-    local dir="$1" man="$dir/$BACKUP_DIR_REL/$MANIFEST_NAME" ver="$dir/$MOD_DIR_REL/VERSION.txt"
+    # One name per statement: under `set -u` a later assignment in the SAME
+    # `local` cannot read an earlier one, and the failure only shows up on the
+    # path that uses it.
+    local dir="$1"
+    local man="$dir/$BACKUP_DIR_REL/$MANIFEST_NAME"
+    local ver="$dir/$MOD_DIR_REL/VERSION.txt"
     printf 'KenshiCoop install info\n'
     printf '  kenshi dir: %s\n' "$dir"
     printf '  platform:   %s\n' "$PLATFORM"
@@ -821,7 +835,8 @@ invoke_uninstall() {
     if [ "$DRY_RUN" = "1" ]; then
         printf 'DRY-RUN: nothing above was done.\n'
     elif [ "$skipped" -gt 0 ]; then
-        printf 'UNINSTALL: COMPLETE with %d file(s) left in place - see the LEFT lines above.\n' "$skipped"
+        # Same word the Windows front end uses, so one support answer covers both.
+        printf 'UNINSTALL: PARTIAL - %d file(s) were left in place; see the LEFT lines above.\n' "$skipped"
     else
         printf 'UNINSTALL: COMPLETE - every restore was hash-verified against the content recorded before the install.\n'
     fi
@@ -846,9 +861,20 @@ invoke_install() {
     # A loaded DLL is the usual reason a deploy silently no-ops
     # (CROSS_MACHINE_RIG sec. 2). Warn rather than refuse: we cannot see the
     # process list of every environment this might run in.
+    # Scoped to THIS install: a Kenshi running out of a different folder holds
+    # no file in this one open. An instance whose command line cannot be read
+    # is treated as relevant, because the conservative side of an unknown is
+    # the safe one when the cost is a half-copied DLL.
     if command -v pgrep >/dev/null 2>&1; then
-        if pgrep -f 'kenshi_x64[.]exe' >/dev/null 2>&1; then
-            refuse "Kenshi is still running. A loaded DLL cannot be replaced, and the copy would silently do nothing. Close the game and run this script again."
+        local procs
+        procs="$(pgrep -af 'kenshi_x64[.]exe' 2>/dev/null || true)"
+        if [ -n "$procs" ]; then
+            local here=""
+            here="$(printf '%s\n' "$procs" | LC_ALL=C grep -F -- "$dir" || true)"
+            if [ -n "$here" ]; then
+                refuse "Kenshi is still running out of '$dir'. A loaded DLL cannot be replaced, and the copy would silently do nothing. Close the game and run this script again."
+            fi
+            printf '  note:    Kenshi is running from a DIFFERENT folder; it holds no file in this install open, so it is not in the way.\n'
         fi
     fi
 
@@ -995,7 +1021,7 @@ invoke_install() {
         printf '  wrote     %s  (%s)\n' "$rel" "${after:0:16}"
     done <<< "$plan"
 
-    [ "$need_ogre" = "1" ] && OGRE_REPAIRED=1
+    if [ "$need_ogre" = "1" ]; then OGRE_REPAIRED=1; fi
 
     # ---- createdDirs, most-nested first ------------------------------------
     local cdirs=""
@@ -1156,7 +1182,8 @@ if [ -n "$OUT_DIR" ]; then
     esac
 fi
 
-DIR="$(resolve_kenshi_dir "$KENSHI_DIR")"
+resolve_kenshi_dir "$KENSHI_DIR"
+DIR="$RESOLVED_KENSHI_DIR"
 
 if [ "$DO_INFO" = "1" ]; then invoke_info "$DIR"; fi
 

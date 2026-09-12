@@ -301,10 +301,45 @@ function Resolve-KenshiDir([string]$given) {
     return $abs
 }
 
-function Assert-GameNotRunning() {
+function Assert-GameNotRunning([string]$Dir = "") {
+    # The hazard this guards is precise: a LOADED DLL cannot be replaced, so a
+    # copy into THIS install would silently no-op (docs\CROSS_MACHINE_RIG.md
+    # section 2). A Kenshi running out of a DIFFERENT folder holds no file in
+    # this one open, so refusing on it is over-broad - and on a rig with
+    # several clones it refuses every install while any unrelated instance is
+    # up, which is how this guard blocked its own test suite.
+    #
+    # A running instance whose executable path cannot be read is still treated
+    # as a refusal: the conservative side of an unknown is the safe one here.
     $running = @(Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.Name -eq "kenshi_x64" -or $_.Name -eq "Kenshi_x64" })
     if ($running.Count -eq 0) { return }
-    $ids = ($running | ForEach-Object { "$($_.Id)" }) -join ", "
+
+    $target = ""
+    if ($Dir) { $target = ([System.IO.Path]::GetFullPath($Dir)).TrimEnd('\', '/') }
+
+    $relevant = @()
+    $elsewhere = @()
+    foreach ($p in $running) {
+        $path = ""
+        try { $path = "$($p.Path)" } catch { $path = "" }
+        if (-not $path) { $relevant += $p; continue }          # unknown: refuse
+        if (-not $target) { $relevant += $p; continue }        # no target given: refuse
+        $full = ([System.IO.Path]::GetFullPath($path))
+        if ($full.StartsWith($target + [System.IO.Path]::DirectorySeparatorChar, [System.StringComparison]::OrdinalIgnoreCase) -or
+            $full.Equals($target, [System.StringComparison]::OrdinalIgnoreCase)) {
+            $relevant += $p
+        } else {
+            $elsewhere += $p
+        }
+    }
+
+    if ($elsewhere.Count -gt 0) {
+        $others = ($elsewhere | ForEach-Object { "$($_.Id)" }) -join ", "
+        Write-Host ("  note:    Kenshi is running from a DIFFERENT folder (PID {0}); it holds no file in this install open, so it is not in the way." -f $others)
+    }
+    if ($relevant.Count -eq 0) { return }
+
+    $ids = ($relevant | ForEach-Object { "$($_.Id)" }) -join ", "
     if ($isWhatIf) {
         # -WhatIf copies nothing, so a running game cannot break anything here;
         # say it would be refused rather than refusing to print the plan.
@@ -777,7 +812,7 @@ function Invoke-Uninstall([string]$Dir, [string]$Out) {
                 ", and this script understands version " + $SchemaVersion + ". Use the installer version that wrote it (" + $man.installerVersion + ").")
     }
 
-    Assert-GameNotRunning
+    Assert-GameNotRunning $Dir
 
     Write-Host ("  manifest: {0} (written {1} by installer {2})" -f (RelPath $Dir $manPath), $man.installedUtc, $man.installerVersion)
 
@@ -940,7 +975,7 @@ function Invoke-Install([string]$Dir, [string]$Out) {
     Write-Host ("  install: {0}" -f $Dir)
     Write-Host ("  guard:   {0}" -f $(if (Test-DevRepo) { "development checkout - the real Steam installs are refused by name" } else { "shipped copy" }))
 
-    Assert-GameNotRunning
+    Assert-GameNotRunning $Dir
 
     # ---- payload ------------------------------------------------------------
     $payloadResolved = Resolve-Payload $Source
