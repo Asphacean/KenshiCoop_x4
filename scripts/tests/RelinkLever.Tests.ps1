@@ -287,6 +287,23 @@ try {
     $e = Invoke-Judge -Dir $d
     Check "judge FAILs when the RELINK tid differs from the MAINTID (exit 1, got $e)" ($e -eq 1)
 
+    # M6 - the slot leak measured live on 2026-09-12: a client relink whose old
+    # peer has not timed out yet, so the host holds BOTH the stale id and the
+    # newly assigned one. Placed after the boundary's own recovery post line, so
+    # only check h can see it - which is the point of h existing separately.
+    $d = New-MutatedFixture 'm6_phantom_slot' { param($L)
+        $out = @()
+        foreach ($ln in $L) {
+            $out += $ln
+            if ($ln -match '^\[10:01:07\.100\]') {
+                $out += '[10:02:30.000] [HOST] INFO: [net] peer connected id=3 player=3 (proto v61)'
+            }
+        }
+        @($out)
+    }
+    $e = Invoke-Judge -Dir $d
+    Check "judge FAILs when the host holds a phantom extra slot (exit 1, got $e)" ($e -eq 1)
+
     # A judge pointed at nothing must report "could not run" (2), not a verdict.
     $empty = Join-Path $fixRoot 'empty'
     New-Item -ItemType Directory -Force -Path $empty | Out-Null

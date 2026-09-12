@@ -37,9 +37,21 @@
        already-empty roster is not the observation). When an instance issued a
        JOIN-side relink, that instance's log must carry the matching
        role=client stop/launch boundary pair.
-    d  the ids admitted after each host boundary equal the ids discarded AT
-       that boundary. This is the sharp discriminator described above.
+    d  the ids admitted DURING A BOUNDARY'S OWN RECOVERY equal the ids
+       discarded at that boundary. This is the sharp discriminator described
+       above. The window is closed by the relinking side's own
+       "SCENARIO relink post" line, not by the next boundary: a client relink
+       landing later in the same span admits ids that have nothing to do with
+       this boundary, and folding those in would blame the boundary for
+       somebody else's reconnect.
     e  zero "slots full" rejections anywhere in the host log.
+    h  the host never holds MORE live slots than there are clients. A client
+       that tears its own transport down (stop() -> enet_host_destroy()) sends
+       no clean ENet disconnect, so the host keeps the old peer until ENet
+       times it out - meanwhile the reconnect takes the NEXT free id and the
+       host counts one client twice. That leak is what eventually produces a
+       real "MAX_PLAYERS slots full", so it is judged here explicitly instead
+       of being left to surface as a confusing failure of check d.
     f  every OBSERVING instance witnessed a roster drop AND return; every
        RELINKING instance recovered its pre-relink id set (ok=1).
     g  "SCENARIO RESULT PASS" in every instance log.
@@ -127,6 +139,7 @@ $RX = @{
     Connect  = '\[coop-ui\] connect: role=(HOST|JOIN) transport=(steam|udp) peer=(\d+) ownRanks=\{([\d,]*)\} src=(env|role)'
     Roster   = '\[net\] roster-reset where=(launch|stop) role=(host|client) slots=(\d+) ids=\{([\d,]*)\} epochs=(\d+)'
     PeerConn = '\[net\] peer connected id=(\d+) player=(\d+)'
+    PeerDisc = '\[net\] peer disconnected id=(\d+)'
     Full     = 'slots full'
     Start    = 'SCENARIO relink start host=(\d+) localId=(\d+) side=(relink|observe) role=(\w+)'
     Post     = 'SCENARIO relink post t=(\d+) peers=(\d+) ids=\{([\d,]*)\} recoveredMs=(\d+) ok=(\d+)'
@@ -141,8 +154,8 @@ function Parse-InstanceLog {
         name = $File.Name; path = $File.FullName
         events = @(); mainTids = @(); relinkTids = @()
         issuedIdx = @(); connectIdx = @()
-        boundaries = @(); admits = @(); slotsFull = 0
-        side = ""; result = ""; posts = @(); observed = $null; samples = @()
+        boundaries = @(); admits = @(); departs = @(); slotsFull = 0
+        side = ""; result = ""; posts = @(); postIdx = @(); observed = $null; samples = @()
     }
     $i = 0
     foreach ($line in [System.IO.File]::ReadLines($File.FullName)) {
@@ -184,8 +197,15 @@ function Parse-InstanceLog {
             & $add 'peer-connected' ("id=" + $m.Groups[1].Value)
             continue
         }
+        $m = [regex]::Match($line, $RX.PeerDisc)
+        if ($m.Success) {
+            $inst.departs += [pscustomobject]@{ idx = $i; ts = $ts; id = (ToInt $m.Groups[1].Value) }
+            & $add 'peer-disconnected' ("id=" + $m.Groups[1].Value)
+            continue
+        }
         $m = [regex]::Match($line, $RX.Post)
         if ($m.Success) {
+            $inst.postIdx += $i
             $inst.posts += [pscustomobject]@{ ok = (ToInt $m.Groups[5].Value); ids = (IdSet $m.Groups[3].Value); recoveredMs = (ToInt $m.Groups[4].Value) }
             & $add 'relink-post' ("ids={{{0}}} recoveredMs={1} ok={2}" -f $m.Groups[3].Value, $m.Groups[4].Value, $m.Groups[5].Value)
             continue
@@ -289,9 +309,14 @@ if (@($clientRelinkers).Count -gt 0) {
 
 # (d) THE DISCRIMINATOR: the ids re-admitted after a boundary equal the ids it discarded.
 for ($i = 0; $i -lt @($hostStops).Count; $i++) {
-    $b    = $hostStops[$i]
+    $b = $hostStops[$i]
+    # Close the window at THIS boundary's own recovery: the relinking side's
+    # next "SCENARIO relink post" line, capped by the next boundary and EOF.
+    # Anything admitted after that belongs to some other reconnect.
     $next = [int]::MaxValue
     if ($i + 1 -lt @($hostStops).Count) { $next = $hostStops[$i + 1].idx }
+    $post = @($H.postIdx | Where-Object { $_ -gt $b.idx } | Sort-Object | Select-Object -First 1)
+    if (@($post).Count -ge 1 -and $post[0] -lt $next) { $next = $post[0] }
     if ($b.slots -eq 0) {
         Write-Host ("  note d/readmit[boundary {0}] - discarded nothing; nothing to re-admit" -f ($i + 1))
         continue
@@ -304,6 +329,35 @@ for ($i = 0; $i -lt @($hostStops).Count; $i++) {
 
 # (e) no rejection anywhere on the host.
 Judge "e/no-slots-full-rejection" ($H.slotsFull -eq 0) ("{0} 'slots full' line(s) in host.log" -f $H.slotsFull)
+
+# (h) slot-leak detector. Replay the host's registry from its own log - a
+# roster-reset clears it, a connect adds, a disconnect removes - and assert it
+# never holds more live slots than there are clients. A client relink tears the
+# transport down WITHOUT enet_peer_disconnect, so the host keeps the old peer
+# until ENet times it out while the reconnect already took the next free id;
+# for that window the host counts one client twice, and repeated relinks walk
+# the table up to a genuine "MAX_PLAYERS slots full".
+$slotCap  = [Math]::Max(1, $ExpectedInstances - 1)
+$live     = @{}
+$peak     = 0
+$peakAt   = ""
+$peakIds  = ""
+$replay   = @()
+foreach ($b in $H.boundaries) { $replay += [pscustomobject]@{ idx = $b.idx; ts = $b.ts; kind = 'reset'; id = 0 } }
+foreach ($a in $H.admits)     { $replay += [pscustomobject]@{ idx = $a.idx; ts = $a.ts; kind = 'add';   id = $a.id } }
+foreach ($x in $H.departs)    { $replay += [pscustomobject]@{ idx = $x.idx; ts = $x.ts; kind = 'del';   id = $x.id } }
+foreach ($e in (@($replay) | Sort-Object idx)) {
+    if     ($e.kind -eq 'reset') { $live = @{} }
+    elseif ($e.kind -eq 'add')   { $live[$e.id] = $true }
+    elseif ($e.kind -eq 'del')   { $live.Remove($e.id) | Out-Null }
+    if ($live.Count -gt $peak) {
+        $peak    = $live.Count
+        $peakAt  = $e.ts
+        $peakIds = CsvOf (@($live.Keys) | Sort-Object)
+    }
+}
+Judge "h/no-phantom-double-slot" ($peak -le $slotCap) `
+    ("host held at most {0} live slot(s) (cap {1} for {2} instances); peak ids={{{3}}} at [{4}]" -f $peak, $slotCap, $ExpectedInstances, $peakIds, $peakAt)
 
 # (f) each instance produced the evidence its own side is responsible for.
 foreach ($inst in $instances) {
