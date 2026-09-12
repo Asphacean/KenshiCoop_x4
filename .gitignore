@@ -90,6 +90,11 @@ scripts/local.rig.json
 scripts/local.rig.n2.json
 scripts/local.rig.n3.json
 
+# Machine-local derivative of the retired deferred-join N=3 variant (Phase 12
+# plan 01, CENSUS-03): same rationale as the three rigs above - carries
+# machine-local install paths, never committed.
+scripts/local.rig.n3.deferred-join.json
+
 # Local assets / working notes (design docs, spikes, recordings, frames) - kept
 # locally, not tracked in the repo.
 resources/

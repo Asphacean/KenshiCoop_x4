@@ -1,0 +1,40 @@
+{
+  "_comment": "Phase 12 plan 01 (D-05, CENSUS-03): this variant DELIBERATELY defers join2's launch by 20s (reconnectAtSec). That deferral is one of the two known levers that MASKS the simultaneous-join census divergence recorded in .planning/debug/knowledge-base.md entry n3-census-join-schedule-race - a PASS produced with this file is NOT coverage of the standard N=3 case. It survives here, separately named, because it is the shape every historical N=3 milestone_a_gate/player_state_gate pass used and is therefore the comparison baseline (the deferred-launch lever also has legitimate uses elsewhere, e.g. exercising a late-joining/replacement connect). The standard N=3 case - both joins connecting undeferred, the shape scripts/repro_census_n3.ps1 requires - is scripts/local.rig.n3.example.json. Copy this file to scripts/local.rig.n3.deferred-join.json (gitignored) and adjust installDir/save/seconds per the scenario being run, same as the standard template.",
+  "save": "wanderer4",
+  "_save_comment": "wanderer4 = the same baked 4-squad start the N=4 gates use (tools/MultiplayerStartGen). At N=3 only ranks 0/1/2 are ever connected; rank 3 stays idle baked furniture for the whole run - do not assume it needs a different save.",
+  "port": 27800,
+  "ip": "127.0.0.1",
+  "seconds": 320,
+  "_seconds_comment": "320 matches ScenarioSaveLoad.cpp's HOST_DURATION_MS/1000 - the longest of the three locked N=2/N=3 gates (milestone_a_gate/player_state_gate finish sooner); lower this to match scenarios.psd1's entry for a shorter gate.",
+  "instances": [
+    {
+      "role": "host",
+      "installDir": "F:\\KenshiCoop-Clone4",
+      "port": 27800,
+      "logName": "host.log",
+      "env": {},
+      "disconnectAtSec": null,
+      "reconnectAtSec": null
+    },
+    {
+      "role": "join",
+      "installDir": "F:\\KenshiCoop-Clone1",
+      "port": 27800,
+      "logName": "join1.log",
+      "env": {},
+      "disconnectAtSec": null,
+      "reconnectAtSec": null,
+      "_comment": "join1 is the ESTABLISHED join - one of Leg R's two contestants (rank 1) alongside join2 below (rank 2). No lifecycle lever needed."
+    },
+    {
+      "role": "join",
+      "installDir": "F:\\KenshiCoop-Clone2",
+      "port": 27800,
+      "logName": "join2.log",
+      "env": {},
+      "disconnectAtSec": null,
+      "reconnectAtSec": 20,
+      "_comment": "join2 mirrors local.rig.json's join3: the deliberately deferred/late-launching instance (reconnectAtSec, same lever save_load_gate's N=4 rig uses). ScenarioSaveLoad.cpp's identity fix (KENSHICOOP_SCENARIO_JOIN_DURATION_SEC, not a rank comparison) resolves join2 as the late-joiner regardless of its rank number. Once connected, join2 (rank 2) ALSO becomes one of Leg R's two contestants alongside join1 (rank 1) - RankRoster's lowestTwoJoins() naturally resolves to (1,2) at N=3, matching the locked decision ('the two lowest join ranks (=1,2 at N>=3)'). THIS DEFERRAL IS WHAT MASKS the simultaneous-join census divergence - do not use this file's PASS result as standard N=3 coverage; use scripts/local.rig.n3.example.json for that."
+    }
+  ]
+}
