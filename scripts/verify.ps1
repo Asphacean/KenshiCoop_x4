@@ -106,6 +106,26 @@ if (Test-Path $routing) {
     $overall = $false
 }
 
+# ---- 5. Census-race reproducer rig shape + anti-escape pins (zero game) --------
+# Phase 12 plan 01 (CENSUS-03): the N=3 simultaneous-join reproducer's rig
+# shape and the three success-criterion-3 anti-escape pins (oracle tolerance,
+# rig stagger, netsim knob defaults) must stay in this fast sweep - a drift on
+# any of them is exactly what the two known masking levers exploit.
+Write-Host ""
+Write-Host "############################################################"
+Write-Host "# verify: census-race reproducer guard"
+Write-Host "############################################################"
+$censusRepro = Join-Path $scriptDir "tests\CensusRepro.Tests.ps1"
+if (Test-Path $censusRepro) {
+    & powershell -NoProfile -ExecutionPolicy Bypass -File $censusRepro
+    $censusReproOk = ($LASTEXITCODE -eq 0)
+    Write-Host ("CENSUS REPRO GUARD: " + $(if ($censusReproOk) { "PASS" } else { "FAIL (exit $LASTEXITCODE)" }))
+    if (-not $censusReproOk) { $overall = $false }
+} else {
+    Write-Host "CENSUS REPRO GUARD: FAIL - scripts\tests\CensusRepro.Tests.ps1 not found"
+    $overall = $false
+}
+
 # ---- summary -------------------------------------------------------------------
 Write-Host ""
 Write-Host "================= VERIFY SUMMARY ================="
@@ -113,5 +133,6 @@ Write-Host ("  unit layer (prototest):   " + $(if ($unitOk) { "PASS" } else { "F
 Write-Host ("  contract fixtures:        " + $(if ($fixOk)  { "PASS" } else { "FAIL" }))
 Write-Host ("  oracle fixtures:          " + $(if ($oracleOk) { "PASS" } else { "FAIL" }))
 Write-Host ("  routing matrix:           " + $(if ($routingOk) { "PASS" } else { "FAIL" }))
+Write-Host ("  census repro guard:       " + $(if ($censusReproOk) { "PASS" } else { "FAIL" }))
 Write-Host ("OVERALL: " + $(if ($overall) { "PASS" } else { "FAIL" }))
 if ($overall) { exit 0 } else { exit 1 }
