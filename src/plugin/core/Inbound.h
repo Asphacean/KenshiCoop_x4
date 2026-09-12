@@ -508,16 +508,54 @@ public:
         buildDoor_(worldReset_),  buildRemove_(worldReset_), stealth_(worldReset_, 512),
         spawnReq_(worldReset_),   spawnInfo_(worldReset_),  camHint_(worldReset_, 64),
         cellClaim_(worldReset_, 64), cellMap_(worldReset_, 16) {
+        for (u32 i = 0; i < MAX_PLAYERS; ++i) lastEdgeConn_[i] = 0;
         InitializeCriticalSection(&cs_);
     }
     ~Inbound() { DeleteCriticalSection(&cs_); }
 
     // NET thread: a peer joined (id) / a peer left (id, or OWNER_ID_ALL).
+    //
+    // conn_ and leave_ are SEPARATE queues, so draining them loses the relative
+    // order of a leave and a connect that land in the SAME main-thread drain.
+    // That never mattered while a client relink took ENet's full ~5.4 s timeout
+    // to produce its leave edge (WINDOWS #19): the two edges were seconds and
+    // several frames apart. With the clean enet_peer_disconnect that closes
+    // #19, the host now sees "peer disconnected id=2" and "peer connected id=2"
+    // 1 ms apart, both in one drain - and Plugin.cpp processes connects BEFORE
+    // leaves, so the re-admit was inserted and then immediately erased by the
+    // stale leave, dropping a LIVE peer out of g_connectedPeers for good.
+    //
+    // lastEdgeConn_ records, per PlayerId, which edge the NET thread pushed
+    // MOST RECENTLY - the one fact the drained queues cannot express and the
+    // net thread always knows. The main thread consults it only for an id that
+    // appears in both drains, so the ordinary single-edge path is untouched.
     void pushConnect(u32 id) {
-        EnterCriticalSection(&cs_); conn_.push_back(id); LeaveCriticalSection(&cs_);
+        EnterCriticalSection(&cs_);
+        conn_.push_back(id);
+        if (id < MAX_PLAYERS) lastEdgeConn_[id] = 1;
+        LeaveCriticalSection(&cs_);
     }
     void pushLeave(u32 id) {
-        EnterCriticalSection(&cs_); leave_.push_back(id); LeaveCriticalSection(&cs_);
+        EnterCriticalSection(&cs_);
+        leave_.push_back(id);
+        if (id < MAX_PLAYERS) {
+            lastEdgeConn_[id] = 0;
+        } else {
+            // OWNER_ID_ALL - "my one link to the host went down", so every
+            // tracked peer is gone, not just one slot.
+            for (u32 i = 0; i < MAX_PLAYERS; ++i) lastEdgeConn_[i] = 0;
+        }
+        LeaveCriticalSection(&cs_);
+    }
+    // MAIN thread: was the NET thread's most recent presence edge for this id a
+    // CONNECT? True means the id is present right now and any leave still
+    // sitting in this drain is the superseded half of a relink.
+    bool lastEdgeWasConnect(u32 id) {
+        if (id >= MAX_PLAYERS) return false;
+        EnterCriticalSection(&cs_);
+        bool v = (lastEdgeConn_[id] != 0);
+        LeaveCriticalSection(&cs_);
+        return v;
     }
     // NET thread: one received entity transform, owner-tagged + send-stamped.
     void pushEntity(u32 ownerId, u32 sendMs, const EntityState& e) {
@@ -1010,6 +1048,11 @@ private:
     // SESSION-PRESERVING: presence edges (the connection persists across a swap).
     SessionQ<u32>                  conn_;
     SessionQ<u32>                  leave_;
+    // Most recent presence edge per PlayerId, 1 = connect, 0 = leave/never.
+    // Guarded by cs_ like the two queues above; see pushConnect() for why the
+    // queues alone cannot answer this. Fixed-size (ids live in [0, MAX_PLAYERS))
+    // so it needs no allocation and no <map>.
+    u8                             lastEdgeConn_[MAX_PLAYERS];
     // SESSION-PRESERVING (protocol 57): ownership assignment describes WHO the
     // players are, not the current world - it survives a reload exactly like
     // the presence edges above.

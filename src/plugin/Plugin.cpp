@@ -717,6 +717,39 @@ void processNetEvents(GameWorld* gw) {
             armConnectPush(*it);
     }
     for (std::deque<coop::u32>::iterator it = leaves.begin(); it != leaves.end(); ++it) {
+        // Same-drain relink (WINDOWS #19/#22 follow-on). The connect loop above
+        // ran FIRST, so if this id was also re-admitted in this very drain the
+        // teardown below would erase a peer that is connected RIGHT NOW - the
+        // host measured exactly that: "handshake: peer present id=2" and
+        // "handshake: peer left id=2" in the same millisecond, after which
+        // g_connectedPeers never saw id=2 again.
+        //
+        // Pre-fix this was unreachable: the client's transport was destroyed
+        // with no enet_peer_disconnect, so the leave edge trailed the re-admit
+        // by ENet's full ~5.4 s timeout and the two never shared a drain. The
+        // clean disconnect closes that window to ~1 ms, which is why this
+        // ordering hazard only surfaces now.
+        //
+        // Both halves must agree before anything is skipped: the id must be in
+        // THIS drain's connect batch, and the net thread's most recent edge for
+        // it must be the connect. The reverse interleaving (connect then leave
+        // inside one drain - a peer that handshook and dropped immediately)
+        // reports lastEdgeWasConnect()==false and still tears down normally.
+        bool reAdmitted = false;
+        for (std::deque<coop::u32>::const_iterator ct = conns.begin();
+             ct != conns.end(); ++ct) {
+            if (*ct == *it) { reAdmitted = true; break; }
+        }
+        if (reAdmitted && g_inbound.lastEdgeWasConnect(*it)) {
+            char sb[128];
+            _snprintf(sb, sizeof(sb) - 1,
+                      "[leave] id=%u superseded by a same-drain re-admit; "
+                      "teardown skipped (peer is present)",
+                      (unsigned)*it);
+            sb[sizeof(sb) - 1] = '\0';
+            coopLog(sb);
+            continue;
+        }
         char b[64];
         _snprintf(b, sizeof(b) - 1, "handshake: peer left id=%u", (unsigned)*it);
         b[sizeof(b) - 1] = '\0';
