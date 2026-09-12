@@ -79,6 +79,15 @@
   the test suite uses to exercise the missing-runtime path without touching the
   real system.
 
+  Several directories may be given either as an array (when the script is
+  dot-invoked or called with &) or as one ';'-separated string. The second form
+  exists because this project invokes every script as
+  "powershell -NoProfile -ExecutionPolicy Bypass -File <script>", and under
+  -File an array parameter cannot take more than one bare token: the second one
+  fails to bind with "A positional parameter cannot be found". Without the
+  ';' form the seam would be unusable from the only invocation style the
+  project actually uses.
+
 .EXAMPLE
   powershell -NoProfile -ExecutionPolicy Bypass -File scripts\install_coop.ps1 -KenshiDir "C:\Games\Kenshi" -WhatIf
 
@@ -945,7 +954,15 @@ function Invoke-Install([string]$Dir, [string]$Out) {
     # ---- prerequisites: BEFORE any write, so a refusal leaves nothing -------
     $searchPath = @()
     if ($CrtSearchPath -and $CrtSearchPath.Count -gt 0) {
-        $searchPath = @($CrtSearchPath)
+        # Accept both an array and one ';'-separated string: under -File, which
+        # is how every script in this project is invoked, only the latter can
+        # carry more than one directory.
+        foreach ($p in $CrtSearchPath) {
+            foreach ($q in ("$p" -split ';')) {
+                $q = $q.Trim()
+                if ($q) { $searchPath += $q }
+            }
+        }
     } else {
         $searchPath = @((Join-Path $env:WINDIR "System32"), $Dir)
     }
