@@ -1,5 +1,5 @@
 {
-  "_comment": "Phase 11 plan 02 (TEST-01): committed N=3 rig TEMPLATE for run_test4.ps1 - copy to local.rig.n3.json (gitignored, like the N=4 local.rig.json) and adjust installDir/save/seconds per the scenario being run. Mirrors local.rig.json's real dev-machine layout (Clone4 as host; Clone1 + Clone2 as joins) with only 3 instances declared. Pass -ExpectedInstances 3 to run_test4.ps1 and -ExpectedInstances 3 (or rely on run_meta.json's instanceCount) to analyze_run4.ps1/analyze_wnpc_diff4.ps1 for the offline judge.",
+  "_comment": "Phase 11 plan 02 (TEST-01): committed N=3 rig TEMPLATE for run_test4.ps1 - copy to local.rig.n3.json (gitignored, like the N=4 local.rig.json) and adjust installDir/save/seconds per the scenario being run. Mirrors local.rig.json's real dev-machine layout (Clone4 as host; Clone1 + Clone2 as joins) with only 3 instances declared. Pass -ExpectedInstances 3 to run_test4.ps1 and -ExpectedInstances 3 (or rely on run_meta.json's instanceCount) to analyze_run4.ps1/analyze_wnpc_diff4.ps1 for the offline judge. Phase 12 plan 01 (CENSUS-03): this shape now has BOTH joins connect undeferred by default - a deferred join is a masking lever that hides the simultaneous-join census race (.planning/debug/knowledge-base.md entry n3-census-join-schedule-race), not standard N=3 coverage. Use scripts/local.rig.n3.deferred-join.example.json if the deferred-join baseline is what you actually want.",
   "save": "wanderer4",
   "_save_comment": "wanderer4 = the same baked 4-squad start the N=4 gates use (tools/MultiplayerStartGen). At N=3 only ranks 0/1/2 are ever connected; rank 3 stays idle baked furniture for the whole run (research Risk 2, budgeted for live verification in Plan 03) - do not assume it needs a different save.",
   "port": 27800,
@@ -33,8 +33,8 @@
       "logName": "join2.log",
       "env": {},
       "disconnectAtSec": null,
-      "reconnectAtSec": 20,
-      "_comment": "join2 mirrors local.rig.json's join3: the deliberately deferred/late-launching instance (reconnectAtSec, same lever save_load_gate's N=4 rig uses). ScenarioSaveLoad.cpp's identity fix (KENSHICOOP_SCENARIO_JOIN_DURATION_SEC, not a rank comparison) resolves join2 as the late-joiner regardless of its rank number. Once connected, join2 (rank 2) ALSO becomes one of Leg R's two contestants alongside join1 (rank 1) - RankRoster's lowestTwoJoins() naturally resolves to (1,2) at N=3, matching the locked decision ('the two lowest join ranks (=1,2 at N>=3)'). Set to null for a plain N=3 connect with no deferred-launch lever (milestone_a_gate/player_state_gate do not need it)."
+      "reconnectAtSec": null,
+      "_comment": "join2 connects undeferred, same as join1 (Phase 12 plan 01, CENSUS-03: simultaneous joins are the default N=3 shape - two real players connecting at the same time is exactly what a deferred join never exercises). Leg R's two contestants (rank 1 and rank 2, RankRoster's lowestTwoJoins()) still resolve the same way at N=3 regardless of launch order. If a scenario genuinely needs the old deferred/late-launching lever (the shape save_load_gate's N=4 rig and every historical N=3 milestone_a_gate/player_state_gate pass used), copy scripts/local.rig.n3.deferred-join.example.json instead - that file states in its own text why it exists and that it is not standard N=3 coverage."
     }
   ]
 }
